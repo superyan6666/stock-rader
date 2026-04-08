@@ -12,7 +12,7 @@ WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 DINGTALK_KEYWORD = "AI"
 
 # 1. 核心盯盘清单：你可以把最关心的几只单独放这里（用于高频异动哨兵）
-CORE_WATCHLIST = ["NVDA", "TSLA", "AAPL", "MSFT"]
+CORE_WATCHLIST = ["TSLA", "AAPL", "MSFT", "PL", "SNDK", "CRCL", "BRK.A"]
 
 # ================= 动态获取股票池 =================
 def get_nasdaq_100():
