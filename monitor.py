@@ -62,7 +62,7 @@ def calculate_indicators(df):
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     
-    # 改进 1: 防止除零错误 (加上极小值 1e-10)
+    # 防止除零错误 (加上极小值 1e-10)
     rs = gain / (loss + 1e-10)
     df['RSI'] = 100 - (100 / (1 + rs))
 
@@ -78,6 +78,13 @@ def calculate_indicators(df):
 
     # 计算 20 日平均成交量
     df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
+    
+    # 计算 ATR (14) 平均真实波幅，用于评估波动率
+    high_low = df['High'] - df['Low']
+    high_close = (df['High'] - df['Close'].shift()).abs()
+    low_close = (df['Low'] - df['Close'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR'] = tr.rolling(window=14).mean()
     
     return df
 
@@ -120,7 +127,7 @@ def run_tech_matrix():
     for symbol in target_list:
         try:
             ticker = yf.Ticker(symbol)
-            # 改进 2: 数据窗口拉长为 6mo 确保均线准确
+            # 数据窗口拉长为 6mo 确保均线准确
             df = ticker.history(period="6mo", interval="1d")
             if len(df) < 55: continue
 
@@ -128,30 +135,41 @@ def run_tech_matrix():
             curr = df.iloc[-1]
             prev = df.iloc[-2]
 
-            # 改进 3: 严格的流动性过滤 (排除冷门股)
+            # 严格的流动性过滤 (排除冷门股)
             if curr['Vol_MA20'] < 1000000:
                 continue
 
             signals = []
             
-            # 改进 4: 趋势过滤 RSI (防接飞刀)
-            if curr['RSI'] < 30 and prev['RSI'] >= 30:
-                if curr['Close'] > curr['EMA_50']:
-                    signals.append("🟢 **[趋势回踩超卖]** 高胜率买点 (价格在50日均线上)")
-                else:
-                    signals.append("⚠️ **[弱势超卖]** 存在接飞刀风险 (趋势向下)")
-            
-            # MACD 金叉
-            if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
-                signals.append("🔥 **[MACD金叉]** 多头启动可能")
+            # 改进 1: 加入波动率评估的动态 RSI 阈值
+            atr_pct = curr['ATR'] / curr['Close']
+            # 根据真实波动幅度调整阈值，限制在 20 到 40 之间
+            dynamic_rsi_threshold = max(20, min(40, 30 - (atr_pct - 0.03) * 100))
 
-            # 异常巨量
-            if curr['Volume'] > (curr['Vol_MA20'] * 3):
-                signals.append(f"⚠️ **[巨量异动]** 成交量为均量 {curr['Volume']/curr['Vol_MA20']:.1f} 倍")
+            # RSI 趋势与动态阈值过滤
+            if curr['RSI'] < dynamic_rsi_threshold and prev['RSI'] >= dynamic_rsi_threshold:
+                if curr['Close'] > curr['EMA_50']:
+                    signals.append(f"🟢 **[趋势回踩超卖]** 顺势买点 (阈值:{dynamic_rsi_threshold:.1f}, RSI:{curr['RSI']:.1f})")
+                else:
+                    signals.append(f"⚠️ **[弱势超卖]** 防范接飞刀 (阈值:{dynamic_rsi_threshold:.1f}, RSI:{curr['RSI']:.1f})")
+            
+            # 改进 2: MACD 金叉的零轴环境区分
+            if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
+                if curr['MACD'] < 0:
+                    signals.append("🔸 **[零下金叉]** 弱反弹预期，注意见好就收")
+                else:
+                    signals.append("🔥 **[零上金叉]** 强势主升浪确认")
+
+            # 改进 3: 放量倍数分级评估
+            vol_ratio = curr['Volume'] / curr['Vol_MA20']
+            if vol_ratio > 3:
+                signals.append(f"🌋 **[极端巨量]** 成交量激增 {vol_ratio:.1f} 倍！")
+            elif vol_ratio > 1.8:
+                signals.append(f"🌊 **[温和放量]** 成交量放大 {vol_ratio:.1f} 倍")
 
             # 趋势突破
             if prev['Close'] < prev['EMA_50'] and curr['Close'] > curr['EMA_50']:
-                signals.append(f"🚀 **[趋势突破]** 突破50日均线 (${curr['EMA_50']:.2f})")
+                signals.append(f"🚀 **[均线突破]** 强势站上50日均线 (${curr['EMA_50']:.2f})")
 
             if signals:
                 reports.append(f"**{symbol}** (${curr['Close']:.2f})\n> " + "\n> ".join(signals))
