@@ -76,11 +76,13 @@ def send_dingtalk(title, content):
 # ================= 核心策略引擎 (共用计算模块) =================
 def calculate_indicators(df):
     """计算所有的技术指标"""
-    # 计算 RSI (14)
+    # 改进 1: 使用 Wilder 平滑版的标准 RSI 算法
     delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / (loss + 1e-10)
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.ewm(alpha=1/14, min_periods=14).mean()
+    avg_loss = loss.ewm(alpha=1/14, min_periods=14).mean()
+    rs = avg_gain / (avg_loss + 1e-10)
     df['RSI'] = 100 - (100 / (1 + rs))
 
     # 计算 MACD (12, 26, 9)
@@ -128,15 +130,19 @@ def run_volatility_sentinel():
             
             curr_price = df['Close'].iloc[-1]
             open_price = df['Open'].iloc[-1] 
-            prev_close = df['Close'].iloc[-2]
             
+            # 短线急涨急跌 (小时线级别)
             hour_change = (curr_price - open_price) / open_price * 100
             if abs(hour_change) > 3:
                 alerts.append(f"> **{symbol}** 短线异动 {'🚀' if hour_change > 0 else '🩸'} \n> 1小时内波动: **{hour_change:+.2f}%** (现价: ${curr_price:.2f})")
                 
-            gap_change = (open_price - prev_close) / prev_close * 100
-            if abs(gap_change) > 4:
-                alerts.append(f"> **{symbol}** 跳空预警 {'💥' if gap_change > 0 else '⚠️'}\n> 缺口: **{gap_change:+.2f}%**")
+            # 改进 2: 真实的日线级别跳空缺口判断
+            df_daily = safe_get_history(symbol, period="5d", interval="1d")
+            if df_daily is not None and len(df_daily) >= 2:
+                gap_daily = (df_daily['Open'].iloc[-1] - df_daily['Close'].iloc[-2]) / df_daily['Close'].iloc[-2] * 100
+                if abs(gap_daily) > 4:
+                    alerts.append(f"> **{symbol}** 日线跳空 {'💥' if gap_daily > 0 else '⚠️'}\n> 真实缺口: **{gap_daily:+.2f}%**")
+                    
         except Exception as e:
             pass 
 
@@ -159,7 +165,8 @@ def run_tech_matrix():
         print(f"[进度 {idx+1}/{total_stocks}] 正在分析 {symbol}...")
         try:
             df = safe_get_history(symbol, period="6mo", interval="1d")
-            if len(df) < 55: continue
+            # 改进 3: 给布林带 100 天均值留出充足的数据余量，防止报错或 NaN
+            if len(df) < 100: continue
 
             # 流动性判断
             if df['Volume'].tail(20).mean() < 1000000:
@@ -244,8 +251,15 @@ def run_tech_matrix():
                 score += 7
 
             if signals:
+                # 改进 4: 计算日成交额 (Turnover)，让资金量级一目了然
+                turnover = curr['Close'] * curr['Volume']
+                if turnover >= 1e9:
+                    turnover_str = f"${turnover/1e9:.2f}B"
+                else:
+                    turnover_str = f"${turnover/1e6:.2f}M"
+                    
                 # 记录这只股票的综合得分和文字报告
-                report_text = f"**{symbol}** (${curr['Close']:.2f} | 🌟综合重要性得分: **{score}**)\n> " + "\n> ".join(signals)
+                report_text = f"**{symbol}** (${curr['Close']:.2f} | 额: {turnover_str} | 🌟综合得分: **{score}**)\n> " + "\n> ".join(signals)
                 reports.append({
                     "symbol": symbol,
                     "score": score,
