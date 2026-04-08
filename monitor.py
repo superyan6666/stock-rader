@@ -5,34 +5,48 @@ import sys
 from datetime import datetime, timezone
 
 # ================= 配置区 =================
+# Webhook URL (从 GitHub Secrets 获取)
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 
-# 【必须包含】钉钉安全关键词（你刚才说你的关键词是 AI）
+# 【重要】钉钉安全关键词
 DINGTALK_KEYWORD = "AI"
 
-# 1. 核心盯盘清单 (用于高频异动和技术指标)
+# 1. 核心盯盘清单 (高频异动和技术指标)
 CORE_WATCHLIST = ["NVDA", "TSLA", "AAPL", "MSFT"]
 
-# 2. 全量扫盘清单 (用于每日复盘，可以放很多)
-EXTENDED_WATCHLIST = ["NVDA", "TSLA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "AMD", "COIN", "MSTR", "0700.HK"]
+# 2. 全量扫盘清单 (每日复盘)
+EXTENDED_WATCHLIST = ["NVDA", "TSLA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "AMD", "COIN", "MSTR"]
 
-# ================= 通用函数 =================
+# ================= 通用消息推送模块 =================
 def send_dingtalk(title, content):
-    """发送格式化的钉钉 Markdown 消息"""
-    if not WEBHOOK_URL: return
+    if not WEBHOOK_URL: 
+        print("❌ 错误：WEBHOOK_URL 环境变量未设置")
+        return
 
-    # 钉钉的 Markdown 格式要求比较严格，必须在 text 里包含关键词
+    # 钉钉 Markdown 格式，严格将关键词嵌入标题和正文中
     payload = {
         "msgtype": "markdown",
         "markdown": {
-            "title": f"【{DINGTALK_KEYWORD} 监控】{title}",
-            "text": f"### 🤖 【{DINGTALK_KEYWORD} 量化监控系统】\n#### {title}\n\n{content}\n\n---\n*⏱️ 扫描时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}*"
+            "title": f"【{DINGTALK_KEYWORD}盯盘】{title}",
+            "text": f"### 🤖 【{DINGTALK_KEYWORD}量化监控系统】\n#### {title}\n\n{content}\n\n---\n*⏱️ 扫描时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}*"
         }
     }
+    
     try:
-        requests.post(WEBHOOK_URL, json=payload)
+        resp = requests.post(WEBHOOK_URL, json=payload)
+        print(f"---- 钉钉服务器真实响应 ----")
+        print(f"状态码: {resp.status_code}")
+        print(f"响应内容: {resp.text}")
+        
+        # 错误分析
+        resp_json = resp.json()
+        if resp_json.get("errcode") != 0:
+            print(f"🚨 警告: 消息被钉钉拦截！请再次确认安全设置中的关键词是否完全包含: {DINGTALK_KEYWORD}")
+        else:
+            print("✅ 消息推送成功！")
+            
     except Exception as e:
-        print(f"推送失败: {e}")
+        print(f"推送请求发生异常: {e}")
 
 # ================= 模式 1: 高频异动哨兵 =================
 def run_volatility_sentinel():
@@ -44,23 +58,20 @@ def run_volatility_sentinel():
             if len(df) < 2: continue
             
             curr_price = df['Close'].iloc[-1]
-            open_price = df['Open'].iloc[-1] # 当前小时开盘价
+            open_price = df['Open'].iloc[-1] 
             prev_close = df['Close'].iloc[-2]
             
-            # 1. 短线暴跌/暴涨 (1小时内波动 > 3%)
             hour_change = (curr_price - open_price) / open_price * 100
             if abs(hour_change) > 3:
                 emoji = "🚀" if hour_change > 0 else "🩸"
-                alerts.append(f"> **{symbol}** 短线异动 {emoji} \n> 1小时内剧烈波动: **{hour_change:+.2f}%** (现价: ${curr_price:.2f})")
+                alerts.append(f"> **{symbol}** 短线异动 {emoji} \n> 1小时内波动: **{hour_change:+.2f}%** (现价: ${curr_price:.2f})")
                 
-            # 2. 跳空高开/低开 (与上一小时收盘价相比 > 4%)
             gap_change = (open_price - prev_close) / prev_close * 100
             if abs(gap_change) > 4:
                 emoji = "💥" if gap_change > 0 else "⚠️"
-                alerts.append(f"> **{symbol}** 跳空预警 {emoji}\n> 出现跳空缺口: **{gap_change:+.2f}%**")
-                
+                alerts.append(f"> **{symbol}** 跳空预警 {emoji}\n> 缺口: **{gap_change:+.2f}%**")
         except Exception as e:
-            pass # 高频模式静默处理错误
+            pass 
 
     if alerts:
         send_dingtalk("⚡ 极端异动警告", "\n\n".join(alerts))
@@ -73,36 +84,26 @@ def run_tech_matrix():
     reports = []
     for symbol in CORE_WATCHLIST:
         try:
-            df = yf.Ticker(symbol).history(period="1mo", interval="1d") # 用日线级别更稳
+            df = yf.Ticker(symbol).history(period="1mo", interval="1d") 
             if len(df) < 20: continue
 
             curr = df.iloc[-1]
-            prev = df.iloc[-2]
-            price = curr['Close']
-            signals = []
-
-            # 简单的 RSI 计算
             delta = df['Close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
             df['RSI'] = 100 - (100 / (1 + gain/loss))
-            curr_rsi = df['RSI'].iloc[-1]
-            prev_rsi = df['RSI'].iloc[-2]
 
-            # 策略检测
-            if curr_rsi < 30 and prev_rsi >= 30:
+            signals = []
+            if df['RSI'].iloc[-1] < 30 and df['RSI'].iloc[-2] >= 30:
                 signals.append("🟢 **RSI超卖** (寻底反弹机会)")
-            elif curr_rsi > 70 and prev_rsi <= 70:
+            elif df['RSI'].iloc[-1] > 70 and df['RSI'].iloc[-2] <= 70:
                 signals.append("🔴 **RSI超买** (短期回调风险)")
             
-            # 成交量异动
-            vol_ma = df['Volume'].rolling(window=20).mean().iloc[-1]
-            if curr['Volume'] > vol_ma * 2:
+            if curr['Volume'] > df['Volume'].rolling(20).mean().iloc[-1] * 2:
                 signals.append("🔥 **巨量突击** (资金高度活跃)")
 
             if signals:
-                reports.append(f"**{symbol}** (日线级别) - 现价: ${price:.2f}\n> " + "\n> ".join(signals))
-
+                reports.append(f"**{symbol}** (日线级别) - 现价: ${curr['Close']:.2f}\n> " + "\n> ".join(signals))
         except Exception as e:
             pass
 
@@ -114,9 +115,7 @@ def run_tech_matrix():
 # ================= 模式 3: 每日全量复盘报告 =================
 def run_daily_screener():
     print(">>> 启动每日全量扫盘报告...")
-    bullish = []
-    bearish = []
-    neutral = []
+    bullish, bearish, neutral = [], [], []
     
     for symbol in EXTENDED_WATCHLIST:
         try:
@@ -127,39 +126,23 @@ def run_daily_screener():
             ma20 = df['Close'].rolling(20).mean().iloc[-1]
             ma50 = df['Close'].rolling(50).mean().iloc[-1]
             
-            # 简单趋势打分模型
-            score = 0
-            if price > ma20: score += 1
-            if price > ma50: score += 1
-            if ma20 > ma50: score += 1
+            score = (price > ma20) + (price > ma50) + (ma20 > ma50)
+            info = f"{symbol} (${price:.2f})"
             
-            info = f"**{symbol}**: ${price:.2f}"
-            if score == 3:
-                bullish.append(info)
-            elif score == 0:
-                bearish.append(info)
-            else:
-                neutral.append(info)
+            if score == 3: bullish.append(info)
+            elif score == 0: bearish.append(info)
+            else: neutral.append(info)
         except Exception as e:
             pass
 
-    # 组装研报
-    report_lines = [
-        "**📈 多头排列 (强势)**", 
-        " > " + (", ".join(bullish) if bullish else "无"),
-        "\n**📉 空头排列 (弱势)**", 
-        " > " + (", ".join(bearish) if bearish else "无"),
-        "\n**➖ 震荡整理 (中性)**", 
-        " > " + (", ".join(neutral) if neutral else "无")
-    ]
-    
-    send_dingtalk("📝 每日市场全景扫描", "\n".join(report_lines))
+    report = f"**📈 多头排列 (强势)**\n> {', '.join(bullish) if bullish else '无'}\n\n**📉 空头排列 (弱势)**\n> {', '.join(bearish) if bearish else '无'}\n\n**➖ 震荡整理 (中性)**\n> {', '.join(neutral) if neutral else '无'}"
+    send_dingtalk("📝 每日市场全景扫描", report)
 
 # ================= 主控制逻辑 =================
 if __name__ == "__main__":
-    # 通过命令行参数决定运行哪个模式
-    # 如果没有参数，默认运行异动哨兵
+    # 接收来自 GitHub Actions 传递的参数
     mode = sys.argv[1] if len(sys.argv) > 1 else "sentinel"
+    print(f"正在以模式运行: [{mode}]")
     
     if mode == "sentinel":
         run_volatility_sentinel()
@@ -168,7 +151,7 @@ if __name__ == "__main__":
     elif mode == "daily":
         run_daily_screener()
     elif mode == "test":
-        # 强制发送一条测试消息，用于验证 Markdown 和关键词配置
-        send_dingtalk("✅ 系统部署成功", f"您的 {DINGTALK_KEYWORD} 监控引擎已完美启动！\n\n> 包含三大模式：\n> 1. 高频异动哨兵\n> 2. 技术指标矩阵\n> 3. 每日全景扫盘")
+        print("执行连接测试...")
+        send_dingtalk("✅ 终极引擎部署成功", "如果您收到此消息，说明您的 GitHub Actions 三合一路由与钉钉机器人通道已完美打通！您可以开始享受全自动化盯盘了。")
     else:
         print(f"未知的模式: {mode}")
