@@ -91,6 +91,16 @@ def calculate_indicators(df):
 # ================= 模式 1: 高频异动哨兵 (仅扫描核心自选) =================
 def run_volatility_sentinel():
     print(">>> 启动高频异动哨兵模式...")
+    
+    # 改进：增加美股交易时段判断 (UTC时间)
+    # 夏令时美东 9:30-16:00 = UTC 13:30-20:00
+    # 冬令时美东 9:30-16:00 = UTC 14:30-21:00
+    # 采用 13-21 的宽泛区间，既兼容冬夏令时，又包含少量盘前盘后活跃期
+    now_utc = datetime.now(timezone.utc)
+    if not (13 <= now_utc.hour <= 21):
+        print(f"💤 当前时间 (UTC {now_utc.hour}:{now_utc.minute}) 处于非主要交易时段，跳过高频扫描以防止盘后假信号。")
+        return
+
     alerts = []
     for symbol in CORE_WATCHLIST:
         try:
@@ -129,6 +139,7 @@ def run_tech_matrix():
             ticker = yf.Ticker(symbol)
             # 数据窗口拉长为 6mo 确保均线准确
             df = ticker.history(period="6mo", interval="1d")
+            # 严格过滤上市不足55天的股票，防止50日均线引发的假信号和报错
             if len(df) < 55: continue
 
             df = calculate_indicators(df)
@@ -141,10 +152,13 @@ def run_tech_matrix():
 
             signals = []
             
-            # 改进 1: 加入波动率评估的动态 RSI 阈值
+            # 加入波动率评估的动态 RSI 阈值
             atr_pct = curr['ATR'] / curr['Close']
-            # 根据真实波动幅度调整阈值，限制在 20 到 40 之间
             dynamic_rsi_threshold = max(20, min(40, 30 - (atr_pct - 0.03) * 100))
+            
+            # 改进：在后台日志打印 ATR 参数，不打扰前端钉钉用户，方便后期量化调参
+            if atr_pct > 0: # 过滤极小值打印
+                print(f"[{symbol}] ATR占比: {atr_pct:.4f} | 动态RSI阈值计算结果: {dynamic_rsi_threshold:.1f}")
 
             # RSI 趋势与动态阈值过滤
             if curr['RSI'] < dynamic_rsi_threshold and prev['RSI'] >= dynamic_rsi_threshold:
@@ -153,14 +167,14 @@ def run_tech_matrix():
                 else:
                     signals.append(f"⚠️ **[弱势超卖]** 防范接飞刀 (阈值:{dynamic_rsi_threshold:.1f}, RSI:{curr['RSI']:.1f})")
             
-            # 改进 2: MACD 金叉的零轴环境区分
+            # MACD 金叉的零轴环境区分
             if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
                 if curr['MACD'] < 0:
                     signals.append("🔸 **[零下金叉]** 弱反弹预期，注意见好就收")
                 else:
                     signals.append("🔥 **[零上金叉]** 强势主升浪确认")
 
-            # 改进 3: 放量倍数分级评估
+            # 放量倍数分级评估
             vol_ratio = curr['Volume'] / curr['Vol_MA20']
             if vol_ratio > 3:
                 signals.append(f"🌋 **[极端巨量]** 成交量激增 {vol_ratio:.1f} 倍！")
