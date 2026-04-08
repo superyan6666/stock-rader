@@ -85,7 +85,7 @@ def send_dingtalk(title: str, content: str) -> None:
         except Exception as e:
             logger.error(f"推送请求发生异常: {e}")
 
-# ================= 3. 大盘状态感知系统 (Market Regime) =================
+# ================= 3. 大盘与趋势感知系统 (Market & Trend Regime) =================
 def get_market_regime() -> Tuple[str, str]:
     """判断大盘环境：牛市、熊市或震荡市"""
     logger.info(f">>> 正在分析大盘环境 ({Config.INDEX_ETF})...")
@@ -106,6 +106,24 @@ def get_market_regime() -> Tuple[str, str]:
         return "bear", "🐻 熊市回调阶段 (在200日均线之下且趋势向下)"
     else:
         return "range", "⚖️ 震荡整理阶段 (缺乏明确的单边趋势)"
+
+def get_weekly_trend(symbol: str) -> str:
+    """获取标的周线趋势，用于多时间框架共振过滤"""
+    df_week = safe_get_history(symbol, period="1y", interval="1wk", retries=2)
+    if len(df_week) < 30:
+        return "neutral"
+        
+    price = df_week['Close'].iloc[-1]
+    ma50w = df_week['Close'].rolling(50).mean().iloc[-1]
+    
+    if pd.isna(ma50w):
+        return "neutral"
+        
+    if price > ma50w:
+        return "bullish"   # 周线多头
+    elif price < ma50w * 0.95:
+        return "bearish"   # 周线空头 (允许5%的跌破缓冲)
+    return "neutral"
 
 # ================= 4. 核心量化指标模块 =================
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -202,9 +220,9 @@ def run_tech_matrix() -> None:
             
             # --- 大盘状态动态调整策略得分权重 ---
             
-            # RSI 超卖策略：熊市中抄底最有效，牛市中更容易踩雷
+            # RSI 超卖策略
             if curr['RSI'] < dynamic_rsi_threshold and prev['RSI'] >= dynamic_rsi_threshold:
-                weight = 13 if regime == 'bear' else 8 # 熊市加权
+                weight = 13 if regime == 'bear' else 8 
                 if curr['Close'] > curr['EMA_50']:
                     signals.append(f"🟢 **[趋势回踩超卖]** 顺势买点 (RSI:{curr['RSI']:.1f})")
                     score += weight
@@ -212,7 +230,7 @@ def run_tech_matrix() -> None:
                     signals.append(f"⚠️ **[弱势超卖]** 防范接飞刀 (RSI:{curr['RSI']:.1f})")
                     score += int(weight * 0.4)
             
-            # RSI 底背离：熊市反转信号
+            # RSI 底背离
             price_low_5 = df['Close'].iloc[-5:].min()
             idx_low_5 = df['Close'].iloc[-5:].idxmin()
             rsi_at_low_5 = df['RSI'].loc[idx_low_5]
@@ -225,9 +243,9 @@ def run_tech_matrix() -> None:
                 signals.append("🔍 **[RSI底背离]** 下跌动能衰竭")
                 score += weight
             
-            # MACD 策略：牛市中主升浪最有效
+            # MACD 策略
             if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
-                weight = 10 if regime == 'bull' else 6 # 牛市加权
+                weight = 10 if regime == 'bull' else 6 
                 if curr['MACD'] < 0:
                     signals.append("🔸 **[零下金叉]** 弱反弹预期")
                     score += int(weight * 0.6)
@@ -235,18 +253,28 @@ def run_tech_matrix() -> None:
                     signals.append("🔥 **[零上金叉]** 强势主升浪确认")
                     score += weight
 
-            # 布林带挤压：震荡市最有效
+            # 布林带挤压
             avg_bb_width = df['BB_Width'].rolling(100).mean().iloc[-1]
             if pd.notna(avg_bb_width) and curr['BB_Width'] < avg_bb_width * 0.5:
-                weight = 10 if regime == 'range' else 5 # 震荡市加权
+                weight = 10 if regime == 'range' else 5 
                 signals.append("📦 **[布林带挤压]** 即将剧烈变盘")
                 score += weight
 
-            # 均线突破：牛市中破位有效
+            # 均线突破
             if prev['Close'] < prev['EMA_50'] and curr['Close'] > curr['EMA_50']:
                 weight = 9 if regime == 'bull' else 5
                 signals.append(f"🚀 **[均线突破]** 强势站上50日均线")
                 score += weight
+
+            # --- 核心新增：多时间框架共振 (懒加载周线数据) ---
+            if signals:
+                weekly_trend = get_weekly_trend(symbol)
+                if weekly_trend == "bullish":
+                    signals.append("📈 **[周线共振]** 长期趋势处于多头，增强日线信号有效性")
+                    score += 5  # 顺大势，加分
+                elif weekly_trend == "bearish":
+                    signals.append("📉 **[周线逆风]** 长期趋势处于空头，需警惕短线陷阱风险")
+                    score -= 4  # 逆大势，扣分降级
 
             if signals:
                 if len(signals) > 4:
@@ -315,7 +343,7 @@ if __name__ == "__main__":
         test_tickers = get_nasdaq_100()[:5]
         send_dingtalk(
             "✅ Pro 量化引擎部署成功", 
-            f"已集成大盘感知分类器！\n当前测算大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"已集成多时间框架(周线)共振过滤！\n当前测算大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
