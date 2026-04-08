@@ -98,7 +98,8 @@ def send_dingtalk(title: str, content: str) -> None:
     urls = [url.strip() for url in Config.WEBHOOK_URL.split(',') if url.strip()]
     for url in urls:
         try:
-            requests.post(url, json=payload, timeout=10)
+            resp = requests.post(url, json=payload, timeout=10)
+            resp.raise_for_status() # 增加 HTTP 状态码校验
         except Exception as e:
             logger.error(f"推送请求发生异常: {e}")
 
@@ -108,7 +109,8 @@ def get_vix_level() -> Tuple[float, str]:
     logger.info(">>> 正在获取 VIX 恐慌指数...")
     df = safe_get_history(Config.VIX_INDEX, period="1mo", interval="1d", retries=2, auto_adjust=False)
     if len(df) < 2:
-        return 20.0, "⚠️ VIX 数据暂缺，启用保守防守模式 (默认 VIX=20)"
+        # 修改为更贴近常态的防守默认值 18.0
+        return 18.0, "⚠️ VIX 数据暂缺，启用中性防守模式 (默认 VIX=18)"
     
     vix = df['Close'].iloc[-1]
     if vix > 30:
@@ -235,12 +237,6 @@ def run_tech_matrix() -> None:
     regime, regime_desc, qqq_df = get_market_regime()
     logger.info(vix_desc)
     logger.info(f"当前大盘状态: {regime_desc}")
-    
-    # 修复逻辑：分别计算 QQQ 20日和5日的涨幅，供下方个股比对
-    qqq_ret_20d, qqq_ret_5d = 0.0, 0.0
-    if not qqq_df.empty and len(qqq_df) > 20:
-        qqq_ret_20d = (qqq_df['Close'].iloc[-1] / qqq_df['Close'].iloc[-20]) - 1
-        qqq_ret_5d = (qqq_df['Close'].iloc[-1] / qqq_df['Close'].iloc[-5]) - 1
 
     target_list = get_nasdaq_100()
     total_stocks = len(target_list)
@@ -248,10 +244,13 @@ def run_tech_matrix() -> None:
     
     for idx, symbol in enumerate(target_list):
         if symbol in Config.BLACKLIST:
-            logger.info(f"⚠️ [{symbol}] 在黑名单中，已跳过扫描。")
+            if idx % 10 == 0: logger.info(f"⚠️ [{symbol}] 等处于黑名单，已跳过。")
             continue
             
-        logger.info(f"[进度 {idx+1}/{total_stocks}] 正在分析 {symbol}...")
+        # 减少日志冗余
+        if idx % 10 == 0:
+            logger.info(f"[进度 {idx}/{total_stocks}] 正在进行指标矩阵扫描...")
+            
         try:
             df = safe_get_history(symbol, period="6mo", interval="1d")
             if len(df) < 100: continue
@@ -268,11 +267,20 @@ def run_tech_matrix() -> None:
 
             dynamic_rsi_threshold = max(20, min(40, 30 - (atr_pct - 0.03) * 100))
             
-            # --- 相对强度 (RS) 增强版 ---
-            stock_ret_20d = (curr['Close'] / df['Close'].iloc[-20]) - 1
-            stock_ret_5d = (curr['Close'] / df['Close'].iloc[-5]) - 1
-            rs_20 = (1 + stock_ret_20d) / (1 + qqq_ret_20d)
-            rs_5 = (1 + stock_ret_5d) / (1 + qqq_ret_5d)
+            # --- 相对强度 (RS) 增强对齐版 ---
+            rs_20, rs_5 = 1.0, 1.0
+            if not qqq_df.empty:
+                # 强制日期对齐，避免停牌/新股带来的周期错位
+                merged = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, suffixes=('_stock', '_qqq'))
+                if len(merged) >= 20:
+                    stock_ret_20d = (merged['Close_stock'].iloc[-1] / merged['Close_stock'].iloc[-20]) - 1
+                    qqq_ret_20d = (merged['Close_qqq'].iloc[-1] / merged['Close_qqq'].iloc[-20]) - 1
+                    rs_20 = (1 + stock_ret_20d) / (1 + qqq_ret_20d)
+                    
+                    stock_ret_5d = (merged['Close_stock'].iloc[-1] / merged['Close_stock'].iloc[-5]) - 1
+                    qqq_ret_5d = (merged['Close_qqq'].iloc[-1] / merged['Close_qqq'].iloc[-5]) - 1
+                    rs_5 = (1 + stock_ret_5d) / (1 + qqq_ret_5d)
+
             vol_ratio = curr['Volume'] / curr['Vol_MA20'] if curr['Vol_MA20'] > 0 else 1.0
 
             if rs_20 > 1.08 or (rs_5 > 1.05 and rs_20 > 1.03):
@@ -315,15 +323,19 @@ def run_tech_matrix() -> None:
                     signals.append("🔥 **[零上金叉]** 强势主升浪确认")
                     score += weight
 
-            # --- TTM Squeeze 升级版 (挤压 + 释放) ---
+            # --- TTM Squeeze 升级版 (历史挤压验证) ---
             bb_abs = curr['BB_Upper'] - curr['BB_Lower']
             kc_abs = curr['KC_Upper'] - curr['KC_Lower']
             is_squeeze_on = bb_abs < kc_abs
             
-            # 判断是否从挤压状态正在扩张释放
+            # 验证前5天是否真实存在过挤压状态，防止假点火
+            past_squeeze = (df['BB_Upper'].iloc[-6:-1] < df['KC_Upper'].iloc[-6:-1]) & \
+                           (df['BB_Lower'].iloc[-6:-1] > df['KC_Lower'].iloc[-6:-1])
+            was_squeeze = past_squeeze.any()
+            
             prev_bb_mean = df['BB_Width'].rolling(5).mean().iloc[-2]
             curr_bb_mean = df['BB_Width'].rolling(5).mean().iloc[-1]
-            is_squeeze_fire = bb_abs > kc_abs and prev_bb_mean < curr_bb_mean
+            is_squeeze_fire = was_squeeze and (bb_abs > kc_abs) and (prev_bb_mean < curr_bb_mean)
 
             if is_squeeze_on:
                 weight = 12 if regime == 'range' else 6
@@ -340,8 +352,9 @@ def run_tech_matrix() -> None:
                 signals.append(f"🚀 **[均线突破]** 强势站上50日均线")
                 score += weight
 
-            # --- 多时间框架共振 ---
-            if signals:
+            # --- 多时间框架共振 (智能懒加载) ---
+            # 仅在产生有价值的信号 (score >= 10) 时才去请求周线，极大节约网络开销
+            if signals and score >= 10:
                 weekly_trend = get_weekly_trend(symbol)
                 if weekly_trend == "bullish":
                     signals.append("📈 **[周线共振]** 长期趋势多头，增强日线有效性")
@@ -371,7 +384,7 @@ def run_tech_matrix() -> None:
                 reports.append({"symbol": symbol, "score": score, "text": report_text})
                 
         except Exception as e:
-            logger.error(f"[{symbol}] 分析发生错误: {e}")
+            logger.debug(f"[{symbol}] 分析发生静默错误: {e}")
 
     if reports:
         reports.sort(key=lambda x: x['score'], reverse=True)
@@ -396,7 +409,7 @@ def run_daily_screener() -> None:
             continue
             
         if idx % 10 == 0:
-            logger.info(f"[进度 {idx}/{total_stocks}] 正在评估趋势...")
+            logger.info(f"[进度 {idx}/{total_stocks}] 正在进行每日全景复盘...")
         try:
             df = safe_get_history(symbol, period="6mo", interval="1d")
             if len(df) < 50: continue
@@ -432,7 +445,7 @@ if __name__ == "__main__":
         test_tickers = get_nasdaq_100()[:5]
         send_dingtalk(
             "✅ Pro 量化引擎部署成功", 
-            f"已集成激进退避、TTM挤压点火与阶梯降权(门槛 {Config.MIN_SCORE_THRESHOLD})！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"已集成最终审查修正 (真点火判定、周线智能懒加载、严格日期对齐)！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
