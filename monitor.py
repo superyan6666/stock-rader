@@ -1,59 +1,52 @@
 import yfinance as yf
 import requests
 import os
+import json
 from datetime import datetime
 
-# 从 GitHub Secrets 中读取敏感信息（Webhook 地址）
+# 从 GitHub Secrets 中读取
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
-# 监控列表，可以根据需要修改
-WATCHLIST = ["NVDA", "TSLA", "AAPL", "AMD", "MSFT", "0700.HK"]
-
-def check_strategy(symbol):
-    try:
-        ticker = yf.Ticker(symbol)
-        # 获取最近 5 天的数据计算技术指标
-        df = ticker.history(period="5d", interval="1h")
-        if len(df) < 20: return None
-
-        current_price = df['Close'].iloc[-1]
-        # 简单模拟 Tickeron 的 RSI 策略
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rsi = 100 - (100 / (1 + gain/loss)).iloc[-1]
-
-        # 触发条件：RSI < 30 (超卖)
-        if rsi > 0:
-            return f"⚠️ {symbol} RSI 低于 30 ({rsi:.1f})，处于超卖区域，可能反弹。现价: ${current_price:.2f}"
-        
-        # 触发条件：单日大跌超过 5%
-        change = (df['Close'].iloc[-1] - df['Open'].iloc[-1]) / df['Open'].iloc[-1] * 100
-        if change < -5:
-            return f"🚨 {symbol} 今日剧烈波动，跌幅 {change:.1f}%。现价: ${current_price:.2f}"
-
-        return None
-    except Exception as e:
-        print(f"Error checking {symbol}: {e}")
-        return None
+WATCHLIST = ["NVDA", "AAPL"] # 缩短列表加快测试
 
 def send_notification(content):
     if not WEBHOOK_URL: 
-        print("Error: WEBHOOK_URL not set")
+        print("错误: 环境变量 WEBHOOK_URL 为空")
         return
     
+    print(f"准备向 Webhook 发送消息... URL前缀: {WEBHOOK_URL[:30]}...")
+    
+    # 飞书的 payload 格式
     payload = {
         "msg_type": "text",
         "content": {"text": f"【AI 盯盘助手】\n{content}\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"}
     }
-    requests.post(WEBHOOK_URL, json=payload)
+    
+    # 如果你是钉钉，请用下面这行替换上面的 payload（注意取消注释）
+    # payload = {"msgtype": "text", "text": {"content": f"【AI 盯盘助手】\n{content}"}}
+
+    try:
+        response = requests.post(WEBHOOK_URL, json=payload)
+        print(f"---- Webhook 响应信息 ----")
+        print(f"HTTP 状态码: {response.status_code}")
+        print(f"服务器真实返回: {response.text}")
+        print(f"--------------------------")
+        
+        # 分析常见错误
+        if response.status_code == 200:
+            res_data = response.json()
+            if res_data.get("code") != 0 and res_data.get("errcode") != 0:
+                print("🚨 警告: 请求已送达，但被机器人拒绝！请检查【安全设置】中的【自定义关键词】是否包含 'AI' 或 '盯盘助手'。")
+            else:
+                print("✅ 发送成功！请检查手机。")
+        else:
+            print("🚨 警告: Webhook 地址可能有误或格式不兼容。")
+            
+    except Exception as e:
+        print(f"发送请求时发生网络错误: {e}")
 
 if __name__ == "__main__":
-    alerts = []
-    for s in WATCHLIST:
-        res = check_strategy(s)
-        if res: alerts.append(res)
+    print("--- 强制测试模式启动 ---")
     
-    if alerts:
-        send_notification("\n\n".join(alerts))
-    else:
-        print("No signals triggered.")
+    # 无论股市如何，先强制发一条测试消息
+    test_msg = "这是一条强制测试消息。如果您收到，说明 GitHub 到手机的推送通道已完全畅通！"
+    send_notification(test_msg)
