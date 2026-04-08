@@ -150,6 +150,9 @@ def run_tech_matrix():
     print(">>> 启动复合技术指标诊断...")
     target_list = get_nasdaq_100()
     total_stocks = len(target_list)
+    
+    # 存放每只股票的评估结果，字典结构便于后续排序
+    # reports = [{"symbol": "AAPL", "score": 15, "text": "..."}, ...]
     reports = []
     
     for idx, symbol in enumerate(target_list):
@@ -158,7 +161,7 @@ def run_tech_matrix():
             df = safe_get_history(symbol, period="6mo", interval="1d")
             if len(df) < 55: continue
 
-            # 优化：计算全部指标前，先进行快速的流动性判断
+            # 流动性判断
             if df['Volume'].tail(20).mean() < 1000000:
                 continue
 
@@ -166,7 +169,9 @@ def run_tech_matrix():
             df = calculate_indicators(df)
             curr = df.iloc[-1]
             prev = df.iloc[-2]
+            
             signals = []
+            score = 0  # 核心改动：为这只股票维护一个策略重要性总分
             
             # --- 波动率动态 RSI 阈值 ---
             atr_pct = curr['ATR'] / curr['Close']
@@ -175,8 +180,10 @@ def run_tech_matrix():
             if curr['RSI'] < dynamic_rsi_threshold and prev['RSI'] >= dynamic_rsi_threshold:
                 if curr['Close'] > curr['EMA_50']:
                     signals.append(f"🟢 **[趋势回踩超卖]** 顺势买点 (阈值:{dynamic_rsi_threshold:.1f}, RSI:{curr['RSI']:.1f})")
+                    score += 10
                 else:
                     signals.append(f"⚠️ **[弱势超卖]** 防范接飞刀 (阈值:{dynamic_rsi_threshold:.1f}, RSI:{curr['RSI']:.1f})")
+                    score += 3
             
             # --- RSI 底背离检测 ---
             price_low_5 = df['Close'].iloc[-5:].min()
@@ -189,18 +196,22 @@ def run_tech_matrix():
             
             if price_low_5 < price_low_prev and rsi_at_low_5 > rsi_at_low_prev and curr['RSI'] < 40:
                 signals.append("🔍 **[RSI底背离]** 价格创新低但RSI未新低，下跌动能可能衰竭")
+                score += 9
             
             # --- MACD 零轴区分 ---
             if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
                 if curr['MACD'] < 0:
                     signals.append("🔸 **[零下金叉]** 弱反弹预期，注意见好就收")
+                    score += 4
                 else:
                     signals.append("🔥 **[零上金叉]** 强势主升浪确认")
+                    score += 8
 
             # --- 布林带挤压 ---
             avg_bb_width = df['BB_Width'].rolling(100).mean().iloc[-1]
             if pd.notna(avg_bb_width) and curr['BB_Width'] < avg_bb_width * 0.5:
                 signals.append("📦 **[布林带挤压]** 波动率降至冰点，即将面临剧烈变盘")
+                score += 6
 
             # --- 量价配合验证 ---
             vol_ratio = curr['Volume'] / curr['Vol_MA20']
@@ -209,24 +220,37 @@ def run_tech_matrix():
                 if vol_ratio > 3:
                     if price_position > 0.02:
                         signals.append(f"🌋 **[极端巨量上涨]** 激增 {vol_ratio:.1f}倍 强势上攻 (+{price_position:.1%})")
+                        score += 7
                     elif price_position < -0.02:
                         signals.append(f"🚨 **[极端巨量砸盘]** 激增 {vol_ratio:.1f}倍 破位下行 ({price_position:.1%})")
+                        score += 6 # 破位同样重要，给予较高关注度分数
                     else:
                         signals.append(f"🌋 **[极端巨量震荡]** 激增 {vol_ratio:.1f}倍 多空激烈交战")
+                        score += 5
                 else:
                     if price_position > 0.02:
                         signals.append(f"🌊 **[放量上涨]** 量价配合良好 (+{price_position:.1%})")
+                        score += 5
                     elif price_position < -0.02:
                         signals.append(f"⚠️ **[放量下跌]** 资金出逃迹象 ({price_position:.1%})")
+                        score += 4
                     else:
                         signals.append(f"🌊 **[温和放量]** 成交量放大 {vol_ratio:.1f} 倍")
+                        score += 3
 
             # --- 均线突破 ---
             if prev['Close'] < prev['EMA_50'] and curr['Close'] > curr['EMA_50']:
                 signals.append(f"🚀 **[均线突破]** 强势站上50日均线 (${curr['EMA_50']:.2f})")
+                score += 7
 
             if signals:
-                reports.append(f"**{symbol}** (${curr['Close']:.2f})\n> " + "\n> ".join(signals))
+                # 记录这只股票的综合得分和文字报告
+                report_text = f"**{symbol}** (${curr['Close']:.2f} | 🌟综合重要性得分: **{score}**)\n> " + "\n> ".join(signals)
+                reports.append({
+                    "symbol": symbol,
+                    "score": score,
+                    "text": report_text
+                })
                 
         except Exception as e:
             print(f"❌ [{symbol}] 处理时发生错误: {e}")
@@ -235,10 +259,17 @@ def run_tech_matrix():
     print(f"扫描完成！共提取 {len(reports)} 个有效标的。")
 
     if reports:
-        final_report = "\n\n".join(reports[:15])
+        # 核心改动：按信号权重得分从高到低进行排序！
+        reports.sort(key=lambda x: x['score'], reverse=True)
+        
+        # 只提取排序后的前 15 名文本
+        top_reports_text = [r['text'] for r in reports[:15]]
+        
+        final_report = "\n\n".join(top_reports_text)
         if len(reports) > 15:
-            final_report += f"\n\n*(还有 {len(reports)-15} 只股票触发预警，已省略)*"
-        send_dingtalk("📊 纳指 100 策略异动池", final_report)
+            final_report += f"\n\n*(还有 {len(reports)-15} 只股票触发预警。已为您智能过滤并展示得分最高的 Top 15 机会)*"
+            
+        send_dingtalk("📊 纳指 100 优选异动池", final_report)
     else:
         print("未触发核心指标策略。")
 
