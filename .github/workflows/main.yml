@@ -1,31 +1,75 @@
+440947
+```yaml
 # 存储路径: .github/workflows/main.yml
-name: Stock Monitor Bot
+name: Tickeron Pro AI Bot
 
 on:
   schedule:
-    # 这里的 cron 表达式表示每 30 分钟运行一次 (UTC 时间)
-    # 建议维持在 30 分钟，避免触发 yfinance 的频率限制
-    - cron: '*/30 * * * *'
-  workflow_dispatch: # 允许手动点击按钮测试
+    # 1. 高频异动哨兵：每 30 分钟运行一次 (周一到周五)
+    - cron: '*/30 * * * 1-5'
+    
+    # 2. 技术指标体检：每小时的第 15 分钟运行一次 (如 1:15, 2:15, 周一到周五)
+    - cron: '15 * * * 1-5'
+    
+    # 3. 每日全量复盘：每天晚上 UTC 22:00 运行一次 (大致美东收盘后，北京时间早上)
+    - cron: '0 22 * * 1-5'
+
+  workflow_dispatch:
+    inputs:
+      # 手动运行时的下拉菜单，让你选择跑哪个功能！
+      run_mode:
+        description: '选择要手动执行的策略模式'
+        required: true
+        default: 'test'
+        type: choice
+        options:
+          - test       # 发送测试消息
+          - sentinel   # 运行高频异动
+          - matrix     # 运行技术分析
+          - daily      # 运行每日复盘
 
 jobs:
-  build:
+  run-bot:
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4 # 更新到 v4
+        uses: actions/checkout@v4
 
-      - name: 设置 Python 环境
-        uses: actions/setup-python@v5 # 更新到 v5
+      - name: 设置 Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.9'
 
-      - name: 安装依赖
+      - name: 安装量化组件
         run: |
           pip install yfinance requests pandas
 
-      - name: 运行监控脚本
+      - name: 智能路由与执行
         env:
-          # 请确保你在 Settings -> Secrets -> Actions 中添加了 WEBHOOK_URL
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-        run: python monitor.py
+        run: |
+          # 判断是定时任务还是手动触发，并分配正确的参数
+          
+          # 默认模式
+          MODE="sentinel"
+          
+          # 如果是手动触发 (workflow_dispatch)，读取选择的模式
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            MODE="${{ github.event.inputs.run_mode }}"
+          
+          # 如果是定时任务 (schedule)，根据当前触发的具体 cron 表达式决定模式
+          elif [[ "${{ github.event_name }}" == "schedule" ]]; then
+            if [[ "${{ github.event.schedule }}" == "0 22 * * 1-5" ]]; then
+              MODE="daily"
+            elif [[ "${{ github.event.schedule }}" == "15 * * * 1-5" ]]; then
+              MODE="matrix"
+            else
+              MODE="sentinel"
+            fi
+          fi
+          
+          echo "准备以 [$MODE] 模式运行 AI 引擎..."
+          python monitor.py $MODE
+
+
+```
