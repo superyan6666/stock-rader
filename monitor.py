@@ -21,6 +21,7 @@ class Config:
     WEBHOOK_URL: str = os.environ.get('WEBHOOK_URL', '')
     DINGTALK_KEYWORD: str = "AI"
     CORE_WATCHLIST: List[str] = ["NVDA", "TSLA", "AAPL", "MSFT", "MSTR"]
+    BLACKLIST: List[str] = [] # 黑名单：遇到即将发财报或退市风险的股票可填入此处跳过扫描
     INDEX_ETF: str = "QQQ" # 纳指100 ETF
     VIX_INDEX: str = "^VIX" # 恐慌指数
 
@@ -157,10 +158,20 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     high_close = (df['High'] - df['Close'].shift()).abs()
     low_close = (df['Low'] - df['Close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    
+    # 动态阈值需要用到 14 日 ATR
     df['ATR'] = tr.rolling(window=14).mean()
     
+    # Keltner Channel (肯特纳通道) 辅助计算 - 采用 20 日均线与 20 日 ATR
+    df['ATR_20'] = tr.rolling(window=20).mean()
+    df['KC_Upper'] = df['EMA_20'] + 1.5 * df['ATR_20']
+    df['KC_Lower'] = df['EMA_20'] - 1.5 * df['ATR_20']
+    
+    # 布林带计算
     df['BB_MA20'] = df['Close'].rolling(window=20).mean()
     df['BB_STD20'] = df['Close'].rolling(window=20).std()
+    df['BB_Upper'] = df['BB_MA20'] + 2 * df['BB_STD20']
+    df['BB_Lower'] = df['BB_MA20'] - 2 * df['BB_STD20']
     df['BB_Width'] = (4 * df['BB_STD20']) / df['BB_MA20']
     
     return df
@@ -175,6 +186,9 @@ def run_volatility_sentinel() -> None:
 
     alerts = []
     for symbol in Config.CORE_WATCHLIST:
+        if symbol in Config.BLACKLIST:
+            continue
+            
         try:
             df = safe_get_history(symbol, period="2d", interval="1h")
             if len(df) < 2: continue
@@ -217,6 +231,10 @@ def run_tech_matrix() -> None:
     reports = []
     
     for idx, symbol in enumerate(target_list):
+        if symbol in Config.BLACKLIST:
+            logger.info(f"⚠️ [{symbol}] 在黑名单中，已跳过扫描。")
+            continue
+            
         logger.info(f"[进度 {idx+1}/{total_stocks}] 正在分析 {symbol}...")
         try:
             df = safe_get_history(symbol, period="6mo", interval="1d")
@@ -281,15 +299,16 @@ def run_tech_matrix() -> None:
                     signals.append("🔥 **[零上金叉]** 强势主升浪确认")
                     score += weight
 
-            # --- 布林带挤压 ---
-            avg_bb_width = df['BB_Width'].rolling(100).mean().iloc[-1]
-            if pd.notna(avg_bb_width) and curr['BB_Width'] < avg_bb_width * 0.5:
-                weight = 10 if regime == 'range' else 5
+            # --- TTM Squeeze 策略 (布林带进入肯特纳通道) ---
+            # 挤压条件：布林带上轨小于肯特纳上轨，且布林带下轨大于肯特纳下轨
+            is_sqz_on = (curr['BB_Upper'] < curr['KC_Upper']) and (curr['BB_Lower'] > curr['KC_Lower'])
+            if is_sqz_on:
+                weight = 12 if regime == 'range' else 6
                 if is_fatigued:
-                    signals.append("📦 **[布林带挤压]** 持续横盘中 (疲劳降权)")
+                    signals.append("📦 **[通道极度挤压]** 持续压缩中 (疲劳降权)")
                     score += int(weight * 0.5) # 疲劳抑制，分数减半
                 else:
-                    signals.append("📦 **[布林带挤压]** 即将剧烈变盘")
+                    signals.append("📦 **[通道极度挤压]** 波动率降至冰点，即将剧烈爆发")
                     score += weight
 
             # --- 均线突破 ---
@@ -346,6 +365,9 @@ def run_daily_screener() -> None:
     total_stocks = len(target_list)
     
     for idx, symbol in enumerate(target_list):
+        if symbol in Config.BLACKLIST:
+            continue
+            
         if idx % 10 == 0:
             logger.info(f"[进度 {idx}/{total_stocks}] 正在评估趋势...")
         try:
@@ -383,7 +405,7 @@ if __name__ == "__main__":
         test_tickers = get_nasdaq_100()[:5]
         send_dingtalk(
             "✅ Pro 量化引擎部署成功", 
-            f"已集成 VIX风控、相对强度与无状态去重！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"已集成肯特纳挤压确认与黑名单机制！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
