@@ -32,20 +32,29 @@ def validate_config():
     logger.info("✅ 环境变量与配置校验通过")
 
 # ================= 2. 数据与网络工具模块 =================
-def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", retries: int = 3) -> pd.DataFrame:
-    """带重试和随机延迟的安全网络请求"""
+def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", retries: int = 4) -> pd.DataFrame:
+    """带指数退避和动态随机延迟的安全网络请求"""
     for attempt in range(retries):
         try:
-            time.sleep(random.uniform(0.3, 0.8))
-            df = yf.Ticker(symbol).history(period=period, interval=interval)
-            # 修复：移除冗余的 None 判断，pandas 返回空时直接检查 empty
+            # 借鉴优化：动态延迟，日线数据长延迟，小时线短延迟模拟真实请求
+            sleep_sec = random.uniform(1.5, 3.0) if "1d" in interval else random.uniform(0.8, 1.5)
+            time.sleep(sleep_sec)
+            
+            # 借鉴优化：显式指定 auto_adjust=True 确保前复权
+            df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True)
+            
             if not df.empty:
                 return df
+                
         except Exception as e:
+            logger.warning(f"[{symbol}] 第 {attempt+1} 次获取数据失败: {e}")
             if attempt == retries - 1:
-                logger.error(f"[{symbol}] 获取数据最终失败: {e}")
+                logger.error(f"[{symbol}] 最终获取失败，已放弃")
                 return pd.DataFrame()
-            time.sleep(2)
+                
+            # 借鉴优化：指数退避 (Exponential Backoff)，失败后等待时间递增 (3s, 5s, 7s...)
+            time.sleep(3 + attempt * 2)
+            
     return pd.DataFrame()
 
 def get_nasdaq_100() -> List[str]:
@@ -146,7 +155,6 @@ def run_volatility_sentinel() -> None:
                 
             df_daily = safe_get_history(symbol, period="5d", interval="1d")
             if df_daily is not None and len(df_daily) >= 2:
-                # 修复：规范变量名
                 gap_daily_pct = (df_daily['Open'].iloc[-1] - df_daily['Close'].iloc[-2]) / df_daily['Close'].iloc[-2] * 100
                 if abs(gap_daily_pct) > 4:
                     alerts.append(f"> **{symbol}** 日线跳空 {'💥' if gap_daily_pct > 0 else '⚠️'}\n> 真实缺口: **{gap_daily_pct:+.2f}%**")
@@ -293,6 +301,6 @@ if __name__ == "__main__":
         run_daily_screener()
     elif mode == "test":
         test_tickers = get_nasdaq_100()[:5]
-        send_dingtalk("✅ Pro 量化引擎部署成功", f"包含代码审查全部优化（高波动拦截、环境校验、数学简化等）！\n当前测试获取的前五个代码为: {', '.join(test_tickers)}")
+        send_dingtalk("✅ Pro 量化引擎部署成功", f"包含网络抗风险优化（指数退避与随机延迟）！\n当前测试获取的前五个代码为: {', '.join(test_tickers)}")
     else:
         logger.error(f"未知的模式: {mode}")
