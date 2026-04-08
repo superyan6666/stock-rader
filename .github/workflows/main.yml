@@ -4,7 +4,7 @@ name: Stock Monitor Bot
 on:
   schedule:
     # 这里的 cron 表达式表示每 30 分钟运行一次 (UTC 时间)
-    # 你可以根据需要调整频率
+    # 建议维持在 30 分钟，避免触发 yfinance 的频率限制
     - cron: '*/30 * * * *'
   workflow_dispatch: # 允许手动点击按钮测试
 
@@ -13,10 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4 # 更新到 v4
 
       - name: 设置 Python 环境
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5 # 更新到 v5
         with:
           python-version: '3.9'
 
@@ -26,6 +26,6 @@ jobs:
 
       - name: 运行监控脚本
         env:
-          # 在 GitHub 仓库的 Settings -> Secrets 中设置此变量
+          # 请确保你在 Settings -> Secrets -> Actions 中添加了 WEBHOOK_URL
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: python monitor.py
