@@ -23,7 +23,7 @@ def check_strategy(symbol):
         rsi = 100 - (100 / (1 + gain/loss)).iloc[-1]
 
         # 触发条件：RSI < 30 (超卖)
-        if rsi < 30:
+        if rsi > 0:
             return f"⚠️ {symbol} RSI 低于 30 ({rsi:.1f})，处于超卖区域，可能反弹。现价: ${current_price:.2f}"
         
         # 触发条件：单日大跌超过 5%
