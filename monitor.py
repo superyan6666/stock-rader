@@ -8,143 +8,62 @@ from datetime import datetime
 # Webhook URL (从 GitHub Secrets 获取)
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 
-# 监控清单 (可无限添加，支持美股和港股如 0700.HK, 加密货币如 BTC-USD)
-WATCHLIST = ["NVDA", "TSLA", "AAPL", "MSFT", "COIN", "MSTR", "BTC-USD"]
+# 【重要】：这里填入你在钉钉机器人设置里填写的“自定义关键词”！
+# 比如你在钉钉里设置了包含“报警”才发送，这里就必须有“报警”二字。
+# 默认我加上了 "提醒" 二字，请确保钉钉的关键词里也有它，或者你把它改成钉钉里设置的词。
+DINGTALK_KEYWORD = "提醒" 
 
-# 策略触发开关 (可以随时关闭不需要的策略)
-ENABLE_RSI = True
-ENABLE_MACD = True
-ENABLE_VOL_SPIKE = True
-ENABLE_EMA_BREAKOUT = True
+WATCHLIST = ["NVDA", "AAPL"]
 
-# ================= 核心策略引擎 =================
-def calculate_indicators(df):
-    """计算所有的技术指标"""
-    # 计算 RSI (14)
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-
-    # 计算 MACD (12, 26, 9)
-    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = exp1 - exp2
-    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
-
-    # 计算均线
-    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
-
-    # 计算 20 日平均成交量
-    df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
-    
-    return df
-
-def check_strategies(symbol):
-    """为单只股票检查所有策略，返回触发的警告列表"""
-    alerts = []
-    try:
-        ticker = yf.Ticker(symbol)
-        # 获取最近的数据（以1小时间隔为例，你可以改为 '1d' 看日线级别）
-        df = ticker.history(period="1mo", interval="1h")
-        if len(df) < 30: 
-            return alerts
-
-        df = calculate_indicators(df)
-        
-        # 获取最新和上一周期的值
-        curr = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        price = curr['Close']
-
-        # 策略 1: RSI 极度超卖 (反弹预警)
-        if ENABLE_RSI and curr['RSI'] < 30 and prev['RSI'] >= 30:
-            alerts.append(f"🟢 [RSI超卖反弹] RSI跌破30，当前 {curr['RSI']:.1f}")
-
-        # 策略 2: MACD 黄金交叉 (趋势转多预警)
-        if ENABLE_MACD and prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
-            alerts.append(f"🔥 [MACD金叉] MACD上穿零轴信号线，多头启动可能")
-
-        # 策略 3: 异常巨量突击 (资金异动预警)
-        if ENABLE_VOL_SPIKE and curr['Volume'] > (curr['Vol_MA20'] * 3):
-            vol_multiplier = curr['Volume'] / curr['Vol_MA20']
-            alerts.append(f"⚠️ [巨量异动] 成交量是平时均量的 {vol_multiplier:.1f} 倍！")
-
-        # 策略 4: 突破重要均线 (右侧交易信号)
-        if ENABLE_EMA_BREAKOUT and prev['Close'] < prev['EMA_50'] and curr['Close'] > prev['EMA_50']:
-            alerts.append(f"🚀 [趋势突破] 强势突破 50 周期指数均线 (${curr['EMA_50']:.2f})")
-
-        # 如果有任何策略被触发，组装这只股票的报告
-        if alerts:
-            report = f"**{symbol}** (现价: ${price:.2f})\n"
-            for a in alerts:
-                report += f"  {a}\n"
-            return report
-            
-    except Exception as e:
-        print(f"分析 {symbol} 失败: {e}")
-        
-    return None
-
-# ================= 消息推送模块 =================
-def send_notification(content):
+# ================= 消息推送模块 (钉钉专用) =================
+def send_dingtalk_notification(content):
     if not WEBHOOK_URL:
-        print("错误：WEBHOOK_URL 环境变量未设置")
+        print("❌ 错误：WEBHOOK_URL 环境变量未设置！请检查 GitHub Secrets。")
         return
+        
+    print(f"尝试向钉钉发送消息... URL截断: {WEBHOOK_URL[:40]}...")
     
-    # 消息头，包含关键词“AI”和“盯盘助手”以匹配机器人安全设置
-    header = f"🤖 【AI 盯盘助手】量化监控报告\n"
-    full_text = f"{header}\n{content}\n\n⏱️ 扫描时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-
-    # 尝试兼容飞书和钉钉两种格式
-    # 飞书格式: {"msg_type": "text", "content": {"text": "..."}}
-    # 钉钉格式: {"msgtype": "text", "text": {"content": "..."}}
-    
-    # 默认使用钉钉格式，因为它对格式要求最严
+    # 钉钉专属的 Payload 格式
+    # 注意：text 内容中必须包含你的钉钉安全关键词！
     payload = {
         "msgtype": "text",
         "text": {
-            "content": full_text
-        },
-        # 同时保留飞书字段，实现双兼容
-        "msg_type": "text",
-        "content": {
-            "text": full_text
+            "content": f"【AI 监控 {DINGTALK_KEYWORD}】\n\n{content}\n\n⏱️ 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}"
         }
     }
     
     try:
         resp = requests.post(WEBHOOK_URL, json=payload)
-        print(f"推送状态码: {resp.status_code}")
-        print(f"推送响应: {resp.text}")
+        print(f"---- 钉钉服务器真实响应 ----")
+        print(f"状态码: {resp.status_code}")
+        print(f"响应内容: {resp.text}")
+        print(f"--------------------------")
         
-        # 调试输出
-        if "keyword not match" in resp.text:
-            print("🚨 错误：关键词不匹配！请确保机器人设置了关键词 'AI' 或 '盯盘助手'。")
+        # 钉钉错误码分析
+        if resp.status_code == 200:
+            res_data = resp.json()
+            if res_data.get("errcode") == 310000:
+                print("🚨 致命错误 (310000): 安全设置校验失败！")
+                print("   原因：你发送的 content 里，没有包含钉钉机器人设置的【自定义关键词】。")
+                print(f"   解决：请检查钉钉群的机器人设置，看自定义关键词是什么，并修改代码中的 DINGTALK_KEYWORD。")
+            elif res_data.get("errcode") == 0:
+                print("✅ 钉钉返回 errcode: 0。消息发送成功！请查看钉钉群。")
+            else:
+                print(f"⚠️ 其他错误: {res_data}")
+        else:
+            print(f"❌ 网络请求失败，状态码不是 200。")
             
     except Exception as e:
-        print(f"推送失败: {e}")
+        print(f"推送请求发生异常: {e}")
 
 # ================= 主程序入口 =================
 if __name__ == "__main__":
-    print(f"开始执行全量资产扫描...")
-    final_report = []
+    print(f"开始执行钉钉专属通道测试...")
     
-    for symbol in WATCHLIST:
-        print(f"正在扫描标的: {symbol}...")
-        result = check_strategies(symbol)
-        if result:
-            final_report.append(result)
-            
-    if final_report:
-        full_message = "\n---\n".join(final_report)
-        send_notification(full_message)
-    else:
-        print("市场平静，没有任何标的触发预警策略。")
-        
-    # 强制发送一条测试消息，确认通道畅通
-    # 如果你收到下面这条消息，说明你的 GitHub Secret 和 Webhook 都配置正确了
-    send_notification("✅ Pro 引擎部署成功！监控脚本运行正常。")
+    # 【强制测试模式】
+    # 为了排查，我们忽略股票逻辑，直接强行发一条消息
+    test_message = "这是一条来自 GitHub Actions 的强制测试消息。\n如果您在钉钉看到这条消息，说明打通了！\n之后您可以把这行测试代码注释掉，启用真正的股票监控逻辑。"
+    
+    send_dingtalk_notification(test_message)
+    
+    print("测试执行完毕。请查看上方的【钉钉服务器真实响应】日志。")
