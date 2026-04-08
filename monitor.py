@@ -3,6 +3,8 @@ import requests
 import os
 import sys
 import pandas as pd
+import time
+import random
 from datetime import datetime, timezone
 
 # ================= 配置区 =================
@@ -14,6 +16,23 @@ DINGTALK_KEYWORD = "AI"
 
 # 1. 核心盯盘清单：用于高频异动哨兵，防止请求过多被封
 CORE_WATCHLIST = ["NVDA", "TSLA", "AAPL", "MSFT", "MSTR"]
+
+# ================= 数据获取防护模块 =================
+def safe_get_history(symbol, period="6mo", interval="1d", retries=3):
+    """带重试和随机延迟的安全网络请求，防止被雅虎限流"""
+    for attempt in range(retries):
+        try:
+            # 随机延迟 0.3~0.8 秒，模拟人类请求
+            time.sleep(random.uniform(0.3, 0.8))
+            df = yf.Ticker(symbol).history(period=period, interval=interval)
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            if attempt == retries - 1:
+                print(f"❌ [{symbol}] 获取数据最终失败: {e}")
+                return pd.DataFrame()
+            time.sleep(2) # 失败后冷却2秒再重试
+    return pd.DataFrame()
 
 # ================= 动态获取股票池 =================
 def get_nasdaq_100():
@@ -61,8 +80,6 @@ def calculate_indicators(df):
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    
-    # 防止除零错误 (加上极小值 1e-10)
     rs = gain / (loss + 1e-10)
     df['RSI'] = 100 - (100 / (1 + rs))
 
@@ -79,23 +96,25 @@ def calculate_indicators(df):
     # 计算 20 日平均成交量
     df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
     
-    # 计算 ATR (14) 平均真实波幅，用于评估波动率
+    # 计算 ATR (14)
     high_low = df['High'] - df['Low']
     high_close = (df['High'] - df['Close'].shift()).abs()
     low_close = (df['Low'] - df['Close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
     
+    # 计算布林带 (20, 2)
+    df['BB_MA20'] = df['Close'].rolling(window=20).mean()
+    df['BB_STD20'] = df['Close'].rolling(window=20).std()
+    df['BB_Upper'] = df['BB_MA20'] + 2 * df['BB_STD20']
+    df['BB_Lower'] = df['BB_MA20'] - 2 * df['BB_STD20']
+    df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_MA20']
+    
     return df
 
 # ================= 模式 1: 高频异动哨兵 (仅扫描核心自选) =================
 def run_volatility_sentinel():
     print(">>> 启动高频异动哨兵模式...")
-    
-    # 改进：增加美股交易时段判断 (UTC时间)
-    # 夏令时美东 9:30-16:00 = UTC 13:30-20:00
-    # 冬令时美东 9:30-16:00 = UTC 14:30-21:00
-    # 采用 13-21 的宽泛区间，既兼容冬夏令时，又包含少量盘前盘后活跃期
     now_utc = datetime.now(timezone.utc)
     if not (13 <= now_utc.hour <= 21):
         print(f"💤 当前时间 (UTC {now_utc.hour}:{now_utc.minute}) 处于非主要交易时段，跳过高频扫描以防止盘后假信号。")
@@ -104,19 +123,17 @@ def run_volatility_sentinel():
     alerts = []
     for symbol in CORE_WATCHLIST:
         try:
-            df = yf.Ticker(symbol).history(period="2d", interval="1h")
+            df = safe_get_history(symbol, period="2d", interval="1h")
             if len(df) < 2: continue
             
             curr_price = df['Close'].iloc[-1]
             open_price = df['Open'].iloc[-1] 
             prev_close = df['Close'].iloc[-2]
             
-            # 短线急涨急跌
             hour_change = (curr_price - open_price) / open_price * 100
             if abs(hour_change) > 3:
                 alerts.append(f"> **{symbol}** 短线异动 {'🚀' if hour_change > 0 else '🩸'} \n> 1小时内波动: **{hour_change:+.2f}%** (现价: ${curr_price:.2f})")
                 
-            # 跳空缺口
             gap_change = (open_price - prev_close) / prev_close * 100
             if abs(gap_change) > 4:
                 alerts.append(f"> **{symbol}** 跳空预警 {'💥' if gap_change > 0 else '⚠️'}\n> 缺口: **{gap_change:+.2f}%**")
@@ -132,56 +149,79 @@ def run_volatility_sentinel():
 def run_tech_matrix():
     print(">>> 启动复合技术指标诊断...")
     target_list = get_nasdaq_100()
+    total_stocks = len(target_list)
     reports = []
     
-    for symbol in target_list:
+    for idx, symbol in enumerate(target_list):
+        print(f"[进度 {idx+1}/{total_stocks}] 正在分析 {symbol}...")
         try:
-            ticker = yf.Ticker(symbol)
-            # 数据窗口拉长为 6mo 确保均线准确
-            df = ticker.history(period="6mo", interval="1d")
-            # 严格过滤上市不足55天的股票，防止50日均线引发的假信号和报错
+            df = safe_get_history(symbol, period="6mo", interval="1d")
             if len(df) < 55: continue
 
+            # 优化：计算全部指标前，先进行快速的流动性判断
+            if df['Volume'].tail(20).mean() < 1000000:
+                continue
+
+            # 通过流动性过滤后，再进行全量计算
             df = calculate_indicators(df)
             curr = df.iloc[-1]
             prev = df.iloc[-2]
-
-            # 严格的流动性过滤 (排除冷门股)
-            if curr['Vol_MA20'] < 1000000:
-                continue
-
             signals = []
             
-            # 加入波动率评估的动态 RSI 阈值
+            # --- 波动率动态 RSI 阈值 ---
             atr_pct = curr['ATR'] / curr['Close']
             dynamic_rsi_threshold = max(20, min(40, 30 - (atr_pct - 0.03) * 100))
             
-            # 改进：在后台日志打印 ATR 参数，不打扰前端钉钉用户，方便后期量化调参
-            if atr_pct > 0: # 过滤极小值打印
-                print(f"[{symbol}] ATR占比: {atr_pct:.4f} | 动态RSI阈值计算结果: {dynamic_rsi_threshold:.1f}")
-
-            # RSI 趋势与动态阈值过滤
             if curr['RSI'] < dynamic_rsi_threshold and prev['RSI'] >= dynamic_rsi_threshold:
                 if curr['Close'] > curr['EMA_50']:
                     signals.append(f"🟢 **[趋势回踩超卖]** 顺势买点 (阈值:{dynamic_rsi_threshold:.1f}, RSI:{curr['RSI']:.1f})")
                 else:
                     signals.append(f"⚠️ **[弱势超卖]** 防范接飞刀 (阈值:{dynamic_rsi_threshold:.1f}, RSI:{curr['RSI']:.1f})")
             
-            # MACD 金叉的零轴环境区分
+            # --- RSI 底背离检测 ---
+            price_low_5 = df['Close'].iloc[-5:].min()
+            idx_low_5 = df['Close'].iloc[-5:].idxmin()
+            rsi_at_low_5 = df['RSI'].loc[idx_low_5]
+            
+            price_low_prev = df['Close'].iloc[-15:-5].min()
+            idx_low_prev = df['Close'].iloc[-15:-5].idxmin()
+            rsi_at_low_prev = df['RSI'].loc[idx_low_prev]
+            
+            if price_low_5 < price_low_prev and rsi_at_low_5 > rsi_at_low_prev and curr['RSI'] < 40:
+                signals.append("🔍 **[RSI底背离]** 价格创新低但RSI未新低，下跌动能可能衰竭")
+            
+            # --- MACD 零轴区分 ---
             if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
                 if curr['MACD'] < 0:
                     signals.append("🔸 **[零下金叉]** 弱反弹预期，注意见好就收")
                 else:
                     signals.append("🔥 **[零上金叉]** 强势主升浪确认")
 
-            # 放量倍数分级评估
-            vol_ratio = curr['Volume'] / curr['Vol_MA20']
-            if vol_ratio > 3:
-                signals.append(f"🌋 **[极端巨量]** 成交量激增 {vol_ratio:.1f} 倍！")
-            elif vol_ratio > 1.8:
-                signals.append(f"🌊 **[温和放量]** 成交量放大 {vol_ratio:.1f} 倍")
+            # --- 布林带挤压 ---
+            avg_bb_width = df['BB_Width'].rolling(100).mean().iloc[-1]
+            if pd.notna(avg_bb_width) and curr['BB_Width'] < avg_bb_width * 0.5:
+                signals.append("📦 **[布林带挤压]** 波动率降至冰点，即将面临剧烈变盘")
 
-            # 趋势突破
+            # --- 量价配合验证 ---
+            vol_ratio = curr['Volume'] / curr['Vol_MA20']
+            if vol_ratio > 1.8:
+                price_position = (curr['Close'] - curr['EMA_20']) / curr['EMA_20']
+                if vol_ratio > 3:
+                    if price_position > 0.02:
+                        signals.append(f"🌋 **[极端巨量上涨]** 激增 {vol_ratio:.1f}倍 强势上攻 (+{price_position:.1%})")
+                    elif price_position < -0.02:
+                        signals.append(f"🚨 **[极端巨量砸盘]** 激增 {vol_ratio:.1f}倍 破位下行 ({price_position:.1%})")
+                    else:
+                        signals.append(f"🌋 **[极端巨量震荡]** 激增 {vol_ratio:.1f}倍 多空激烈交战")
+                else:
+                    if price_position > 0.02:
+                        signals.append(f"🌊 **[放量上涨]** 量价配合良好 (+{price_position:.1%})")
+                    elif price_position < -0.02:
+                        signals.append(f"⚠️ **[放量下跌]** 资金出逃迹象 ({price_position:.1%})")
+                    else:
+                        signals.append(f"🌊 **[温和放量]** 成交量放大 {vol_ratio:.1f} 倍")
+
+            # --- 均线突破 ---
             if prev['Close'] < prev['EMA_50'] and curr['Close'] > curr['EMA_50']:
                 signals.append(f"🚀 **[均线突破]** 强势站上50日均线 (${curr['EMA_50']:.2f})")
 
@@ -189,7 +229,10 @@ def run_tech_matrix():
                 reports.append(f"**{symbol}** (${curr['Close']:.2f})\n> " + "\n> ".join(signals))
                 
         except Exception as e:
+            print(f"❌ [{symbol}] 处理时发生错误: {e}")
             pass
+
+    print(f"扫描完成！共提取 {len(reports)} 个有效标的。")
 
     if reports:
         final_report = "\n\n".join(reports[:15])
@@ -204,10 +247,12 @@ def run_daily_screener():
     print(">>> 启动纳指 100 全量扫盘报告...")
     target_list = get_nasdaq_100()
     bullish, bearish = [], []
+    total_stocks = len(target_list)
     
-    for symbol in target_list:
+    for idx, symbol in enumerate(target_list):
+        print(f"[进度 {idx+1}/{total_stocks}] 正在评估趋势 {symbol}...")
         try:
-            df = yf.Ticker(symbol).history(period="6mo", interval="1d")
+            df = safe_get_history(symbol, period="6mo", interval="1d")
             if len(df) < 50: continue
             
             price = df['Close'].iloc[-1]
@@ -226,7 +271,6 @@ def run_daily_screener():
 
 # ================= 主控制逻辑 =================
 if __name__ == "__main__":
-    # 接收 GitHub Actions 传递的执行模式，默认执行 sentinel
     mode = sys.argv[1] if len(sys.argv) > 1 else "sentinel"
     print(f"正在以模式运行: [{mode}]")
     
@@ -238,6 +282,6 @@ if __name__ == "__main__":
         run_daily_screener()
     elif mode == "test":
         test_tickers = get_nasdaq_100()[:5]
-        send_dingtalk("✅ Pro 引擎部署成功", f"包含防接飞刀机制与自动纳指100抓取！\n当前测试获取的前五个代码为: {', '.join(test_tickers)}")
+        send_dingtalk("✅ Pro 量化引擎部署成功", f"包含防接飞刀、底背离检测、量价确认与随机请求延迟！\n当前测试获取的前五个代码为: {', '.join(test_tickers)}")
     else:
         print(f"未知的模式: {mode}")
