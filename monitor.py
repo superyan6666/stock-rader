@@ -11,7 +11,7 @@ WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 # 【重要】：这里填入你在钉钉机器人设置里填写的“自定义关键词”！
 # 比如你在钉钉里设置了包含“报警”才发送，这里就必须有“报警”二字。
 # 默认我加上了 "提醒" 二字，请确保钉钉的关键词里也有它，或者你把它改成钉钉里设置的词。
-DINGTALK_KEYWORD = "提醒" 
+DINGTALK_KEYWORD = "AI" 
 
 WATCHLIST = ["NVDA", "AAPL"]
 
