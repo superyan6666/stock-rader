@@ -1,0 +1,31 @@
+# 存储路径: .github/workflows/main.yml
+name: Stock Monitor Bot
+
+on:
+  schedule:
+    # 这里的 cron 表达式表示每 30 分钟运行一次 (UTC 时间)
+    # 你可以根据需要调整频率
+    - cron: '*/30 * * * *'
+  workflow_dispatch: # 允许手动点击按钮测试
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v3
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: 安装依赖
+        run: |
+          pip install yfinance requests pandas
+
+      - name: 运行监控脚本
+        env:
+          # 在 GitHub 仓库的 Settings -> Secrets 中设置此变量
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: python monitor.py
