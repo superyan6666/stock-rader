@@ -32,14 +32,15 @@ def validate_config():
     logger.info("✅ 环境变量与配置校验通过")
 
 # ================= 2. 数据与网络工具模块 =================
-def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", retries: int = 4) -> pd.DataFrame:
+def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", retries: int = 4, auto_adjust: bool = True) -> pd.DataFrame:
     """带指数退避和动态随机延迟的安全网络请求"""
     for attempt in range(retries):
         try:
             sleep_sec = random.uniform(1.5, 3.0) if "1d" in interval else random.uniform(0.8, 1.5)
             time.sleep(sleep_sec)
             
-            df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True)
+            # 改进：允许关闭 auto_adjust，防止指数和 ETF 报价失真
+            df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=auto_adjust)
             if not df.empty:
                 return df
                 
@@ -59,9 +60,11 @@ def get_nasdaq_100() -> List[str]:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         response = requests.get(url, headers=headers, timeout=15)
         
-        tables = pd.read_html(response.text, match='Ticker')
+        # 改进：增加正则容错，防止维基百科表头在 Ticker 和 Symbol 之间变动
+        tables = pd.read_html(response.text, match='Ticker|Symbol')
         df = tables[0]
-        tickers = df['Ticker'].tolist()
+        col_name = 'Ticker' if 'Ticker' in df.columns else 'Symbol'
+        tickers = df[col_name].tolist()
         tickers = [t.replace('.', '-') for t in tickers]
         logger.info(f"✅ 成功获取 {len(tickers)} 只纳斯达克 100 股票！")
         return tickers
@@ -91,9 +94,10 @@ def send_dingtalk(title: str, content: str) -> None:
 def get_vix_level() -> Tuple[float, str]:
     """获取 VIX 恐慌指数，用于全局风控"""
     logger.info(">>> 正在获取 VIX 恐慌指数...")
-    df = safe_get_history(Config.VIX_INDEX, period="1mo", interval="1d", retries=2)
+    df = safe_get_history(Config.VIX_INDEX, period="1mo", interval="1d", retries=2, auto_adjust=False)
     if len(df) < 2:
-        return 15.0, "⚖️ VIX 数据暂缺，按正常波动处理"
+        # 改进：数据缺失时，默认 VIX=20 (防守模式)，避免误判为平静
+        return 20.0, "⚠️ VIX 数据暂缺，启用保守防守模式 (默认 VIX=20)"
     
     vix = df['Close'].iloc[-1]
     if vix > 25:
@@ -106,7 +110,7 @@ def get_vix_level() -> Tuple[float, str]:
 def get_market_regime() -> Tuple[str, str, pd.DataFrame]:
     """判断大盘环境，并返回 QQQ 数据用于后续相对强度(RS)计算"""
     logger.info(f">>> 正在分析大盘环境 ({Config.INDEX_ETF})...")
-    df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d")
+    df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", auto_adjust=False)
     
     if len(df) < 200:
         return "range", "大盘数据不足，默认震荡市", df
@@ -124,8 +128,9 @@ def get_market_regime() -> Tuple[str, str, pd.DataFrame]:
 
 def get_weekly_trend(symbol: str) -> str:
     """懒加载获取周线，做多时间框架过滤"""
-    df_week = safe_get_history(symbol, period="1y", interval="1wk", retries=2)
-    if len(df_week) < 30: return "neutral"
+    # 改进：修复 50w MA 需要足够数据的 Bug，将 period 改为 "2y" (约104根周线)
+    df_week = safe_get_history(symbol, period="2y", interval="1wk", retries=2)
+    if len(df_week) < 55: return "neutral"
         
     price = df_week['Close'].iloc[-1]
     ma50w = df_week['Close'].rolling(50).mean().iloc[-1]
@@ -172,7 +177,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['BB_STD20'] = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = df['BB_MA20'] + 2 * df['BB_STD20']
     df['BB_Lower'] = df['BB_MA20'] - 2 * df['BB_STD20']
-    df['BB_Width'] = (4 * df['BB_STD20']) / df['BB_MA20']
     
     return df
 
@@ -207,7 +211,8 @@ def run_volatility_sentinel() -> None:
                     alerts.append(f"> **{symbol}** 日线跳空 {'💥' if gap_daily_pct > 0 else '⚠️'}\n> 真实缺口: **{gap_daily_pct:+.2f}%**")
                     
         except Exception as e:
-            pass
+            # 改进：记录异常但静默运行，便于排查
+            logger.debug(f"[{symbol}] 哨兵模式分析跳过: {e}")
 
     if alerts:
         send_dingtalk("⚡ 极端异动警告", "\n\n".join(alerts))
@@ -249,10 +254,6 @@ def run_tech_matrix() -> None:
             
             atr_pct = curr['ATR'] / curr['Close']
             if atr_pct > 0.10: continue # 过滤极端波动 (财报/暴雷)
-            
-            # 计算无状态疲劳度 (股价1日内变动极小)
-            price_change_1d = abs((curr['Close'] - prev['Close']) / prev['Close'])
-            is_fatigued = price_change_1d < 0.005 # 变动不足 0.5%
 
             dynamic_rsi_threshold = max(20, min(40, 30 - (atr_pct - 0.03) * 100))
             
@@ -300,16 +301,15 @@ def run_tech_matrix() -> None:
                     score += weight
 
             # --- TTM Squeeze 策略 (布林带进入肯特纳通道) ---
-            # 挤压条件：布林带上轨小于肯特纳上轨，且布林带下轨大于肯特纳下轨
-            is_sqz_on = (curr['BB_Upper'] < curr['KC_Upper']) and (curr['BB_Lower'] > curr['KC_Lower'])
+            # 改进：修复数学比较逻辑，直接比较绝对宽度，更准确地捕获波动率压缩
+            bb_abs_width = curr['BB_Upper'] - curr['BB_Lower']
+            kc_abs_width = curr['KC_Upper'] - curr['KC_Lower']
+            is_sqz_on = bb_abs_width < kc_abs_width
+            
             if is_sqz_on:
                 weight = 12 if regime == 'range' else 6
-                if is_fatigued:
-                    signals.append("📦 **[通道极度挤压]** 持续压缩中 (疲劳降权)")
-                    score += int(weight * 0.5) # 疲劳抑制，分数减半
-                else:
-                    signals.append("📦 **[通道极度挤压]** 波动率降至冰点，即将剧烈爆发")
-                    score += weight
+                signals.append("📦 **[通道极度挤压]** 波动率降至冰点，即将剧烈爆发")
+                score += weight
 
             # --- 均线突破 ---
             if prev['Close'] < prev['EMA_50'] and curr['Close'] > curr['EMA_50']:
@@ -321,10 +321,10 @@ def run_tech_matrix() -> None:
             if signals:
                 weekly_trend = get_weekly_trend(symbol)
                 if weekly_trend == "bullish":
-                    signals.append("📈 **[周线共振]** 长期趋势处于多头，增强有效性")
+                    signals.append("📈 **[周线共振]** 长期趋势多头，增强日线有效性")
                     score += 5 
                 elif weekly_trend == "bearish":
-                    signals.append("📉 **[周线逆风]** 长期趋势处于空头，需警惕陷阱")
+                    signals.append("📉 **[周线逆风]** 长期趋势空头，警惕短线陷阱风险")
                     score -= 4 
 
             if signals:
@@ -405,7 +405,7 @@ if __name__ == "__main__":
         test_tickers = get_nasdaq_100()[:5]
         send_dingtalk(
             "✅ Pro 量化引擎部署成功", 
-            f"已集成肯特纳挤压确认与黑名单机制！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"已集成精修版算法（2年周线修复、VIX防守增强、TTM通道修正）！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
