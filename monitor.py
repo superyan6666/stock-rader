@@ -6,13 +6,14 @@ import pandas as pd
 from datetime import datetime, timezone
 
 # ================= 配置区 =================
+# Webhook URL (从 GitHub Secrets 获取)
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 
 # 【重要】钉钉安全关键词
 DINGTALK_KEYWORD = "AI"
 
-# 1. 核心盯盘清单：你可以把最关心的几只单独放这里（用于高频异动哨兵）
-CORE_WATCHLIST = ["TSLA", "AAPL", "MSFT", "PL", "SNDK", "CRCL", "BRK.A"]
+# 1. 核心盯盘清单：用于高频异动哨兵，防止请求过多被封
+CORE_WATCHLIST = ["NVDA", "TSLA", "AAPL", "MSFT", "MSTR"]
 
 # ================= 动态获取股票池 =================
 def get_nasdaq_100():
@@ -20,29 +21,23 @@ def get_nasdaq_100():
     print(">>> 正在联网获取最新 纳斯达克 100 成分股名单...")
     try:
         url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
-        # 伪装成浏览器请求，防止被维基百科拦截
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         response = requests.get(url, headers=headers)
         
-        # 使用 pandas 自动解析网页中包含 'Ticker' 列的表格
         tables = pd.read_html(response.text, match='Ticker')
         df = tables[0]
-        
-        # 提取股票代码并转换为列表
         tickers = df['Ticker'].tolist()
-        
-        # 修复雅虎财经的代码格式 (比如维基上是 BRK.B，雅虎需要 BRK-B)
-        tickers = [t.replace('.', '-') for t in tickers]
+        tickers = [t.replace('.', '-') for t in tickers] # 修复雅虎财经格式
         
         print(f"✅ 成功获取 {len(tickers)} 只纳斯达克 100 股票！")
         return tickers
     except Exception as e:
-        print(f"❌ 获取名单失败，将使用备用名单。错误: {e}")
-        # 如果抓取失败，返回几个保底的科技巨头
-        return ["MSFT", "AAPL", "NVDA", "AMZN", "META", "GOOGL", "TSLA"]
+        print(f"❌ 获取名单失败，使用备用核心名单。错误: {e}")
+        return CORE_WATCHLIST
 
 # ================= 通用消息推送模块 =================
 def send_dingtalk(title, content):
+    """发送格式化的钉钉 Markdown 消息"""
     if not WEBHOOK_URL: 
         print("❌ 错误：WEBHOOK_URL 环境变量未设置")
         return
@@ -59,11 +54,37 @@ def send_dingtalk(title, content):
     except Exception as e:
         print(f"推送请求发生异常: {e}")
 
+# ================= 核心策略引擎 (共用计算模块) =================
+def calculate_indicators(df):
+    """计算所有的技术指标"""
+    # 计算 RSI (14)
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    
+    # 改进 1: 防止除零错误 (加上极小值 1e-10)
+    rs = gain / (loss + 1e-10)
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    # 计算 MACD (12, 26, 9)
+    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp1 - exp2
+    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+    # 计算均线
+    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+
+    # 计算 20 日平均成交量
+    df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
+    
+    return df
+
 # ================= 模式 1: 高频异动哨兵 (仅扫描核心自选) =================
 def run_volatility_sentinel():
     print(">>> 启动高频异动哨兵模式...")
     alerts = []
-    # 高频扫描为了速度和防止被封IP，仅扫描 CORE_WATCHLIST
     for symbol in CORE_WATCHLIST:
         try:
             df = yf.Ticker(symbol).history(period="2d", interval="1h")
@@ -73,10 +94,12 @@ def run_volatility_sentinel():
             open_price = df['Open'].iloc[-1] 
             prev_close = df['Close'].iloc[-2]
             
+            # 短线急涨急跌
             hour_change = (curr_price - open_price) / open_price * 100
             if abs(hour_change) > 3:
                 alerts.append(f"> **{symbol}** 短线异动 {'🚀' if hour_change > 0 else '🩸'} \n> 1小时内波动: **{hour_change:+.2f}%** (现价: ${curr_price:.2f})")
                 
+            # 跳空缺口
             gap_change = (open_price - prev_close) / prev_close * 100
             if abs(gap_change) > 4:
                 alerts.append(f"> **{symbol}** 跳空预警 {'💥' if gap_change > 0 else '⚠️'}\n> 缺口: **{gap_change:+.2f}%**")
@@ -85,52 +108,68 @@ def run_volatility_sentinel():
 
     if alerts:
         send_dingtalk("⚡ 极端异动警告", "\n\n".join(alerts))
+    else:
+        print("未发现极端异动。")
 
-# ================= 模式 2: 技术指标矩阵 =================
+# ================= 模式 2: 技术指标矩阵 (扫描纳指100) =================
 def run_tech_matrix():
     print(">>> 启动复合技术指标诊断...")
-    
-    # 动态获取纳斯达克 100 列表！
     target_list = get_nasdaq_100()
     reports = []
     
     for symbol in target_list:
         try:
-            df = yf.Ticker(symbol).history(period="1mo", interval="1d") 
-            if len(df) < 20: continue
+            ticker = yf.Ticker(symbol)
+            # 改进 2: 数据窗口拉长为 6mo 确保均线准确
+            df = ticker.history(period="6mo", interval="1d")
+            if len(df) < 55: continue
 
+            df = calculate_indicators(df)
             curr = df.iloc[-1]
-            delta = df['Close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            df['RSI'] = 100 - (100 / (1 + gain/loss))
+            prev = df.iloc[-2]
+
+            # 改进 3: 严格的流动性过滤 (排除冷门股)
+            if curr['Vol_MA20'] < 1000000:
+                continue
 
             signals = []
-            if df['RSI'].iloc[-1] < 30 and df['RSI'].iloc[-2] >= 30:
-                signals.append("🟢 **RSI超卖** (寻底反弹机会)")
-            elif df['RSI'].iloc[-1] > 70 and df['RSI'].iloc[-2] <= 70:
-                signals.append("🔴 **RSI超买** (短期回调风险)")
             
-            if curr['Volume'] > df['Volume'].rolling(20).mean().iloc[-1] * 2:
-                signals.append("🔥 **巨量突击** (资金高度活跃)")
+            # 改进 4: 趋势过滤 RSI (防接飞刀)
+            if curr['RSI'] < 30 and prev['RSI'] >= 30:
+                if curr['Close'] > curr['EMA_50']:
+                    signals.append("🟢 **[趋势回踩超卖]** 高胜率买点 (价格在50日均线上)")
+                else:
+                    signals.append("⚠️ **[弱势超卖]** 存在接飞刀风险 (趋势向下)")
+            
+            # MACD 金叉
+            if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
+                signals.append("🔥 **[MACD金叉]** 多头启动可能")
+
+            # 异常巨量
+            if curr['Volume'] > (curr['Vol_MA20'] * 3):
+                signals.append(f"⚠️ **[巨量异动]** 成交量为均量 {curr['Volume']/curr['Vol_MA20']:.1f} 倍")
+
+            # 趋势突破
+            if prev['Close'] < prev['EMA_50'] and curr['Close'] > curr['EMA_50']:
+                signals.append(f"🚀 **[趋势突破]** 突破50日均线 (${curr['EMA_50']:.2f})")
 
             if signals:
                 reports.append(f"**{symbol}** (${curr['Close']:.2f})\n> " + "\n> ".join(signals))
+                
         except Exception as e:
             pass
 
     if reports:
-        # 如果触发的股票太多，截取前 15 个防止钉钉消息过长报错
         final_report = "\n\n".join(reports[:15])
         if len(reports) > 15:
             final_report += f"\n\n*(还有 {len(reports)-15} 只股票触发预警，已省略)*"
         send_dingtalk("📊 纳指 100 策略异动池", final_report)
+    else:
+        print("未触发核心指标策略。")
 
-# ================= 模式 3: 每日全量复盘报告 =================
+# ================= 模式 3: 每日全量复盘报告 (扫描纳指100) =================
 def run_daily_screener():
     print(">>> 启动纳指 100 全量扫盘报告...")
-    
-    # 动态获取纳斯达克 100 列表！
     target_list = get_nasdaq_100()
     bullish, bearish = [], []
     
@@ -155,6 +194,7 @@ def run_daily_screener():
 
 # ================= 主控制逻辑 =================
 if __name__ == "__main__":
+    # 接收 GitHub Actions 传递的执行模式，默认执行 sentinel
     mode = sys.argv[1] if len(sys.argv) > 1 else "sentinel"
     print(f"正在以模式运行: [{mode}]")
     
@@ -165,7 +205,7 @@ if __name__ == "__main__":
     elif mode == "daily":
         run_daily_screener()
     elif mode == "test":
-        test_tickers = get_nasdaq_100()[:5] # 测试抓取前5个
-        send_dingtalk("✅ 纳指动态引擎部署成功", f"成功接入维基百科实时爬虫！\n当前纳指100前五个代码为: {', '.join(test_tickers)}")
+        test_tickers = get_nasdaq_100()[:5]
+        send_dingtalk("✅ Pro 引擎部署成功", f"包含防接飞刀机制与自动纳指100抓取！\n当前测试获取的前五个代码为: {', '.join(test_tickers)}")
     else:
         print(f"未知的模式: {mode}")
