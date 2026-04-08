@@ -74,7 +74,7 @@ def check_strategies(symbol):
             alerts.append(f"⚠️ [巨量异动] 成交量是平时均量的 {vol_multiplier:.1f} 倍！")
 
         # 策略 4: 突破重要均线 (右侧交易信号)
-        if ENABLE_EMA_BREAKOUT and prev['Close'] < prev['EMA_50'] and curr['Close'] > curr['EMA_50']:
+        if ENABLE_EMA_BREAKOUT and prev['Close'] < prev['EMA_50'] and curr['Close'] > prev['EMA_50']:
             alerts.append(f"🚀 [趋势突破] 强势突破 50 周期指数均线 (${curr['EMA_50']:.2f})")
 
         # 如果有任何策略被触发，组装这只股票的报告
@@ -94,12 +94,25 @@ def send_notification(content):
     if not WEBHOOK_URL:
         print("错误：WEBHOOK_URL 环境变量未设置")
         return
-        
-    # 构建飞书/钉钉支持的 Markdown/纯文本格式
+    
+    # 消息头，包含关键词“AI”和“盯盘助手”以匹配机器人安全设置
+    header = f"🤖 【AI 盯盘助手】量化监控报告\n"
+    full_text = f"{header}\n{content}\n\n⏱️ 扫描时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+    # 尝试兼容飞书和钉钉两种格式
+    # 飞书格式: {"msg_type": "text", "content": {"text": "..."}}
+    # 钉钉格式: {"msgtype": "text", "text": {"content": "..."}}
+    
+    # 默认使用钉钉格式，因为它对格式要求最严
     payload = {
+        "msgtype": "text",
+        "text": {
+            "content": full_text
+        },
+        # 同时保留飞书字段，实现双兼容
         "msg_type": "text",
         "content": {
-            "text": f"🤖 【AI 量化监控报告】\n\n{content}\n\n⏱️ 扫描时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+            "text": full_text
         }
     }
     
@@ -107,6 +120,11 @@ def send_notification(content):
         resp = requests.post(WEBHOOK_URL, json=payload)
         print(f"推送状态码: {resp.status_code}")
         print(f"推送响应: {resp.text}")
+        
+        # 调试输出
+        if "keyword not match" in resp.text:
+            print("🚨 错误：关键词不匹配！请确保机器人设置了关键词 'AI' 或 '盯盘助手'。")
+            
     except Exception as e:
         print(f"推送失败: {e}")
 
@@ -122,13 +140,11 @@ if __name__ == "__main__":
             final_report.append(result)
             
     if final_report:
-        # 如果有多只股票触发信号，用分隔符隔开
         full_message = "\n---\n".join(final_report)
         send_notification(full_message)
     else:
         print("市场平静，没有任何标的触发预警策略。")
         
-    # 为了方便你测试，如果是你第一次运行，我加了一行测试防呆代码：
-    # （测试成功后可以把下面两行删掉）
-    print("\n[注] 如果你一直收不到信号，可以取消下一行的注释强制发一条")
-    send_notification("✅ Pro 引擎部署成功！正在 24/7 守护。")
+    # 强制发送一条测试消息，确认通道畅通
+    # 如果你收到下面这条消息，说明你的 GitHub Secret 和 Webhook 都配置正确了
+    send_notification("✅ Pro 引擎部署成功！监控脚本运行正常。")
