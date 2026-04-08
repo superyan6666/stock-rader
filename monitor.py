@@ -21,10 +21,10 @@ class Config:
     WEBHOOK_URL: str = os.environ.get('WEBHOOK_URL', '')
     DINGTALK_KEYWORD: str = "AI"
     CORE_WATCHLIST: List[str] = ["NVDA", "TSLA", "AAPL", "MSFT", "MSTR"]
-    BLACKLIST: List[str] = [] # 黑名单：遇到即将发财报或退市风险的股票可填入此处跳过扫描
-    INDEX_ETF: str = "QQQ" # 纳指100 ETF
-    VIX_INDEX: str = "^VIX" # 恐慌指数
-    MIN_SCORE_THRESHOLD: int = 8 # 最低推送门槛，过滤低质量信号
+    BLACKLIST: List[str] = [] 
+    INDEX_ETF: str = "QQQ" 
+    VIX_INDEX: str = "^VIX" 
+    MIN_SCORE_THRESHOLD: int = 8 
 
 def validate_config():
     if not Config.WEBHOOK_URL:
@@ -34,13 +34,11 @@ def validate_config():
 
 # ================= 2. 数据与网络工具模块 =================
 def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", retries: int = 5, auto_adjust: bool = True) -> pd.DataFrame:
-    """带激进退避机制和动态延迟的安全网络请求"""
     for attempt in range(retries):
         try:
             sleep_sec = random.uniform(2.0, 4.5) if "1d" in interval else random.uniform(1.2, 2.5)
             time.sleep(sleep_sec)
             
-            # 增加 timeout 防止请求一直挂起
             df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=auto_adjust, timeout=15)
             if not df.empty:
                 return df
@@ -51,7 +49,6 @@ def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", ret
                 logger.error(f"[{symbol}] 最终获取失败，已放弃")
                 return pd.DataFrame()
             
-            # 改进：针对 429 频控实施激进退避
             error_msg = str(e).lower()
             if "429" in error_msg or "rate" in error_msg:
                 time.sleep(12 + attempt * 10)
@@ -69,7 +66,6 @@ def get_nasdaq_100() -> List[str]:
         
         tables = pd.read_html(response.text, match='Ticker|Symbol')
         
-        # 改进：更强容错，取包含 Ticker/Symbol 且行数大于 90 的真实数据表
         for table in tables:
             if ('Ticker' in table.columns or 'Symbol' in table.columns) and len(table) > 90:
                 col_name = 'Ticker' if 'Ticker' in table.columns else 'Symbol'
@@ -99,31 +95,48 @@ def send_dingtalk(title: str, content: str) -> None:
     for url in urls:
         try:
             resp = requests.post(url, json=payload, timeout=10)
-            resp.raise_for_status() # 增加 HTTP 状态码校验
+            resp.raise_for_status()
         except Exception as e:
             logger.error(f"推送请求发生异常: {e}")
 
 # ================= 3. 大盘风控感知系统 (Market & Risk Regime) =================
 def get_vix_level() -> Tuple[float, str]:
-    """获取 VIX 恐慌指数，用于全局风控"""
+    """获取 VIX 恐慌指数，带有基于 QQQ 真实波动率的影子合成熔断机制"""
     logger.info(">>> 正在获取 VIX 恐慌指数...")
-    df = safe_get_history(Config.VIX_INDEX, period="1mo", interval="1d", retries=2, auto_adjust=False)
-    if len(df) < 2:
-        # 修改为更贴近常态的防守默认值 18.0
-        return 18.0, "⚠️ VIX 数据暂缺，启用中性防守模式 (默认 VIX=18)"
     
-    vix = df['Close'].iloc[-1]
-    if vix > 30:
-        return vix, f"🚨 极其恐慌 (VIX: {vix:.2f} > 30)，切勿盲目抄底，防守降权全开！"
-    elif vix > 25:
-        return vix, f"⚠️ 市场恐慌 (VIX: {vix:.2f} > 25)，系统已自动启动【防接飞刀】降权机制！"
-    elif vix < 15:
-        return vix, f"✅ 市场平静 (VIX: {vix:.2f} < 15)，技术信号可靠性较高。"
+    # 改进 1：将 period 缩短为 5d，大幅提升雅虎财经对指数请求的成功率
+    df = safe_get_history(Config.VIX_INDEX, period="5d", interval="1d", retries=3)
+    
+    vix = 18.0
+    is_simulated = False
+    
+    if df is not None and not df.empty and len(df) >= 1:
+        vix = df['Close'].iloc[-1]
     else:
-        return vix, f"⚖️ 正常波动 (VIX: {vix:.2f})"
+        # 改进 2：影子 VIX 引擎。当官方 VIX 获取失败时，通过 QQQ 真实波动率推算
+        logger.warning("⚠️ 雅虎财经拒绝返回 ^VIX 数据，启动影子波动率合成引擎...")
+        qqq_df = safe_get_history(Config.INDEX_ETF, period="2mo", interval="1d", retries=2)
+        if not qqq_df.empty and len(qqq_df) >= 20:
+            # 计算 QQQ 近 20 日收益率的年化标准差，作为 VIX 的高精度数学替身
+            daily_pct_change = qqq_df['Close'].pct_change().dropna()
+            realized_volatility = daily_pct_change.rolling(window=20).std().iloc[-1]
+            vix = realized_volatility * (252 ** 0.5) * 100
+            is_simulated = True
+        else:
+            return 18.0, "⚠️ VIX 与大盘双双获取失败，启用中性防守模式 (默认 VIX=18.0)"
+
+    prefix = "影子VIX" if is_simulated else "VIX"
+    
+    if vix > 30:
+        return vix, f"🚨 极其恐慌 ({prefix}: {vix:.2f} > 30)，切勿盲目抄底，防守降权全开！"
+    elif vix > 25:
+        return vix, f"⚠️ 市场恐慌 ({prefix}: {vix:.2f} > 25)，系统已自动启动【防接飞刀】降权机制！"
+    elif vix < 15:
+        return vix, f"✅ 市场平静 ({prefix}: {vix:.2f} < 15)，技术信号可靠性较高。"
+    else:
+        return vix, f"⚖️ 正常波动 ({prefix}: {vix:.2f})"
 
 def get_market_regime() -> Tuple[str, str, pd.DataFrame]:
-    """判断大盘环境，并返回 QQQ 数据用于后续相对强度(RS)计算"""
     logger.info(f">>> 正在分析大盘环境 ({Config.INDEX_ETF})...")
     df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", auto_adjust=False)
     
@@ -142,7 +155,6 @@ def get_market_regime() -> Tuple[str, str, pd.DataFrame]:
         return "range", "⚖️ 震荡整理阶段 (缺乏明确的单边趋势)", df
 
 def get_weekly_trend(symbol: str) -> str:
-    """懒加载获取周线，做多时间框架过滤"""
     df_week = safe_get_history(symbol, period="2y", interval="1wk", retries=2)
     if len(df_week) < 55: return "neutral"
         
@@ -180,12 +192,10 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     
     df['ATR'] = tr.rolling(window=14).mean()
     
-    # Keltner Channel
     df['ATR_20'] = tr.rolling(window=20).mean()
     df['KC_Upper'] = df['EMA_20'] + 1.5 * df['ATR_20']
     df['KC_Lower'] = df['EMA_20'] - 1.5 * df['ATR_20']
     
-    # 布林带
     df['BB_MA20'] = df['Close'].rolling(window=20).mean()
     df['BB_STD20'] = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = df['BB_MA20'] + 2 * df['BB_STD20']
@@ -237,6 +247,11 @@ def run_tech_matrix() -> None:
     regime, regime_desc, qqq_df = get_market_regime()
     logger.info(vix_desc)
     logger.info(f"当前大盘状态: {regime_desc}")
+    
+    qqq_ret_20d, qqq_ret_5d = 0.0, 0.0
+    if not qqq_df.empty and len(qqq_df) > 20:
+        qqq_ret_20d = (qqq_df['Close'].iloc[-1] / qqq_df['Close'].iloc[-20]) - 1
+        qqq_ret_5d = (qqq_df['Close'].iloc[-1] / qqq_df['Close'].iloc[-5]) - 1
 
     target_list = get_nasdaq_100()
     total_stocks = len(target_list)
@@ -244,10 +259,8 @@ def run_tech_matrix() -> None:
     
     for idx, symbol in enumerate(target_list):
         if symbol in Config.BLACKLIST:
-            if idx % 10 == 0: logger.info(f"⚠️ [{symbol}] 等处于黑名单，已跳过。")
             continue
             
-        # 减少日志冗余
         if idx % 10 == 0:
             logger.info(f"[进度 {idx}/{total_stocks}] 正在进行指标矩阵扫描...")
             
@@ -267,10 +280,9 @@ def run_tech_matrix() -> None:
 
             dynamic_rsi_threshold = max(20, min(40, 30 - (atr_pct - 0.03) * 100))
             
-            # --- 相对强度 (RS) 增强对齐版 ---
+            # --- 相对强度 (RS) ---
             rs_20, rs_5 = 1.0, 1.0
             if not qqq_df.empty:
-                # 强制日期对齐，避免停牌/新股带来的周期错位
                 merged = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, suffixes=('_stock', '_qqq'))
                 if len(merged) >= 20:
                     stock_ret_20d = (merged['Close_stock'].iloc[-1] / merged['Close_stock'].iloc[-20]) - 1
@@ -323,12 +335,11 @@ def run_tech_matrix() -> None:
                     signals.append("🔥 **[零上金叉]** 强势主升浪确认")
                     score += weight
 
-            # --- TTM Squeeze 升级版 (历史挤压验证) ---
+            # --- TTM Squeeze 升级版 ---
             bb_abs = curr['BB_Upper'] - curr['BB_Lower']
             kc_abs = curr['KC_Upper'] - curr['KC_Lower']
             is_squeeze_on = bb_abs < kc_abs
             
-            # 验证前5天是否真实存在过挤压状态，防止假点火
             past_squeeze = (df['BB_Upper'].iloc[-6:-1] < df['KC_Upper'].iloc[-6:-1]) & \
                            (df['BB_Lower'].iloc[-6:-1] > df['KC_Lower'].iloc[-6:-1])
             was_squeeze = past_squeeze.any()
@@ -352,8 +363,7 @@ def run_tech_matrix() -> None:
                 signals.append(f"🚀 **[均线突破]** 强势站上50日均线")
                 score += weight
 
-            # --- 多时间框架共振 (智能懒加载) ---
-            # 仅在产生有价值的信号 (score >= 10) 时才去请求周线，极大节约网络开销
+            # --- 多时间框架共振 ---
             if signals and score >= 10:
                 weekly_trend = get_weekly_trend(symbol)
                 if weekly_trend == "bullish":
@@ -364,13 +374,11 @@ def run_tech_matrix() -> None:
                     score -= 4 
 
             if signals:
-                # 阶梯式恐慌风控打折
                 if vix > 30:
                     score = int(score * 0.6)
                 elif vix > 25:
                     score = int(score * 0.75)
 
-                # 低于阈值则直接抛弃，不进入最终列表
                 if score < Config.MIN_SCORE_THRESHOLD:
                     continue
 
@@ -445,7 +453,7 @@ if __name__ == "__main__":
         test_tickers = get_nasdaq_100()[:5]
         send_dingtalk(
             "✅ Pro 量化引擎部署成功", 
-            f"已集成最终审查修正 (真点火判定、周线智能懒加载、严格日期对齐)！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"已启动【影子VIX熔断机制】双保险！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
