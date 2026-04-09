@@ -104,18 +104,19 @@ def get_vix_level() -> Tuple[float, str]:
     """获取 VIX 恐慌指数，带有基于 QQQ 真实波动率的影子合成熔断机制"""
     logger.info(">>> 正在获取 VIX 恐慌指数...")
     
-    # 改进：强制关闭 auto_adjust，这是雅虎获取指数数据最容易返回空值的坑
+    # 纯指数必须关闭 auto_adjust，防止雅虎返回空值
     df = safe_get_history(Config.VIX_INDEX, period="5d", interval="1d", retries=3, auto_adjust=False)
     
     vix = 18.0
     is_simulated = False
     
-    if df is not None and not df.empty and len(df) >= 1:
-        vix = df['Close'].iloc[-1]
+    if not df.empty and len(df) >= 1:
+        # Pro级防御: 使用 dropna() 防止盘中雅虎返回最新一行为 NaN
+        vix = df['Close'].dropna().iloc[-1]
     else:
         logger.warning("⚠️ 雅虎财经拒绝返回 ^VIX 数据，启动影子波动率合成引擎...")
-        # 同样强制关闭 auto_adjust 获取大盘 ETF 替身数据
-        qqq_df = safe_get_history(Config.INDEX_ETF, period="2mo", interval="1d", retries=2, auto_adjust=False)
+        # 恢复 ETF 的 auto_adjust=True，确保历史波动率计算精准（包含分红处理）
+        qqq_df = safe_get_history(Config.INDEX_ETF, period="2mo", interval="1d", retries=2, auto_adjust=True)
         if not qqq_df.empty and len(qqq_df) >= 20:
             daily_pct_change = qqq_df['Close'].pct_change().dropna()
             realized_volatility = daily_pct_change.rolling(window=20).std().iloc[-1]
@@ -137,12 +138,14 @@ def get_vix_level() -> Tuple[float, str]:
 
 def get_market_regime() -> Tuple[str, str, pd.DataFrame]:
     logger.info(f">>> 正在分析大盘环境 ({Config.INDEX_ETF})...")
-    df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", auto_adjust=False)
+    # ETF 恢复 auto_adjust=True，保证 200日均线 计算准确无偏移
+    df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", auto_adjust=True)
     
     if len(df) < 200:
         return "range", "大盘数据不足，默认震荡市", df
         
-    current_close = df['Close'].iloc[-1]
+    # Pro级防御: dropna() 防止最新价为 NaN
+    current_close = df['Close'].dropna().iloc[-1]
     ma200 = df['Close'].rolling(200).mean().iloc[-1]
     trend_20d = (current_close - df['Close'].iloc[-20]) / df['Close'].iloc[-20]
     
@@ -157,7 +160,7 @@ def get_weekly_trend(symbol: str) -> str:
     df_week = safe_get_history(symbol, period="2y", interval="1wk", retries=2)
     if len(df_week) < 55: return "neutral"
         
-    price = df_week['Close'].iloc[-1]
+    price = df_week['Close'].dropna().iloc[-1]
     ma50w = df_week['Close'].rolling(50).mean().iloc[-1]
     if pd.isna(ma50w): return "neutral"
         
@@ -220,7 +223,7 @@ def run_volatility_sentinel() -> None:
             df = safe_get_history(symbol, period="2d", interval="1h")
             if len(df) < 2: continue
             
-            curr_price = df['Close'].iloc[-1]
+            curr_price = df['Close'].dropna().iloc[-1]
             open_price = df['Open'].iloc[-1] 
             
             hour_change = (curr_price - open_price) / open_price * 100
@@ -228,7 +231,8 @@ def run_volatility_sentinel() -> None:
                 alerts.append(f"> **{symbol}** 短线异动 {'🚀' if hour_change > 0 else '🩸'} \n> 1小时内波动: **{hour_change:+.2f}%** (现价: ${curr_price:.2f})")
                 
             df_daily = safe_get_history(symbol, period="5d", interval="1d")
-            if df_daily is not None and len(df_daily) >= 2:
+            # 移除冗余的 is not None 判定
+            if not df_daily.empty and len(df_daily) >= 2:
                 gap_daily_pct = (df_daily['Open'].iloc[-1] - df_daily['Close'].iloc[-2]) / df_daily['Close'].iloc[-2] * 100
                 if abs(gap_daily_pct) > 4:
                     alerts.append(f"> **{symbol}** 日线跳空 {'💥' if gap_daily_pct > 0 else '⚠️'}\n> 真实缺口: **{gap_daily_pct:+.2f}%**")
@@ -249,8 +253,8 @@ def run_tech_matrix() -> None:
     
     qqq_ret_20d, qqq_ret_5d = 0.0, 0.0
     if not qqq_df.empty and len(qqq_df) > 20:
-        qqq_ret_20d = (qqq_df['Close'].iloc[-1] / qqq_df['Close'].iloc[-20]) - 1
-        qqq_ret_5d = (qqq_df['Close'].iloc[-1] / qqq_df['Close'].iloc[-5]) - 1
+        qqq_ret_20d = (qqq_df['Close'].dropna().iloc[-1] / qqq_df['Close'].iloc[-20]) - 1
+        qqq_ret_5d = (qqq_df['Close'].dropna().iloc[-1] / qqq_df['Close'].iloc[-5]) - 1
 
     target_list = get_nasdaq_100()
     total_stocks = len(target_list)
@@ -284,12 +288,12 @@ def run_tech_matrix() -> None:
             if not qqq_df.empty:
                 merged = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, suffixes=('_stock', '_qqq'))
                 if len(merged) >= 20:
-                    stock_ret_20d = (merged['Close_stock'].iloc[-1] / merged['Close_stock'].iloc[-20]) - 1
-                    qqq_ret_20d = (merged['Close_qqq'].iloc[-1] / merged['Close_qqq'].iloc[-20]) - 1
+                    stock_ret_20d = (merged['Close_stock'].dropna().iloc[-1] / merged['Close_stock'].iloc[-20]) - 1
+                    qqq_ret_20d = (merged['Close_qqq'].dropna().iloc[-1] / merged['Close_qqq'].iloc[-20]) - 1
                     rs_20 = (1 + stock_ret_20d) / (1 + qqq_ret_20d)
                     
-                    stock_ret_5d = (merged['Close_stock'].iloc[-1] / merged['Close_stock'].iloc[-5]) - 1
-                    qqq_ret_5d = (merged['Close_qqq'].iloc[-1] / merged['Close_qqq'].iloc[-5]) - 1
+                    stock_ret_5d = (merged['Close_stock'].dropna().iloc[-1] / merged['Close_stock'].iloc[-5]) - 1
+                    qqq_ret_5d = (merged['Close_qqq'].dropna().iloc[-1] / merged['Close_qqq'].iloc[-5]) - 1
                     rs_5 = (1 + stock_ret_5d) / (1 + qqq_ret_5d)
 
             vol_ratio = curr['Volume'] / curr['Vol_MA20'] if curr['Vol_MA20'] > 0 else 1.0
@@ -421,7 +425,7 @@ def run_daily_screener() -> None:
             df = safe_get_history(symbol, period="6mo", interval="1d")
             if len(df) < 50: continue
             
-            price = df['Close'].iloc[-1]
+            price = df['Close'].dropna().iloc[-1]
             ma20 = df['Close'].rolling(20).mean().iloc[-1]
             ma50 = df['Close'].rolling(50).mean().iloc[-1]
             
@@ -452,7 +456,7 @@ if __name__ == "__main__":
         test_tickers = get_nasdaq_100()[:5]
         send_dingtalk(
             "✅ Pro 量化引擎部署成功", 
-            f"已启动【影子VIX熔断机制】双保险！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"已集成 Pro级边界防护（NaN极值防御与精准复权管理）！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
