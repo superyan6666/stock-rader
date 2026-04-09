@@ -3,6 +3,7 @@ import requests
 import os
 import sys
 import pandas as pd
+import numpy as np
 import time
 import random
 import logging
@@ -97,7 +98,6 @@ def send_dingtalk(title: str, content: str) -> None:
             resp = requests.post(url, json=payload, timeout=10)
             resp.raise_for_status()
         except requests.exceptions.HTTPError as e:
-            # 改进：精准捕获并记录 HTTP 错误状态码，方便排查 Webhook 限制
             logger.error(f"钉钉接口返回错误: {e.response.status_code} - {e.response.text}")
         except Exception as e:
             logger.error(f"推送请求网络异常: {e}")
@@ -118,7 +118,6 @@ def get_vix_level() -> Tuple[float, str]:
         if not qqq_df.empty and len(qqq_df) >= 20:
             daily_pct_change = qqq_df['Close'].pct_change().dropna()
             realized_volatility = daily_pct_change.rolling(window=20).std().iloc[-1]
-            # 改进：期权隐含波动率(IV)通常高于历史波动率(HV)，乘以 1.2 作为保守溢价补偿
             vix = realized_volatility * (252 ** 0.5) * 100 * 1.2
             is_simulated = True
         else:
@@ -181,7 +180,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     exp2 = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = exp1 - exp2
     df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    df['MACD_Hist'] = df['MACD'] - df['Signal_Line'] # 动量柱
+    df['MACD_Hist'] = df['MACD'] - df['Signal_Line'] 
 
     # 3. 均线与成交量
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
@@ -195,23 +194,37 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
     
-    # 5. ADX 趋势强度过滤 (14期) - 使用 EWM 模拟 Wilder 平滑
-    high_diff = df['High'].diff()
-    low_diff = df['Low'].shift(1) - df['Low']
+    # 5. SuperTrend (10, 3) - 趋势跟踪核心，全面替代 ADX
+    hl2 = (df['High'] + df['Low']) / 2
+    atr10 = tr.rolling(window=10).mean()
+    ub = (hl2 + 3 * atr10).values
+    lb = (hl2 - 3 * atr10).values
+    close = df['Close'].values
     
-    plus_dm = pd.Series(0.0, index=df.index)
-    minus_dm = pd.Series(0.0, index=df.index)
+    in_uptrend = np.ones(len(df), dtype=bool)
+    for i in range(1, len(df)):
+        if close[i] > ub[i-1]:
+            in_uptrend[i] = True
+        elif close[i] < lb[i-1]:
+            in_uptrend[i] = False
+        else:
+            in_uptrend[i] = in_uptrend[i-1]
+            
+        # Ratchet 机制：趋势中边界只进不退
+        if in_uptrend[i] and in_uptrend[i-1]:
+            lb[i] = max(lb[i], lb[i-1])
+        if not in_uptrend[i] and not in_uptrend[i-1]:
+            ub[i] = min(ub[i], ub[i-1])
+            
+    df['SuperTrend_Up'] = in_uptrend.astype(int) # 1=强势上升趋势，0=下降趋势
     
-    plus_dm[(high_diff > low_diff) & (high_diff > 0)] = high_diff[(high_diff > low_diff) & (high_diff > 0)]
-    minus_dm[(low_diff > high_diff) & (low_diff > 0)] = low_diff[(low_diff > high_diff) & (low_diff > 0)]
+    # 6. 自适应 RSI 历史分位 (20% 极值作为个股专属超卖线)
+    if len(df) >= 120:
+        df['RSI_P20'] = df['RSI'].rolling(window=120, min_periods=60).quantile(0.20)
+    else:
+        df['RSI_P20'] = 30.0
     
-    tr_smooth = tr.ewm(span=14, adjust=False).mean()
-    plus_di = 100 * (plus_dm.ewm(span=14, adjust=False).mean() / tr_smooth)
-    minus_di = 100 * (minus_dm.ewm(span=14, adjust=False).mean() / tr_smooth)
-    dx = (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10) * 100
-    df['ADX'] = dx.ewm(span=14, adjust=False).mean()
-    
-    # 6. Keltner Channel & Bollinger Bands (TTM Squeeze 前置条件)
+    # 7. Keltner Channel & Bollinger Bands (TTM Squeeze 前置)
     df['ATR_20'] = tr.rolling(window=20).mean()
     df['KC_Upper'] = df['EMA_20'] + 1.5 * df['ATR_20']
     df['KC_Lower'] = df['EMA_20'] - 1.5 * df['ATR_20']
@@ -292,12 +305,16 @@ def run_tech_matrix() -> None:
             atr_pct = curr['ATR'] / curr['Close']
             if atr_pct > 0.10: continue 
 
-            # ADX 趋势过滤前置
-            adx = curr.get('ADX', 20)
-            is_strong_trend = adx > 25
-
-            dynamic_rsi_threshold = max(20, min(40, 30 - (atr_pct - 0.03) * 100))
+            # === 核心趋势与环境过滤 ===
+            is_strong_trend = curr.get('SuperTrend_Up', 0) == 1 
+            dynamic_rsi_threshold = curr.get('RSI_P20', 30.0)
+            if pd.isna(dynamic_rsi_threshold): dynamic_rsi_threshold = 30.0
             
+            vol_ratio = curr['Volume'] / curr['Vol_MA20'] if curr['Vol_MA20'] > 0 else 1.0
+            is_volume_confirmed = vol_ratio > 1.5
+
+            strong_signals_count = 0
+
             # --- 相对强度 (RS) 严谨版对齐 ---
             rs_20, rs_5 = 1.0, 1.0
             if not qqq_df.empty:
@@ -311,9 +328,6 @@ def run_tech_matrix() -> None:
                     qqq_ret_5d = (merged['Close_qqq'].dropna().iloc[-1] / merged['Close_qqq'].iloc[-5]) - 1
                     rs_5 = (1 + stock_ret_5d) / (1 + qqq_ret_5d)
 
-            vol_ratio = curr['Volume'] / curr['Vol_MA20'] if curr['Vol_MA20'] > 0 else 1.0
-            is_volume_confirmed = vol_ratio > 1.5
-
             if rs_20 > 1.08 or (rs_5 > 1.05 and rs_20 > 1.03):
                 signals.append(f"⚡ **[强相对强度]** 跑赢QQQ {rs_20-1:+.1%} (5日{rs_5-1:+.1%})")
                 score += 7 if is_volume_confirmed else 4
@@ -321,17 +335,20 @@ def run_tech_matrix() -> None:
                 signals.append(f"🐢 **[相对弱势]** 跑输大盘 {(1-rs_20):.1%}")
                 score -= 3
 
-            # --- RSI 超卖策略 ---
+            # --- 严格共振引擎 (Confluence Engine) ---
+            
+            # 1. 自适应 RSI 超卖策略
             if curr['RSI'] < dynamic_rsi_threshold and prev['RSI'] >= dynamic_rsi_threshold:
                 weight = 13 if regime == 'bear' else 8 
-                if curr['Close'] > curr['EMA_50']:
-                    signals.append(f"🟢 **[趋势回踩超卖]** 顺势买点 (RSI:{curr['RSI']:.1f})")
+                if curr['Close'] > curr['EMA_50'] and is_strong_trend:
+                    signals.append(f"🟢 **[强势回踩超卖]** 趋势+自适应买点 (RSI:{curr['RSI']:.1f})")
                     score += weight
+                    strong_signals_count += 1
                 else:
                     signals.append(f"⚠️ **[弱势超卖]** 防范接飞刀 (RSI:{curr['RSI']:.1f})")
                     score += int(weight * 0.4)
             
-            # --- RSI 底背离 ---
+            # 2. RSI 底背离
             price_low_5 = df['Close'].iloc[-5:].min()
             idx_low_5 = df['Close'].iloc[-5:].idxmin()
             rsi_at_low_5 = df['RSI'].loc[idx_low_5]
@@ -343,23 +360,23 @@ def run_tech_matrix() -> None:
                 weight = 12 if regime == 'bear' else 8
                 signals.append("🔍 **[RSI底背离]** 下跌动能衰竭")
                 score += weight
+                strong_signals_count += 1
             
-            # --- MACD 策略 + ADX 共振 ---
+            # 3. MACD + SuperTrend 共振
             if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
-                weight = 10 if regime == 'bull' else 6 
-                if curr['MACD'] < 0:
-                    signals.append("🔸 **[零下金叉]** 弱反弹预期")
-                    score += int(weight * 0.6)
+                if curr['MACD'] > 0 and is_strong_trend:
+                    signals.append("🔥 **[零上金叉 + 趋势确认]** 主升浪高概率启动")
+                    score += 12
+                    strong_signals_count += 1
                 else:
-                    signals.append("🔥 **[零上金叉]** 强势主升浪确认")
-                    score += weight + (4 if is_strong_trend else 0)
+                    signals.append("🔸 **[零下金叉]** 弱反弹预期")
+                    score += 4
 
-            # --- TTM Squeeze 动量版 (The True Squeeze) ---
+            # 4. TTM Squeeze 动量点火版
             bb_abs = curr['BB_Upper'] - curr['BB_Lower']
             kc_abs = curr['KC_Upper'] - curr['KC_Lower']
             is_squeeze_on = bb_abs < kc_abs
             
-            # 改进：确保有足够数据切片，获取过去5天是否存在挤压
             was_squeeze = False
             if len(df) >= 6:
                 past_squeeze = (df['BB_Upper'].iloc[-6:-1] < df['KC_Upper'].iloc[-6:-1]) & \
@@ -369,11 +386,8 @@ def run_tech_matrix() -> None:
             macd_hist = curr['MACD_Hist']
             prev_macd_hist = prev['MACD_Hist']
             
-            # 动能反转确认
             is_squeeze_fire_up = was_squeeze and (not is_squeeze_on) and (macd_hist > 0) and (macd_hist > prev_macd_hist)
             is_squeeze_fire_down = was_squeeze and (not is_squeeze_on) and (macd_hist < 0) and (macd_hist < prev_macd_hist)
-            
-            # 改进：John Carter 原版要求叠加价格真实突破布林带上轨
             price_above_bb_upper = curr['Close'] > curr['BB_Upper']
 
             if is_squeeze_on:
@@ -382,36 +396,47 @@ def run_tech_matrix() -> None:
                 score += weight
             elif is_squeeze_fire_up:
                 weight = 18 if regime == 'bull' else 10
-                if price_above_bb_upper:
+                if price_above_bb_upper and is_strong_trend:
                     signals.append("🚀 **[TTM Squeeze FIRE ↑]** 价格突破上轨，动能强劲确认点火！")
-                    score += weight + 4 # 价格突破再额外加分
+                    score += weight + 4 
+                    strong_signals_count += 1
                 elif is_strong_trend:
                     signals.append("🔥 **[TTM Squeeze FIRE ↑]** 挤压向上释放 (趋势确认)")
                     score += weight
+                    strong_signals_count += 1
                 else:
-                    signals.append("🔥 **[TTM Squeeze FIRE ↑]** 挤压向上释放 (需防假突破)")
+                    signals.append("🔥 **[TTM Squeeze FIRE ↑]** 挤压向上释放 (无大级别趋势配合)")
                     score += int(weight * 0.6)
             elif is_squeeze_fire_down:
                 signals.append("🔻 **[TTM Squeeze FIRE ↓]** 空头动量释放，警惕下杀")
                 score -= 8 
 
-            # --- 均线突破 + ADX 共振 ---
+            # 5. 均线突破 + 趋势量价确认
             if prev['Close'] < prev['EMA_50'] and curr['Close'] > curr['EMA_50']:
-                weight = 9 if regime == 'bull' else 5
-                if is_strong_trend:
-                    signals.append(f"📈 **[有效突破]** 携趋势站上50日均线")
-                    score += weight
+                if is_strong_trend and is_volume_confirmed:
+                    signals.append(f"📈 **[SuperTrend + 有效突破]** 携趋势与巨量站上50日均线")
+                    score += 11
+                    strong_signals_count += 1
                 else:
-                    signals.append(f"📉 **[疲软突破]** 站上50日均线 (ADX提示趋势偏弱)")
+                    signals.append(f"📉 **[疲软突破]** 站上50日均线 (缺乏量能或趋势配合)")
                     score -= 3 
 
-            # --- 全局量价共振加分 ---
-            if is_volume_confirmed and score > 0:
+            # === 全局信号过滤阀 (Noise Filter) ===
+            # 核心原则：如果全是单薄的弱信号，且毫无量能配合，直接丢弃
+            if score > 0 and strong_signals_count < 1 and not is_volume_confirmed:
+                score = int(score * 0.3) # 惩罚孤立信号
+
+            # 全局量价共振加分
+            if is_volume_confirmed and score >= 5:
                 signals.append("🌊 **[量价共振]** 成交量显著放大(>1.5x)，确认资金介入")
                 score += 3
+                
+            # 若包含强信号，赋予共振徽章
+            if strong_signals_count >= 2:
+                signals.append("🎯 **[严密共振确认]** 多维度技术面共振达成！")
+                score += 5
 
-            # --- 多时间框架共振 (极大优化 GHA 网络开销) ---
-            # 改进：将获取周线的门槛提升至 15 分，过滤掉大量弱势股，单次任务省下几十秒
+            # 6. 多时间框架共振 (智能懒加载 - 提高门槛省耗时)
             if signals and score >= 15:
                 weekly_trend = get_weekly_trend(symbol)
                 if weekly_trend == "bullish":
@@ -430,8 +455,8 @@ def run_tech_matrix() -> None:
                 if score < Config.MIN_SCORE_THRESHOLD:
                     continue
 
-                if len(signals) > 5:
-                    signals = signals[:5] + [f"*(...还有 {len(signals)-5} 个辅助信号)*"]
+                if len(signals) > 6:
+                    signals = signals[:6] + [f"*(...还有 {len(signals)-6} 个辅助信号)*"]
                     
                 turnover = curr['Close'] * curr['Volume']
                 turnover_str = f"${turnover/1e9:.2f}B" if turnover >= 1e9 else f"${turnover/1e6:.2f}M"
@@ -446,7 +471,6 @@ def run_tech_matrix() -> None:
         reports.sort(key=lambda x: x['score'], reverse=True)
         top_reports_text = [r['text'] for r in reports[:15]]
         
-        # 改进：动态输出当前拦截门槛，缓解用户“为什么今天没消息”的焦虑
         final_report = f"*{vix_desc}*\n*{regime_desc}*\n\n" + "\n\n".join(top_reports_text)
         if len(reports) > 15:
             final_report += f"\n\n*(已过滤低质信号，当前为您展示得分最高的 Top 15 机会)*"
@@ -456,7 +480,6 @@ def run_tech_matrix() -> None:
         send_dingtalk("📊 纳指 100 优选异动池", final_report)
     else:
         logger.info(f"未触发核心指标策略，或所有个股得分均低于门槛 ({Config.MIN_SCORE_THRESHOLD}分)。")
-        # 即使无信号也发送状态报告（每天首次运行时可能会有用，这里暂保留原逻辑静默）
 
 def run_daily_screener() -> None:
     logger.info(">>> 启动纳指 100 全量扫盘报告...")
@@ -505,7 +528,7 @@ if __name__ == "__main__":
         test_tickers = get_nasdaq_100()[:5]
         send_dingtalk(
             "✅ Pro 量化引擎部署成功", 
-            f"已集成 影子VIX溢价修正 与 TTM Squeeze 价格破位确认！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"已集成 SuperTrend 共振滤网与 RSI 自适应阈值引擎！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
