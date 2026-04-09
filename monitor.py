@@ -104,8 +104,8 @@ def get_vix_level() -> Tuple[float, str]:
     """获取 VIX 恐慌指数，带有基于 QQQ 真实波动率的影子合成熔断机制"""
     logger.info(">>> 正在获取 VIX 恐慌指数...")
     
-    # 改进 1：将 period 缩短为 5d，大幅提升雅虎财经对指数请求的成功率
-    df = safe_get_history(Config.VIX_INDEX, period="5d", interval="1d", retries=3)
+    # 改进：强制关闭 auto_adjust，这是雅虎获取指数数据最容易返回空值的坑
+    df = safe_get_history(Config.VIX_INDEX, period="5d", interval="1d", retries=3, auto_adjust=False)
     
     vix = 18.0
     is_simulated = False
@@ -113,11 +113,10 @@ def get_vix_level() -> Tuple[float, str]:
     if df is not None and not df.empty and len(df) >= 1:
         vix = df['Close'].iloc[-1]
     else:
-        # 改进 2：影子 VIX 引擎。当官方 VIX 获取失败时，通过 QQQ 真实波动率推算
         logger.warning("⚠️ 雅虎财经拒绝返回 ^VIX 数据，启动影子波动率合成引擎...")
-        qqq_df = safe_get_history(Config.INDEX_ETF, period="2mo", interval="1d", retries=2)
+        # 同样强制关闭 auto_adjust 获取大盘 ETF 替身数据
+        qqq_df = safe_get_history(Config.INDEX_ETF, period="2mo", interval="1d", retries=2, auto_adjust=False)
         if not qqq_df.empty and len(qqq_df) >= 20:
-            # 计算 QQQ 近 20 日收益率的年化标准差，作为 VIX 的高精度数学替身
             daily_pct_change = qqq_df['Close'].pct_change().dropna()
             realized_volatility = daily_pct_change.rolling(window=20).std().iloc[-1]
             vix = realized_volatility * (252 ** 0.5) * 100
