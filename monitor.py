@@ -26,6 +26,22 @@ class Config:
     INDEX_ETF: str = "QQQ" 
     VIX_INDEX: str = "^VIX" 
     MIN_SCORE_THRESHOLD: int = 8 
+    
+    # 优雅的板块映射字典，便于后续手动维护与扩充，零网络开销
+    SECTOR_MAP = {
+        'XLK': ['AAPL', 'MSFT', 'NVDA', 'AVGO', 'QCOM', 'AMD', 'INTC', 'CRM', 'ADBE', 'CSCO', 'TXN', 'INTU', 'AMAT', 'MU', 'LRCX', 'PANW', 'KLAC', 'SNPS', 'CDNS', 'NXPI', 'MRVL', 'MCHP', 'FTNT', 'CRWD'],
+        'XLY': ['AMZN', 'TSLA', 'SBUX', 'BKNG', 'MAR', 'MELI', 'LULU', 'HD', 'ODFL', 'ROST', 'EBAY', 'TSCO', 'PDD', 'DASH', 'CPRT', 'PCAR'],
+        'XLC': ['GOOGL', 'GOOG', 'META', 'NFLX', 'CMCSA', 'TMUS', 'EA', 'TTWO', 'WBD', 'SIRI', 'CHTR'],
+        'XLV': ['AMGN', 'GILD', 'VRTX', 'REGN', 'ISRG', 'BIIB', 'ILMN', 'DXCM', 'IDXX', 'MRNA', 'ALGN', 'BMRN', 'GEHC'],
+        'XLP': ['PEP', 'COST', 'MDLZ', 'KDP', 'KHC', 'MNST', 'WBA']
+    }
+
+    @staticmethod
+    def get_sector_etf(symbol: str) -> str:
+        for etf, symbols in Config.SECTOR_MAP.items():
+            if symbol in symbols:
+                return etf
+        return Config.INDEX_ETF
 
 def validate_config():
     if not Config.WEBHOOK_URL:
@@ -34,10 +50,15 @@ def validate_config():
     logger.info("✅ 环境变量与配置校验通过")
 
 # ================= 2. 数据与网络工具模块 =================
-def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", retries: int = 5, auto_adjust: bool = True) -> pd.DataFrame:
+def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", retries: int = 5, auto_adjust: bool = True, fast_mode: bool = False) -> pd.DataFrame:
     for attempt in range(retries):
         try:
-            sleep_sec = random.uniform(2.0, 4.5) if "1d" in interval else random.uniform(1.2, 2.5)
+            # 优化：加入 fast_mode，为固定且数量较少的 ETF 预加载加速，压缩闲置等待时间
+            if fast_mode:
+                sleep_sec = random.uniform(0.5, 1.2)
+            else:
+                sleep_sec = random.uniform(2.0, 4.5) if "1d" in interval else random.uniform(1.2, 2.5)
+                
             time.sleep(sleep_sec)
             
             df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=auto_adjust, timeout=15)
@@ -105,7 +126,7 @@ def send_dingtalk(title: str, content: str) -> None:
 # ================= 3. 大盘风控感知系统 (Market & Risk Regime) =================
 def get_vix_level(qqq_df_for_shadow: pd.DataFrame = None) -> Tuple[float, str]:
     logger.info(">>> 正在获取 VIX 恐慌指数...")
-    df = safe_get_history(Config.VIX_INDEX, period="5d", interval="1d", retries=3, auto_adjust=False)
+    df = safe_get_history(Config.VIX_INDEX, period="5d", interval="1d", retries=3, auto_adjust=False, fast_mode=True)
     
     vix = 18.0
     is_simulated = False
@@ -114,8 +135,7 @@ def get_vix_level(qqq_df_for_shadow: pd.DataFrame = None) -> Tuple[float, str]:
         vix = df['Close'].dropna().iloc[-1]
     else:
         logger.warning("⚠️ 雅虎财经拒绝返回 ^VIX 数据，启动影子波动率合成引擎...")
-        # 改进：如果外部已经拿到了大盘数据，则直接复用，避免双重网络调用
-        qqq_df = qqq_df_for_shadow if qqq_df_for_shadow is not None else safe_get_history(Config.INDEX_ETF, period="2mo", interval="1d", retries=2, auto_adjust=True)
+        qqq_df = qqq_df_for_shadow if qqq_df_for_shadow is not None else safe_get_history(Config.INDEX_ETF, period="2mo", interval="1d", retries=2, auto_adjust=True, fast_mode=True)
         if qqq_df is not None and not qqq_df.empty and len(qqq_df) >= 20:
             daily_pct_change = qqq_df['Close'].pct_change().dropna()
             realized_volatility = daily_pct_change.rolling(window=20).std().iloc[-1]
@@ -137,7 +157,7 @@ def get_vix_level(qqq_df_for_shadow: pd.DataFrame = None) -> Tuple[float, str]:
 
 def get_market_regime() -> Tuple[str, str, pd.DataFrame]:
     logger.info(f">>> 正在分析大盘环境 ({Config.INDEX_ETF})...")
-    df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", auto_adjust=True)
+    df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", auto_adjust=True, fast_mode=True)
     
     if len(df) < 200:
         return "range", "大盘数据不足，默认震荡市", df
@@ -165,9 +185,9 @@ def get_weekly_trend(symbol: str) -> str:
     elif price < ma50w * 0.95: return "bearish"
     return "neutral"
 
-# ================= 4. 核心量化指标模块 =================
-def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    # 1. RSI
+# ================= 4. 核心量化指标模块 (重构后高可读版本) =================
+
+def _add_rsi(df: pd.DataFrame) -> None:
     delta = df['Close'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
@@ -175,27 +195,32 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     avg_loss = loss.ewm(alpha=1/14, min_periods=14).mean()
     rs = avg_gain / (avg_loss + 1e-10)
     df['RSI'] = 100 - (100 / (1 + rs))
+    
+    # 自适应 RSI 历史分位
+    if len(df) >= 120:
+        df['RSI_P20'] = df['RSI'].rolling(window=120, min_periods=60).quantile(0.20)
+    else:
+        df['RSI_P20'] = 30.0
 
-    # 2. MACD & Histogram
+def _add_macd_and_emas(df: pd.DataFrame) -> None:
     exp1 = df['Close'].ewm(span=12, adjust=False).mean()
     exp2 = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = exp1 - exp2
     df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['Signal_Line'] 
 
-    # 3. 均线与成交量
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
 
-    # 4. ATR (真实波动幅度)
+def _add_atr_and_supertrend(df: pd.DataFrame) -> None:
     high_low = df['High'] - df['Low']
     high_close = (df['High'] - df['Close'].shift()).abs()
     low_close = (df['Low'] - df['Close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
     
-    # 5. SuperTrend (10, 3) 
+    # SuperTrend (10, 3)
     hl2 = (df['High'] + df['Low']) / 2
     atr10 = tr.rolling(window=10).mean()
     ub = (hl2 + 3 * atr10).values
@@ -203,7 +228,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     close = df['Close'].values
     
     in_uptrend = np.ones(len(df), dtype=bool)
-    # 改进：安全的 NaN 冷启动处理，防止边界溢出与错误赋值
     for i in range(1, len(df)):
         if pd.isna(ub[i-1]) or pd.isna(lb[i-1]):
             in_uptrend[i] = True
@@ -222,15 +246,10 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
             ub[i] = min(ub[i], ub[i-1])
             
     df['SuperTrend_Up'] = in_uptrend.astype(int) 
-    
-    # 6. 自适应 RSI 历史分位
-    if len(df) >= 120:
-        df['RSI_P20'] = df['RSI'].rolling(window=120, min_periods=60).quantile(0.20)
-    else:
-        df['RSI_P20'] = 30.0
-    
-    # 7. Keltner Channel & Bollinger Bands
-    df['ATR_20'] = tr.rolling(window=20).mean()
+
+def _add_channels(df: pd.DataFrame) -> None:
+    # Keltner Channel & Bollinger Bands
+    df['ATR_20'] = df['ATR'] # 近似简化复用
     df['KC_Upper'] = df['EMA_20'] + 1.5 * df['ATR_20']
     df['KC_Lower'] = df['EMA_20'] - 1.5 * df['ATR_20']
     
@@ -238,8 +257,9 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['BB_STD20'] = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = df['BB_MA20'] + 2 * df['BB_STD20']
     df['BB_Lower'] = df['BB_MA20'] - 2 * df['BB_STD20']
-    
-    # 8. ICHIMOKU Cloud (9, 26, 52) 
+
+def _add_ichimoku(df: pd.DataFrame) -> None:
+    # ICHIMOKU Cloud (9, 26, 52) 
     high9 = df['High'].rolling(9).max()
     low9 = df['Low'].rolling(9).min()
     df['Tenkan'] = (high9 + low9) / 2
@@ -256,7 +276,14 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     
     df['Above_Cloud'] = (df['Close'] > df[['SenkouA', 'SenkouB']].max(axis=1)).astype(int)
     df['Cloud_Twist'] = (df['SenkouA'] > df['SenkouB']).astype(int)
-    
+
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """将 DataFrame 贯穿所有技术指标引擎，模块化流水线"""
+    _add_rsi(df)
+    _add_macd_and_emas(df)
+    _add_atr_and_supertrend(df)
+    _add_channels(df)
+    _add_ichimoku(df)
     return df
 
 # ================= 5. 业务策略模块 =================
@@ -298,7 +325,6 @@ def run_volatility_sentinel() -> None:
 def run_tech_matrix() -> None:
     logger.info(">>> 启动复合技术指标诊断...")
     
-    # 改进：先后获取大盘和 VIX 数据，复用 QQQ DataFrame 以节省请求
     regime, regime_desc, qqq_df = get_market_regime()
     vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
     logger.info(vix_desc)
@@ -309,15 +335,15 @@ def run_tech_matrix() -> None:
         qqq_ret_20d = (qqq_df['Close'].dropna().iloc[-1] / qqq_df['Close'].iloc[-20]) - 1
         qqq_ret_5d = (qqq_df['Close'].dropna().iloc[-1] / qqq_df['Close'].iloc[-5]) - 1
 
-    logger.info(">>> 预加载 Sector ETF 板块数据...")
-    sector_etfs = ['XLK', 'XLY', 'XLC', 'XLV', 'XLP']
+    logger.info(">>> 预加载 Sector ETF 板块数据 (Fast Mode)...")
+    sector_etfs = list(Config.SECTOR_MAP.keys())
     sector_data = {}
     for etf in sector_etfs:
-        sdf = safe_get_history(etf, period="2mo", interval="1d", auto_adjust=True, retries=2)
+        sdf = safe_get_history(etf, period="2mo", interval="1d", auto_adjust=True, retries=2, fast_mode=True)
         if not sdf.empty and len(sdf) >= 20:
             sector_data[etf] = (sdf['Close'].dropna().iloc[-1] / sdf['Close'].iloc[-20]) - 1
 
-    # === 新增核心：市场健康自适应权重引擎 ===
+    # === 市场健康自适应权重引擎 ===
     avg_sector_strength = np.mean(list(sector_data.values())) if sector_data else 0.0
     health_score = 0.0
     
@@ -332,27 +358,16 @@ def run_tech_matrix() -> None:
     elif regime == 'bear':
         health_score = -0.7
     else:  # range 震荡市
-        # 改进：使用钳位操作 (Clamp) 避免 ETF 收益率畸高导致 health_score 爆炸
         sector_strength_capped = max(-0.2, min(0.2, float(avg_sector_strength)))
         health_score = 0.0 if sector_strength_capped < 0.01 else sector_strength_capped * 2
 
-    # 限制 health_score 在安全区间 [-1.0, 1.0]
     health_score = max(-1.0, min(1.0, float(health_score)))
 
-    # 自适应权重倍增器与动态发车门槛
     weight_multiplier = 1.0 + health_score * 0.8
     min_score_dynamic = max(Config.MIN_SCORE_THRESHOLD, 8 + int(health_score * -6))
     
     logger.info(f"市场健康度: {health_score:.2f} | 权重倍增器: {weight_multiplier:.2f} | 动态门槛: {min_score_dynamic}")
             
-    def get_sector_etf(sym: str) -> str:
-        if sym in ['AAPL', 'MSFT', 'NVDA', 'AVGO', 'QCOM', 'AMD', 'INTC', 'CRM', 'ADBE', 'CSCO', 'TXN', 'INTU', 'AMAT', 'MU', 'LRCX', 'PANW', 'KLAC', 'SNPS', 'CDNS', 'NXPI', 'MRVL', 'MCHP', 'FTNT', 'CRWD']: return 'XLK'
-        if sym in ['AMZN', 'TSLA', 'SBUX', 'BKNG', 'MAR', 'MELI', 'LULU', 'HD', 'ODFL', 'ROST', 'EBAY', 'TSCO', 'PDD', 'DASH', 'CPRT', 'PCAR']: return 'XLY'
-        if sym in ['GOOGL', 'GOOG', 'META', 'NFLX', 'CMCSA', 'TMUS', 'EA', 'TTWO', 'WBD', 'SIRI', 'CHTR']: return 'XLC'
-        if sym in ['AMGN', 'GILD', 'VRTX', 'REGN', 'ISRG', 'BIIB', 'ILMN', 'DXCM', 'IDXX', 'MRNA', 'ALGN', 'BMRN', 'GEHC']: return 'XLV'
-        if sym in ['PEP', 'COST', 'MDLZ', 'KDP', 'KHC', 'MNST', 'WBA']: return 'XLP'
-        return Config.INDEX_ETF
-
     target_list = get_nasdaq_100()
     total_stocks = len(target_list)
     reports = []
@@ -390,7 +405,7 @@ def run_tech_matrix() -> None:
             # --- 相对强度 (RS) 包含板块轮动比较 ---
             rs_20, rs_5 = 1.0, 1.0
             if not qqq_df.empty:
-                merged = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, suffixes=('_stock', '_qqq'))
+                merged = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, how='inner', suffixes=('_stock', '_qqq'))
                 if len(merged) >= 20:
                     stock_ret_20d = (merged['Close_stock'].dropna().iloc[-1] / merged['Close_stock'].iloc[-20]) - 1
                     qqq_ret_20d_merged = (merged['Close_qqq'].dropna().iloc[-1] / merged['Close_qqq'].iloc[-20]) - 1
@@ -402,7 +417,7 @@ def run_tech_matrix() -> None:
                     qqq_ret_5d_merged = (merged['Close_qqq'].dropna().iloc[-1] / merged['Close_qqq'].iloc[-5]) - 1
                     rs_5 = (1 + stock_ret_5d) / max(1 + qqq_ret_5d_merged, 0.5)
                     
-                    target_sector = get_sector_etf(symbol)
+                    target_sector = Config.get_sector_etf(symbol)
                     sector_ret_20d = sector_data.get(target_sector, qqq_ret_20d_merged)
                     
                     denom_sector = max(1 + sector_ret_20d, 0.5)
@@ -624,7 +639,7 @@ if __name__ == "__main__":
         test_tickers = get_nasdaq_100()[:5]
         send_dingtalk(
             "✅ Pro 量化引擎部署成功", 
-            f"已集成 [双重网络调用节约机制] 与 [极值压缩阀门]！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"完成指标高可读模块化重构与 ETF 极速防抖预加载！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
