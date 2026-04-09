@@ -53,9 +53,9 @@ def validate_config():
 def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", retries: int = 5, auto_adjust: bool = True, fast_mode: bool = False) -> pd.DataFrame:
     for attempt in range(retries):
         try:
-            # 优化：加入 fast_mode，为固定且数量较少的 ETF 预加载加速，压缩闲置等待时间
+            # 优化：极限压缩 fast_mode 的等待时间 (0.2~0.5秒)，在防封禁的前提下榨干网络性能
             if fast_mode:
-                sleep_sec = random.uniform(0.5, 1.2)
+                sleep_sec = random.uniform(0.2, 0.5)
             else:
                 sleep_sec = random.uniform(2.0, 4.5) if "1d" in interval else random.uniform(1.2, 2.5)
                 
@@ -176,7 +176,8 @@ def get_market_regime() -> Tuple[str, str, pd.DataFrame]:
         return "range", "⚖️ 震荡整理阶段 (缺乏明确的单边趋势)", df
 
 def get_weekly_trend(symbol: str) -> str:
-    df_week = safe_get_history(symbol, period="2y", interval="1wk", retries=2)
+    # 优化：为周线请求启用极速模式 (fast_mode=True)，大幅压榨高分股票并发查询的耗时
+    df_week = safe_get_history(symbol, period="2y", interval="1wk", retries=2, fast_mode=True)
     if len(df_week) < 55: return "neutral"
         
     price = df_week['Close'].ffill().iloc[-1]
@@ -700,7 +701,7 @@ if __name__ == "__main__":
         test_tickers = get_nasdaq_100()[:5]
         send_dingtalk(
             "✅ Pro 量化引擎部署成功", 
-            f"逻辑链路全线修缮，自适应分位与通道均流转完毕！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"完成性能极限压榨！极速加载策略与周线低延时机制部署完毕！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
