@@ -198,8 +198,8 @@ def _add_rsi(df: pd.DataFrame) -> None:
     rs = avg_gain / (avg_loss + 1e-10)
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # 自适应 RSI 历史分位
-    if len(df) >= 120:
+    # 修正：只要满足 min_periods=60 即可启动动态阈值，避免在长度略小于120时死板降级
+    if len(df) >= 60:
         df['RSI_P20'] = df['RSI'].rolling(window=120, min_periods=60).quantile(0.20)
     else:
         df['RSI_P20'] = 30.0
@@ -220,6 +220,9 @@ def _add_atr_and_supertrend(df: pd.DataFrame) -> None:
     high_close = (df['High'] - df['Close'].shift()).abs()
     low_close = (df['Low'] - df['Close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    
+    # 修正：保存真实的日级别 TR 数据，供后续通道宽度做精准 20 日均值计算
+    df['TR'] = tr
     df['ATR'] = tr.rolling(window=14).mean()
     
     # SuperTrend (10, 3)
@@ -232,6 +235,7 @@ def _add_atr_and_supertrend(df: pd.DataFrame) -> None:
     in_uptrend = np.ones(len(df), dtype=bool)
     for i in range(1, len(df)):
         if pd.isna(ub[i-1]) or pd.isna(lb[i-1]):
+            # 优化：冷启动期预设看多，因总体扫描周期通常超100天，初期默认值不会影响到最后的真实趋势判定
             in_uptrend[i] = True
             continue
             
@@ -251,7 +255,12 @@ def _add_atr_and_supertrend(df: pd.DataFrame) -> None:
 
 def _add_channels(df: pd.DataFrame) -> None:
     # Keltner Channel & Bollinger Bands
-    df['ATR_20'] = df['ATR'] # 近似简化复用
+    # 修正：使用真实波动幅度(TR)的20日均值来计算肯特纳通道，避免因误用14日ATR导致通道收窄、触发假挤压
+    if 'TR' in df:
+        df['ATR_20'] = df['TR'].rolling(window=20).mean()
+    else:
+        df['ATR_20'] = df['ATR'].rolling(window=20).mean()
+        
     df['KC_Upper'] = df['EMA_20'] + 1.5 * df['ATR_20']
     df['KC_Lower'] = df['EMA_20'] - 1.5 * df['ATR_20']
     
@@ -423,6 +432,13 @@ def run_tech_matrix() -> None:
             df = calculate_indicators(df)
             curr = df.iloc[-1]
             prev = df.iloc[-2]
+            
+            # --- 事件风险防雷网 (The Event Risk Filter) ---
+            event_risk = curr.get('Event_Risk', 0.0)
+            if event_risk > 0.85:
+                logger.debug(f"[{symbol}] 检测到极高事件风险(量价突变)，防雷网直接跳过。")
+                continue  # 极高风险直接丢弃，技术面已完全失效
+                
             signals = []
             score = 0
             
@@ -684,7 +700,7 @@ if __name__ == "__main__":
         test_tickers = get_nasdaq_100()[:5]
         send_dingtalk(
             "✅ Pro 量化引擎部署成功", 
-            f"完成【事件风险过滤器(防雷网)】精度优化与边界防护升级！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"逻辑链路全线修缮，自适应分位与通道均流转完毕！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
