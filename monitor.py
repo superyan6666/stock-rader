@@ -202,7 +202,9 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     close = df['Close'].values
     
     in_uptrend = np.ones(len(df), dtype=bool)
-    for i in range(1, len(df)):
+    # 改进：规避前10个 NaN 值的错误判定导致的索引越界与计算污染
+    in_uptrend[:10] = True 
+    for i in range(10, len(df)):
         if close[i] > ub[i-1]:
             in_uptrend[i] = True
         elif close[i] < lb[i-1]:
@@ -233,7 +235,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['BB_Upper'] = df['BB_MA20'] + 2 * df['BB_STD20']
     df['BB_Lower'] = df['BB_MA20'] - 2 * df['BB_STD20']
     
-    # === 8. 新增: ICHIMOKU Cloud (9, 26, 52) 终极主趋势过滤器 ===
+    # 8. ICHIMOKU Cloud (9, 26, 52) 
     high9 = df['High'].rolling(9).max()
     low9 = df['Low'].rolling(9).min()
     df['Tenkan'] = (high9 + low9) / 2
@@ -245,13 +247,10 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     high52 = df['High'].rolling(52).max()
     low52 = df['Low'].rolling(52).min()
     
-    # Senkou Span A/B 本应前移26天画在未来，但为了判断"当前的云"，我们将26天前算好的云平移到今天
     df['SenkouA'] = ((df['Tenkan'] + df['Kijun']) / 2).shift(26)
     df['SenkouB'] = ((high52 + low52) / 2).shift(26)
     
-    # 判断当前收盘价是否在云层上方
     df['Above_Cloud'] = (df['Close'] > df[['SenkouA', 'SenkouB']].max(axis=1)).astype(int)
-    # 判断云层是否扭转为多头云 (Span A > Span B)
     df['Cloud_Twist'] = (df['SenkouA'] > df['SenkouB']).astype(int)
     
     return df
@@ -300,27 +299,26 @@ def run_tech_matrix() -> None:
     logger.info(vix_desc)
     logger.info(f"当前大盘状态: {regime_desc}")
     
-    # 1. 提取 QQQ 基准收益率
     qqq_ret_20d, qqq_ret_5d = 0.0, 0.0
     if not qqq_df.empty and len(qqq_df) > 20:
         qqq_ret_20d = (qqq_df['Close'].dropna().iloc[-1] / qqq_df['Close'].iloc[-20]) - 1
         qqq_ret_5d = (qqq_df['Close'].dropna().iloc[-1] / qqq_df['Close'].iloc[-5]) - 1
 
-    # 2. 预加载纳指核心板块 ETF 数据，用于板块轮动 RS 测算
+    # 改进：大幅度扩充板块轮动的映射广度，并加入消费必需品(XLP)
     logger.info(">>> 预加载 Sector ETF 板块数据...")
-    sector_etfs = ['XLK', 'XLY', 'XLC', 'XLV']
+    sector_etfs = ['XLK', 'XLY', 'XLC', 'XLV', 'XLP']
     sector_data = {}
     for etf in sector_etfs:
         sdf = safe_get_history(etf, period="2mo", interval="1d", auto_adjust=True, retries=2)
         if not sdf.empty and len(sdf) >= 20:
             sector_data[etf] = (sdf['Close'].dropna().iloc[-1] / sdf['Close'].iloc[-20]) - 1
             
-    # 定义简单的板块映射规则 (权重股)
     def get_sector_etf(sym: str) -> str:
-        if sym in ['AAPL', 'MSFT', 'NVDA', 'AVGO', 'QCOM', 'AMD', 'INTC', 'CRM', 'ADBE', 'CSCO', 'TXN']: return 'XLK'
-        if sym in ['AMZN', 'TSLA', 'SBUX', 'BKNG', 'MAR', 'MELI', 'LULU']: return 'XLY'
-        if sym in ['GOOGL', 'META', 'NFLX', 'CMCSA', 'TMUS', 'EA']: return 'XLC'
-        if sym in ['AMGN', 'GILD', 'VRTX', 'REGN', 'ISRG', 'BIIB', 'ILMN']: return 'XLV'
+        if sym in ['AAPL', 'MSFT', 'NVDA', 'AVGO', 'QCOM', 'AMD', 'INTC', 'CRM', 'ADBE', 'CSCO', 'TXN', 'INTU', 'AMAT', 'MU', 'LRCX', 'PANW', 'KLAC', 'SNPS', 'CDNS', 'NXPI', 'MRVL', 'MCHP', 'FTNT', 'CRWD']: return 'XLK'
+        if sym in ['AMZN', 'TSLA', 'SBUX', 'BKNG', 'MAR', 'MELI', 'LULU', 'HD', 'ODFL', 'ROST', 'EBAY', 'TSCO', 'PDD', 'DASH', 'CPRT', 'PCAR']: return 'XLY'
+        if sym in ['GOOGL', 'GOOG', 'META', 'NFLX', 'CMCSA', 'TMUS', 'EA', 'TTWO', 'WBD', 'SIRI', 'CHTR']: return 'XLC'
+        if sym in ['AMGN', 'GILD', 'VRTX', 'REGN', 'ISRG', 'BIIB', 'ILMN', 'DXCM', 'IDXX', 'MRNA', 'ALGN', 'BMRN', 'GEHC']: return 'XLV'
+        if sym in ['PEP', 'COST', 'MDLZ', 'KDP', 'KHC', 'MNST', 'WBA']: return 'XLP'
         return Config.INDEX_ETF
 
     target_list = get_nasdaq_100()
@@ -364,16 +362,21 @@ def run_tech_matrix() -> None:
                 if len(merged) >= 20:
                     stock_ret_20d = (merged['Close_stock'].dropna().iloc[-1] / merged['Close_stock'].iloc[-20]) - 1
                     qqq_ret_20d_merged = (merged['Close_qqq'].dropna().iloc[-1] / merged['Close_qqq'].iloc[-20]) - 1
-                    rs_20 = (1 + stock_ret_20d) / (1 + qqq_ret_20d_merged)
+                    
+                    # 改进：防止大盘暴跌时分母为零引发异常计算
+                    denom_qqq = max(1 + qqq_ret_20d_merged, 0.5)
+                    rs_20 = (1 + stock_ret_20d) / denom_qqq
                     
                     stock_ret_5d = (merged['Close_stock'].dropna().iloc[-1] / merged['Close_stock'].iloc[-5]) - 1
                     qqq_ret_5d_merged = (merged['Close_qqq'].dropna().iloc[-1] / merged['Close_qqq'].iloc[-5]) - 1
-                    rs_5 = (1 + stock_ret_5d) / (1 + qqq_ret_5d_merged)
+                    rs_5 = (1 + stock_ret_5d) / max(1 + qqq_ret_5d_merged, 0.5)
                     
-                    # 动态检测板块轮动溢价
                     target_sector = get_sector_etf(symbol)
                     sector_ret_20d = sector_data.get(target_sector, qqq_ret_20d_merged)
-                    stock_sector_rs = (1 + stock_ret_20d) / (1 + sector_ret_20d) if sector_ret_20d != -1 else 1.0
+                    
+                    # 改进：严谨的除零安全保护
+                    denom_sector = max(1 + sector_ret_20d, 0.5)
+                    stock_sector_rs = (1 + stock_ret_20d) / denom_sector
 
                     if rs_20 > 1.08 or (rs_5 > 1.05 and rs_20 > 1.03):
                         signals.append(f"⚡ **[强相对强度]** 跑赢大盘 {rs_20-1:+.1%} (5日{rs_5-1:+.1%})")
@@ -480,7 +483,6 @@ def run_tech_matrix() -> None:
             tenkan_above_kijun = curr.get('Tenkan', 0) > curr.get('Kijun', 0)
             
             if not above_cloud:
-                # 若价格未站上云端，强行过滤掉一半得分
                 score = int(score * 0.4)
                 if strong_signals_count >= 1:
                     signals.append("☁️ **[云层压制]** 价格处于一目均衡云下方，长线趋势承压")
@@ -519,7 +521,6 @@ def run_tech_matrix() -> None:
                 elif vix > 25:
                     score = int(score * 0.75)
 
-                # 必须达到强共振门槛才放行
                 if score < Config.MIN_SCORE_THRESHOLD:
                     continue
 
@@ -596,7 +597,7 @@ if __name__ == "__main__":
         test_tickers = get_nasdaq_100()[:5]
         send_dingtalk(
             "✅ Pro 量化引擎部署成功", 
-            f"已集成 [一目均衡表云层系统] 与 [板块轮动共振]！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"已集成 [防崩溃除零护盾] 与 [极限边界过滤引擎]！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
