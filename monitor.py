@@ -103,7 +103,7 @@ def send_dingtalk(title: str, content: str) -> None:
             logger.error(f"推送请求网络异常: {e}")
 
 # ================= 3. 大盘风控感知系统 (Market & Risk Regime) =================
-def get_vix_level() -> Tuple[float, str]:
+def get_vix_level(qqq_df_for_shadow: pd.DataFrame = None) -> Tuple[float, str]:
     logger.info(">>> 正在获取 VIX 恐慌指数...")
     df = safe_get_history(Config.VIX_INDEX, period="5d", interval="1d", retries=3, auto_adjust=False)
     
@@ -114,8 +114,9 @@ def get_vix_level() -> Tuple[float, str]:
         vix = df['Close'].dropna().iloc[-1]
     else:
         logger.warning("⚠️ 雅虎财经拒绝返回 ^VIX 数据，启动影子波动率合成引擎...")
-        qqq_df = safe_get_history(Config.INDEX_ETF, period="2mo", interval="1d", retries=2, auto_adjust=True)
-        if not qqq_df.empty and len(qqq_df) >= 20:
+        # 改进：如果外部已经拿到了大盘数据，则直接复用，避免双重网络调用
+        qqq_df = qqq_df_for_shadow if qqq_df_for_shadow is not None else safe_get_history(Config.INDEX_ETF, period="2mo", interval="1d", retries=2, auto_adjust=True)
+        if qqq_df is not None and not qqq_df.empty and len(qqq_df) >= 20:
             daily_pct_change = qqq_df['Close'].pct_change().dropna()
             realized_volatility = daily_pct_change.rolling(window=20).std().iloc[-1]
             vix = realized_volatility * (252 ** 0.5) * 100 * 1.2
@@ -202,8 +203,12 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     close = df['Close'].values
     
     in_uptrend = np.ones(len(df), dtype=bool)
-    in_uptrend[:10] = True 
-    for i in range(10, len(df)):
+    # 改进：安全的 NaN 冷启动处理，防止边界溢出与错误赋值
+    for i in range(1, len(df)):
+        if pd.isna(ub[i-1]) or pd.isna(lb[i-1]):
+            in_uptrend[i] = True
+            continue
+            
         if close[i] > ub[i-1]:
             in_uptrend[i] = True
         elif close[i] < lb[i-1]:
@@ -293,8 +298,9 @@ def run_volatility_sentinel() -> None:
 def run_tech_matrix() -> None:
     logger.info(">>> 启动复合技术指标诊断...")
     
-    vix, vix_desc = get_vix_level()
+    # 改进：先后获取大盘和 VIX 数据，复用 QQQ DataFrame 以节省请求
     regime, regime_desc, qqq_df = get_market_regime()
+    vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
     logger.info(vix_desc)
     logger.info(f"当前大盘状态: {regime_desc}")
     
@@ -326,7 +332,9 @@ def run_tech_matrix() -> None:
     elif regime == 'bear':
         health_score = -0.7
     else:  # range 震荡市
-        health_score = 0.0 if avg_sector_strength < 0.01 else avg_sector_strength * 2
+        # 改进：使用钳位操作 (Clamp) 避免 ETF 收益率畸高导致 health_score 爆炸
+        sector_strength_capped = max(-0.2, min(0.2, float(avg_sector_strength)))
+        health_score = 0.0 if sector_strength_capped < 0.01 else sector_strength_capped * 2
 
     # 限制 health_score 在安全区间 [-1.0, 1.0]
     health_score = max(-1.0, min(1.0, float(health_score)))
@@ -611,12 +619,12 @@ if __name__ == "__main__":
     elif mode == "daily":
         run_daily_screener()
     elif mode == "test":
-        vix, vix_desc = get_vix_level()
-        regime, desc, _ = get_market_regime()
+        regime, desc, qqq_df = get_market_regime()
+        vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
         test_tickers = get_nasdaq_100()[:5]
         send_dingtalk(
             "✅ Pro 量化引擎部署成功", 
-            f"已集成 [市场健康自适应引擎] 与 [动态权重阀门]！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"已集成 [双重网络调用节约机制] 与 [极值压缩阀门]！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
