@@ -279,13 +279,42 @@ def _add_ichimoku(df: pd.DataFrame) -> None:
     df['Above_Cloud'] = (df['Close'] > df[['SenkouA', 'SenkouB']].max(axis=1)).astype(int)
     df['Cloud_Twist'] = (df['SenkouA'] > df['SenkouB']).astype(int)
 
+def _add_event_risk(df: pd.DataFrame) -> None:
+    """新增：轻量级事件风险评分引擎（财报/黑天鹅防雷网）"""
+    if len(df) < 30:
+        df['Event_Risk'] = 0.0
+        return
+        
+    # 1. 成交量异常（过去10天均量 vs 之前20天的基础均量）
+    recent_vol = df['Volume'].iloc[-10:].mean()
+    hist_vol = df['Volume'].iloc[-30:-10].mean()
+    vol_spike = recent_vol / (hist_vol + 1e-10) if hist_vol > 0 else 1.0
+        
+    # 2. 最近5天是否有极端跳空或单日 >8% 的暴涨暴跌 (资金抢跑或业绩暴雷)
+    recent_changes = df['Close'].pct_change().iloc[-5:].abs()
+    gap_or_spike = (recent_changes > 0.08).any()
+        
+    # 综合事件风险分数（0~1.0）
+    risk_score = 0.0
+    if vol_spike > 2.5:
+        risk_score += 0.6
+    if gap_or_spike:
+        risk_score += 0.4
+        
+    df['Event_Risk'] = min(1.0, risk_score)
+
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """将 DataFrame 贯穿所有技术指标引擎，模块化流水线"""
+    # 优化：全局预处理，防止因为少数几天无交易引发的 NaN 导致后续指标错乱
+    df['Close'] = df['Close'].ffill()
+    df['Volume'] = df['Volume'].ffill()
+    
     _add_rsi(df)
     _add_macd_and_emas(df)
     _add_atr_and_supertrend(df)
     _add_channels(df)
     _add_ichimoku(df)
+    _add_event_risk(df) # 接入财报/黑天鹅防雷网
     return df
 
 # ================= 5. 业务策略模块 =================
@@ -389,6 +418,13 @@ def run_tech_matrix() -> None:
             df = calculate_indicators(df)
             curr = df.iloc[-1]
             prev = df.iloc[-2]
+            
+            # --- 事件风险防雷网 (The Event Risk Filter) ---
+            event_risk = curr.get('Event_Risk', 0.0)
+            if event_risk > 0.85:
+                logger.debug(f"[{symbol}] 检测到极高事件风险(量价突变)，防雷网直接跳过。")
+                continue  # 极高风险直接丢弃，技术面已完全失效
+                
             signals = []
             score = 0
             
@@ -541,6 +577,12 @@ def run_tech_matrix() -> None:
                     score += int(6 * weight_multiplier)
                     strong_signals_count += 1
 
+            # --- 事件风险惩罚 (财报/突发异动防雷网应用) ---
+            if event_risk > 0.5:
+                # 0.5 - 0.85 区间的风险，剥夺部分得分
+                score = int(score * (1 - event_risk))
+                signals.append(f"⚠️ **[事件风险预警]** 近期量价异常(疑似事件窗口)，防守降权")
+
             # === 全局共振噪音过滤器 ===
             if score > 0 and strong_signals_count < 1 and not is_volume_confirmed:
                 score = int(score * 0.3) 
@@ -641,7 +683,7 @@ if __name__ == "__main__":
         test_tickers = get_nasdaq_100()[:5]
         send_dingtalk(
             "✅ Pro 量化引擎部署成功", 
-            f"完成极端边界防护与日志全链路追踪升级！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"完成【事件风险过滤器(防雷网)】与全局防漏值升级！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
