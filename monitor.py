@@ -410,7 +410,8 @@ def run_tech_matrix() -> None:
     health_score = max(-1.0, min(1.0, float(health_score)))
 
     weight_multiplier = 1.0 + health_score * 0.8
-    min_score_dynamic = max(Config.MIN_SCORE_THRESHOLD, 8 + int(health_score * -6))
+    # 修正：使用 round() 替代 int() 避免极端情况下浮点数精度截断误差导致动态门槛不符预期
+    min_score_dynamic = max(Config.MIN_SCORE_THRESHOLD, 8 + round(health_score * -6))
     
     logger.info(f"市场健康度: {health_score:.2f} | 权重倍增器: {weight_multiplier:.2f} | 动态门槛: {min_score_dynamic}")
             
@@ -644,11 +645,12 @@ def run_tech_matrix() -> None:
         reports.sort(key=lambda x: x['score'], reverse=True)
         top_reports_text = [r['text'] for r in reports[:15]]
         
+        # 修正：将权重因子等参数加入到最终推送报告尾部，确保推断溯源时可查
         final_report = f"*{vix_desc}*\n*{regime_desc}*\n\n" + "\n\n".join(top_reports_text)
         if len(reports) > 15:
-            final_report += f"\n\n*(已过滤低质信号，为您优选展示最高分 Top 15)*"
+            final_report += f"\n\n*(已过滤低质信号，为您优选展示最高分 Top 15 | 动态门槛: {min_score_dynamic} 分 | 权重因子: {weight_multiplier:.2f})*"
         else:
-            final_report += f"\n\n*(当前系统动态过滤门槛: {min_score_dynamic} 分)*"
+            final_report += f"\n\n*(动态门槛: {min_score_dynamic} 分 | 权重因子: {weight_multiplier:.2f})*"
             
         send_dingtalk("📊 纳指 100 优选异动池", final_report)
     else:
@@ -701,7 +703,7 @@ if __name__ == "__main__":
         test_tickers = get_nasdaq_100()[:5]
         send_dingtalk(
             "✅ Pro 量化引擎部署成功", 
-            f"完成性能极限压榨！极速加载策略与周线低延时机制部署完毕！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"逻辑一致性打磨完毕，动态门槛精度与报告透明度全面上线！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
