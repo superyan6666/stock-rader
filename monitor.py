@@ -96,8 +96,11 @@ def send_dingtalk(title: str, content: str) -> None:
         try:
             resp = requests.post(url, json=payload, timeout=10)
             resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            # 改进：精准捕获并记录 HTTP 错误状态码，方便排查 Webhook 限制
+            logger.error(f"钉钉接口返回错误: {e.response.status_code} - {e.response.text}")
         except Exception as e:
-            logger.error(f"推送请求发生异常: {e}")
+            logger.error(f"推送请求网络异常: {e}")
 
 # ================= 3. 大盘风控感知系统 (Market & Risk Regime) =================
 def get_vix_level() -> Tuple[float, str]:
@@ -115,7 +118,8 @@ def get_vix_level() -> Tuple[float, str]:
         if not qqq_df.empty and len(qqq_df) >= 20:
             daily_pct_change = qqq_df['Close'].pct_change().dropna()
             realized_volatility = daily_pct_change.rolling(window=20).std().iloc[-1]
-            vix = realized_volatility * (252 ** 0.5) * 100
+            # 改进：期权隐含波动率(IV)通常高于历史波动率(HV)，乘以 1.2 作为保守溢价补偿
+            vix = realized_volatility * (252 ** 0.5) * 100 * 1.2
             is_simulated = True
         else:
             return 18.0, "⚠️ VIX 与大盘双双获取失败，启用中性防守模式 (默认 VIX=18.0)"
@@ -191,7 +195,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
     
-    # 5. ADX 趋势强度过滤 (14期) [核心提升点]
+    # 5. ADX 趋势强度过滤 (14期) - 使用 EWM 模拟 Wilder 平滑
     high_diff = df['High'].diff()
     low_diff = df['Low'].shift(1) - df['Low']
     
@@ -348,41 +352,48 @@ def run_tech_matrix() -> None:
                     score += int(weight * 0.6)
                 else:
                     signals.append("🔥 **[零上金叉]** 强势主升浪确认")
-                    score += weight + (4 if is_strong_trend else 0) # 强趋势加成
+                    score += weight + (4 if is_strong_trend else 0)
 
             # --- TTM Squeeze 动量版 (The True Squeeze) ---
             bb_abs = curr['BB_Upper'] - curr['BB_Lower']
             kc_abs = curr['KC_Upper'] - curr['KC_Lower']
             is_squeeze_on = bb_abs < kc_abs
             
-            # 历史挤压验证
-            past_squeeze = (df['BB_Upper'].iloc[-6:-1] < df['KC_Upper'].iloc[-6:-1]) & \
-                           (df['BB_Lower'].iloc[-6:-1] > df['KC_Lower'].iloc[-6:-1])
-            was_squeeze = past_squeeze.any()
+            # 改进：确保有足够数据切片，获取过去5天是否存在挤压
+            was_squeeze = False
+            if len(df) >= 6:
+                past_squeeze = (df['BB_Upper'].iloc[-6:-1] < df['KC_Upper'].iloc[-6:-1]) & \
+                               (df['BB_Lower'].iloc[-6:-1] > df['KC_Lower'].iloc[-6:-1])
+                was_squeeze = past_squeeze.any()
             
-            # 动能柱方向确认 (John Carter's Momentum Logic)
             macd_hist = curr['MACD_Hist']
             prev_macd_hist = prev['MACD_Hist']
             
+            # 动能反转确认
             is_squeeze_fire_up = was_squeeze and (not is_squeeze_on) and (macd_hist > 0) and (macd_hist > prev_macd_hist)
             is_squeeze_fire_down = was_squeeze and (not is_squeeze_on) and (macd_hist < 0) and (macd_hist < prev_macd_hist)
+            
+            # 改进：John Carter 原版要求叠加价格真实突破布林带上轨
+            price_above_bb_upper = curr['Close'] > curr['BB_Upper']
 
             if is_squeeze_on:
                 weight = 12 if regime == 'range' else 6
                 signals.append("📦 **[TTM Squeeze ON]** 极致压缩，等待爆发")
                 score += weight
             elif is_squeeze_fire_up:
-                # 向上突破，结合 ADX 趋势过滤
                 weight = 18 if regime == 'bull' else 10
-                if is_strong_trend:
-                    signals.append("🚀 **[TTM Squeeze FIRE ↑]** 挤压向上释放，动能强劲！")
+                if price_above_bb_upper:
+                    signals.append("🚀 **[TTM Squeeze FIRE ↑]** 价格突破上轨，动能强劲确认点火！")
+                    score += weight + 4 # 价格突破再额外加分
+                elif is_strong_trend:
+                    signals.append("🔥 **[TTM Squeeze FIRE ↑]** 挤压向上释放 (趋势确认)")
                     score += weight
                 else:
                     signals.append("🔥 **[TTM Squeeze FIRE ↑]** 挤压向上释放 (需防假突破)")
                     score += int(weight * 0.6)
             elif is_squeeze_fire_down:
                 signals.append("🔻 **[TTM Squeeze FIRE ↓]** 空头动量释放，警惕下杀")
-                score -= 8 # 避险扣分
+                score -= 8 
 
             # --- 均线突破 + ADX 共振 ---
             if prev['Close'] < prev['EMA_50'] and curr['Close'] > curr['EMA_50']:
@@ -392,15 +403,16 @@ def run_tech_matrix() -> None:
                     score += weight
                 else:
                     signals.append(f"📉 **[疲软突破]** 站上50日均线 (ADX提示趋势偏弱)")
-                    score -= 3 # 弱趋势下突破极易骗炮
+                    score -= 3 
 
             # --- 全局量价共振加分 ---
             if is_volume_confirmed and score > 0:
                 signals.append("🌊 **[量价共振]** 成交量显著放大(>1.5x)，确认资金介入")
                 score += 3
 
-            # --- 多时间框架共振 ---
-            if signals and score >= 10:
+            # --- 多时间框架共振 (极大优化 GHA 网络开销) ---
+            # 改进：将获取周线的门槛提升至 15 分，过滤掉大量弱势股，单次任务省下几十秒
+            if signals and score >= 15:
                 weekly_trend = get_weekly_trend(symbol)
                 if weekly_trend == "bullish":
                     signals.append("🌟 **[周线共振]** 长期趋势多头，胜率倍增")
@@ -434,13 +446,17 @@ def run_tech_matrix() -> None:
         reports.sort(key=lambda x: x['score'], reverse=True)
         top_reports_text = [r['text'] for r in reports[:15]]
         
+        # 改进：动态输出当前拦截门槛，缓解用户“为什么今天没消息”的焦虑
         final_report = f"*{vix_desc}*\n*{regime_desc}*\n\n" + "\n\n".join(top_reports_text)
         if len(reports) > 15:
             final_report += f"\n\n*(已过滤低质信号，当前为您展示得分最高的 Top 15 机会)*"
+        else:
+            final_report += f"\n\n*(当前系统推送过滤门槛: {Config.MIN_SCORE_THRESHOLD} 分)*"
             
         send_dingtalk("📊 纳指 100 优选异动池", final_report)
     else:
         logger.info(f"未触发核心指标策略，或所有个股得分均低于门槛 ({Config.MIN_SCORE_THRESHOLD}分)。")
+        # 即使无信号也发送状态报告（每天首次运行时可能会有用，这里暂保留原逻辑静默）
 
 def run_daily_screener() -> None:
     logger.info(">>> 启动纳指 100 全量扫盘报告...")
@@ -489,7 +505,7 @@ if __name__ == "__main__":
         test_tickers = get_nasdaq_100()[:5]
         send_dingtalk(
             "✅ Pro 量化引擎部署成功", 
-            f"已集成 ADX 趋势过滤与 TTM 动能引擎！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"已集成 影子VIX溢价修正 与 TTM Squeeze 价格破位确认！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
