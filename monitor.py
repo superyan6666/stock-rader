@@ -118,6 +118,7 @@ def send_dingtalk(title: str, content: str) -> None:
         try:
             resp = requests.post(url, json=payload, timeout=10)
             resp.raise_for_status()
+            logger.info(f"✅ 成功推送至 {url}")
         except requests.exceptions.HTTPError as e:
             logger.error(f"钉钉接口返回错误: {e.response.status_code} - {e.response.text}")
         except Exception as e:
@@ -132,7 +133,7 @@ def get_vix_level(qqq_df_for_shadow: pd.DataFrame = None) -> Tuple[float, str]:
     is_simulated = False
     
     if not df.empty and len(df) >= 1:
-        vix = df['Close'].dropna().iloc[-1]
+        vix = df['Close'].ffill().iloc[-1]
     else:
         logger.warning("⚠️ 雅虎财经拒绝返回 ^VIX 数据，启动影子波动率合成引擎...")
         qqq_df = qqq_df_for_shadow if qqq_df_for_shadow is not None else safe_get_history(Config.INDEX_ETF, period="2mo", interval="1d", retries=2, auto_adjust=True, fast_mode=True)
@@ -157,12 +158,13 @@ def get_vix_level(qqq_df_for_shadow: pd.DataFrame = None) -> Tuple[float, str]:
 
 def get_market_regime() -> Tuple[str, str, pd.DataFrame]:
     logger.info(f">>> 正在分析大盘环境 ({Config.INDEX_ETF})...")
-    df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", auto_adjust=True, fast_mode=True)
+    # 优化：ETF 统一使用 auto_adjust=False 保持指数类数据一致性
+    df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", auto_adjust=False, fast_mode=True)
     
     if len(df) < 200:
         return "range", "大盘数据不足，默认震荡市", df
         
-    current_close = df['Close'].dropna().iloc[-1]
+    current_close = df['Close'].ffill().iloc[-1]
     ma200 = df['Close'].rolling(200).mean().iloc[-1]
     trend_20d = (current_close - df['Close'].iloc[-20]) / df['Close'].iloc[-20]
     
@@ -177,7 +179,7 @@ def get_weekly_trend(symbol: str) -> str:
     df_week = safe_get_history(symbol, period="2y", interval="1wk", retries=2)
     if len(df_week) < 55: return "neutral"
         
-    price = df_week['Close'].dropna().iloc[-1]
+    price = df_week['Close'].ffill().iloc[-1]
     ma50w = df_week['Close'].rolling(50).mean().iloc[-1]
     if pd.isna(ma50w): return "neutral"
         
@@ -303,7 +305,7 @@ def run_volatility_sentinel() -> None:
             df = safe_get_history(symbol, period="2d", interval="1h")
             if len(df) < 2: continue
             
-            curr_price = df['Close'].dropna().iloc[-1]
+            curr_price = df['Close'].ffill().iloc[-1]
             open_price = df['Open'].iloc[-1] 
             
             hour_change = (curr_price - open_price) / open_price * 100
@@ -332,16 +334,16 @@ def run_tech_matrix() -> None:
     
     qqq_ret_20d, qqq_ret_5d = 0.0, 0.0
     if not qqq_df.empty and len(qqq_df) > 20:
-        qqq_ret_20d = (qqq_df['Close'].dropna().iloc[-1] / qqq_df['Close'].iloc[-20]) - 1
-        qqq_ret_5d = (qqq_df['Close'].dropna().iloc[-1] / qqq_df['Close'].iloc[-5]) - 1
+        qqq_ret_20d = (qqq_df['Close'].ffill().iloc[-1] / qqq_df['Close'].iloc[-20]) - 1
+        qqq_ret_5d = (qqq_df['Close'].ffill().iloc[-1] / qqq_df['Close'].iloc[-5]) - 1
 
     logger.info(">>> 预加载 Sector ETF 板块数据 (Fast Mode)...")
     sector_etfs = list(Config.SECTOR_MAP.keys())
     sector_data = {}
     for etf in sector_etfs:
-        sdf = safe_get_history(etf, period="2mo", interval="1d", auto_adjust=True, retries=2, fast_mode=True)
+        sdf = safe_get_history(etf, period="2mo", interval="1d", auto_adjust=False, retries=2, fast_mode=True)
         if not sdf.empty and len(sdf) >= 20:
-            sector_data[etf] = (sdf['Close'].dropna().iloc[-1] / sdf['Close'].iloc[-20]) - 1
+            sector_data[etf] = (sdf['Close'].ffill().iloc[-1] / sdf['Close'].iloc[-20]) - 1
 
     # === 市场健康自适应权重引擎 ===
     avg_sector_strength = np.mean(list(sector_data.values())) if sector_data else 0.0
@@ -407,14 +409,14 @@ def run_tech_matrix() -> None:
             if not qqq_df.empty:
                 merged = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, how='inner', suffixes=('_stock', '_qqq'))
                 if len(merged) >= 20:
-                    stock_ret_20d = (merged['Close_stock'].dropna().iloc[-1] / merged['Close_stock'].iloc[-20]) - 1
-                    qqq_ret_20d_merged = (merged['Close_qqq'].dropna().iloc[-1] / merged['Close_qqq'].iloc[-20]) - 1
+                    stock_ret_20d = (merged['Close_stock'].ffill().iloc[-1] / merged['Close_stock'].iloc[-20]) - 1
+                    qqq_ret_20d_merged = (merged['Close_qqq'].ffill().iloc[-1] / merged['Close_qqq'].iloc[-20]) - 1
                     
                     denom_qqq = max(1 + qqq_ret_20d_merged, 0.5)
                     rs_20 = (1 + stock_ret_20d) / denom_qqq
                     
-                    stock_ret_5d = (merged['Close_stock'].dropna().iloc[-1] / merged['Close_stock'].iloc[-5]) - 1
-                    qqq_ret_5d_merged = (merged['Close_qqq'].dropna().iloc[-1] / merged['Close_qqq'].iloc[-5]) - 1
+                    stock_ret_5d = (merged['Close_stock'].ffill().iloc[-1] / merged['Close_stock'].iloc[-5]) - 1
+                    qqq_ret_5d_merged = (merged['Close_qqq'].ffill().iloc[-1] / merged['Close_qqq'].iloc[-5]) - 1
                     rs_5 = (1 + stock_ret_5d) / max(1 + qqq_ret_5d_merged, 0.5)
                     
                     target_sector = Config.get_sector_etf(symbol)
@@ -608,15 +610,15 @@ def run_daily_screener() -> None:
             df = safe_get_history(symbol, period="6mo", interval="1d")
             if len(df) < 50: continue
             
-            price = df['Close'].dropna().iloc[-1]
+            price = df['Close'].ffill().iloc[-1]
             ma20 = df['Close'].rolling(20).mean().iloc[-1]
             ma50 = df['Close'].rolling(50).mean().iloc[-1]
             
             score = (price > ma20) + (price > ma50) + (ma20 > ma50)
             if score == 3: bullish.append(symbol)
             elif score == 0: bearish.append(symbol)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[{symbol}] 每日复盘分析跳过: {e}")
 
     report = f"🎯 **今日纳斯达克 100 扫描总结**\n\n**📈 绝对多头排列 (强势)**\n> {', '.join(bullish) if bullish else '无'}\n\n**📉 绝对空头排列 (弱势)**\n> {', '.join(bearish) if bearish else '无'}"
     send_dingtalk("📝 纳指 100 全景复盘", report)
@@ -639,7 +641,7 @@ if __name__ == "__main__":
         test_tickers = get_nasdaq_100()[:5]
         send_dingtalk(
             "✅ Pro 量化引擎部署成功", 
-            f"完成指标高可读模块化重构与 ETF 极速防抖预加载！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"完成极端边界防护与日志全链路追踪升级！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
