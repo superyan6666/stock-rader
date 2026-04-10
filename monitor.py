@@ -19,7 +19,12 @@ logging.basicConfig(
 logger = logging.getLogger("QuantBot")
 
 class Config:
+    # Webhook 支持钉钉/飞书/企业微信
     WEBHOOK_URL: str = os.environ.get('WEBHOOK_URL', '')
+    # 借鉴：新增 Telegram 原生多渠道推送支持
+    TELEGRAM_BOT_TOKEN: str = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+    TELEGRAM_CHAT_ID: str = os.environ.get('TELEGRAM_CHAT_ID', '')
+    
     DINGTALK_KEYWORD: str = "AI"
     CORE_WATCHLIST: List[str] = ["NVDA", "TSLA", "AAPL", "MSFT", "MSTR"]
     BLACKLIST: List[str] = [] 
@@ -27,7 +32,6 @@ class Config:
     VIX_INDEX: str = "^VIX" 
     MIN_SCORE_THRESHOLD: int = 8 
     
-    # 优雅的板块映射字典，便于后续手动维护与扩充，零网络开销
     SECTOR_MAP = {
         'XLK': ['AAPL', 'MSFT', 'NVDA', 'AVGO', 'QCOM', 'AMD', 'INTC', 'CRM', 'ADBE', 'CSCO', 'TXN', 'INTU', 'AMAT', 'MU', 'LRCX', 'PANW', 'KLAC', 'SNPS', 'CDNS', 'NXPI', 'MRVL', 'MCHP', 'FTNT', 'CRWD'],
         'XLY': ['AMZN', 'TSLA', 'SBUX', 'BKNG', 'MAR', 'MELI', 'LULU', 'HD', 'ODFL', 'ROST', 'EBAY', 'TSCO', 'PDD', 'DASH', 'CPRT', 'PCAR'],
@@ -44,8 +48,8 @@ class Config:
         return Config.INDEX_ETF
 
 def validate_config():
-    if not Config.WEBHOOK_URL:
-        logger.error("❌ WEBHOOK_URL 未配置，系统无法推送消息。请检查 GitHub Secrets 环境。")
+    if not Config.WEBHOOK_URL and not Config.TELEGRAM_BOT_TOKEN:
+        logger.error("❌ 未配置任何推送渠道 (WEBHOOK_URL 或 TELEGRAM_BOT_TOKEN)。请检查 GitHub Secrets。")
         sys.exit(1)
     logger.info("✅ 环境变量与配置校验通过")
 
@@ -53,7 +57,6 @@ def validate_config():
 def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", retries: int = 5, auto_adjust: bool = True, fast_mode: bool = False) -> pd.DataFrame:
     for attempt in range(retries):
         try:
-            # 优化：极限压缩 fast_mode 的等待时间 (0.2~0.5秒)，在防封禁的前提下榨干网络性能
             if fast_mode:
                 sleep_sec = random.uniform(0.2, 0.5)
             else:
@@ -79,6 +82,21 @@ def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", ret
             
     return pd.DataFrame()
 
+def get_latest_news(symbol: str) -> str:
+    """借鉴：轻量级实时新闻上下文拉取器，解释暴涨暴跌背后的基本面逻辑"""
+    try:
+        # yfinance 的 news 接口是轻量级的，适合按需即时抓取
+        news_data = yf.Ticker(symbol).news
+        if news_data and len(news_data) > 0:
+            latest_news = news_data[0]
+            title = latest_news.get('title', '')
+            publisher = latest_news.get('publisher', '')
+            if title:
+                return f"📰 **[最新动态]** {title} ({publisher})"
+    except Exception as e:
+        logger.debug(f"[{symbol}] 新闻拉取失败: {e}")
+    return ""
+
 def get_nasdaq_100() -> List[str]:
     logger.info(">>> 正在联网获取最新 纳斯达克 100 成分股名单...")
     try:
@@ -102,27 +120,44 @@ def get_nasdaq_100() -> List[str]:
         logger.error(f"❌ 获取名单解析失败，使用备用核心名单: {e}")
         return Config.CORE_WATCHLIST
 
-def send_dingtalk(title: str, content: str) -> None:
-    if not Config.WEBHOOK_URL: return
-
-    payload = {
-        "msgtype": "markdown",
-        "markdown": {
-            "title": f"【{Config.DINGTALK_KEYWORD}盯盘】{title}",
-            "text": f"### 🤖 【{Config.DINGTALK_KEYWORD}量化监控系统】\n#### {title}\n\n{content}\n\n---\n*⏱️ 扫描时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}*"
-        }
-    }
+def send_alert(title: str, content: str) -> None:
+    """借鉴：升级为多渠道广播中心 (Webhook + Telegram)"""
+    formatted_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     
-    urls = [url.strip() for url in Config.WEBHOOK_URL.split(',') if url.strip()]
-    for url in urls:
+    # 1. 钉钉/飞书/企微 Webhook 推送
+    if Config.WEBHOOK_URL:
+        payload = {
+            "msgtype": "markdown",
+            "markdown": {
+                "title": f"【{Config.DINGTALK_KEYWORD}盯盘】{title}",
+                "text": f"### 🤖 【{Config.DINGTALK_KEYWORD}量化监控系统】\n#### {title}\n\n{content}\n\n---\n*⏱️ 扫描时间: {formatted_time}*"
+            }
+        }
+        urls = [url.strip() for url in Config.WEBHOOK_URL.split(',') if url.strip()]
+        for url in urls:
+            try:
+                resp = requests.post(url, json=payload, timeout=10)
+                resp.raise_for_status()
+                logger.info(f"✅ 成功推送至 Webhook")
+            except Exception as e:
+                logger.error(f"Webhook 推送异常: {e}")
+                
+    # 2. Telegram Bot 推送
+    if Config.TELEGRAM_BOT_TOKEN and Config.TELEGRAM_CHAT_ID:
+        tg_url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage"
+        # Telegram MarkdownV2 格式需注意转义，这里使用默认的 Markdown 保持兼容
+        tg_payload = {
+            "chat_id": Config.TELEGRAM_CHAT_ID,
+            "text": f"🤖 *量化监控系统*\n\n*{title}*\n\n{content}\n\n⏱️ _{formatted_time}_",
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }
         try:
-            resp = requests.post(url, json=payload, timeout=10)
+            resp = requests.post(tg_url, json=tg_payload, timeout=10)
             resp.raise_for_status()
-            logger.info(f"✅ 成功推送至 {url}")
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"钉钉接口返回错误: {e.response.status_code} - {e.response.text}")
+            logger.info(f"✅ 成功推送至 Telegram")
         except Exception as e:
-            logger.error(f"推送请求网络异常: {e}")
+            logger.error(f"Telegram 推送异常: {e}")
 
 # ================= 3. 大盘风控感知系统 (Market & Risk Regime) =================
 def get_vix_level(qqq_df_for_shadow: pd.DataFrame = None) -> Tuple[float, str]:
@@ -158,7 +193,6 @@ def get_vix_level(qqq_df_for_shadow: pd.DataFrame = None) -> Tuple[float, str]:
 
 def get_market_regime() -> Tuple[str, str, pd.DataFrame]:
     logger.info(f">>> 正在分析大盘环境 ({Config.INDEX_ETF})...")
-    # 优化：ETF 统一使用 auto_adjust=False 保持指数类数据一致性
     df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", auto_adjust=False, fast_mode=True)
     
     if len(df) < 200:
@@ -176,7 +210,6 @@ def get_market_regime() -> Tuple[str, str, pd.DataFrame]:
         return "range", "⚖️ 震荡整理阶段 (缺乏明确的单边趋势)", df
 
 def get_weekly_trend(symbol: str) -> str:
-    # 优化：为周线请求启用极速模式 (fast_mode=True)，大幅压榨高分股票并发查询的耗时
     df_week = safe_get_history(symbol, period="2y", interval="1wk", retries=2, fast_mode=True)
     if len(df_week) < 55: return "neutral"
         
@@ -199,7 +232,6 @@ def _add_rsi(df: pd.DataFrame) -> None:
     rs = avg_gain / (avg_loss + 1e-10)
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # 修正：只要满足 min_periods=60 即可启动动态阈值，避免在长度略小于120时死板降级
     if len(df) >= 60:
         df['RSI_P20'] = df['RSI'].rolling(window=120, min_periods=60).quantile(0.20)
     else:
@@ -222,7 +254,6 @@ def _add_atr_and_supertrend(df: pd.DataFrame) -> None:
     low_close = (df['Low'] - df['Close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     
-    # 修正：保存真实的日级别 TR 数据，供后续通道宽度做精准 20 日均值计算
     df['TR'] = tr
     df['ATR'] = tr.rolling(window=14).mean()
     
@@ -236,7 +267,6 @@ def _add_atr_and_supertrend(df: pd.DataFrame) -> None:
     in_uptrend = np.ones(len(df), dtype=bool)
     for i in range(1, len(df)):
         if pd.isna(ub[i-1]) or pd.isna(lb[i-1]):
-            # 优化：冷启动期预设看多，因总体扫描周期通常超100天，初期默认值不会影响到最后的真实趋势判定
             in_uptrend[i] = True
             continue
             
@@ -255,8 +285,6 @@ def _add_atr_and_supertrend(df: pd.DataFrame) -> None:
     df['SuperTrend_Up'] = in_uptrend.astype(int) 
 
 def _add_channels(df: pd.DataFrame) -> None:
-    # Keltner Channel & Bollinger Bands
-    # 修正：使用真实波动幅度(TR)的20日均值来计算肯特纳通道，避免因误用14日ATR导致通道收窄、触发假挤压
     if 'TR' in df:
         df['ATR_20'] = df['TR'].rolling(window=20).mean()
     else:
@@ -271,7 +299,6 @@ def _add_channels(df: pd.DataFrame) -> None:
     df['BB_Lower'] = df['BB_MA20'] - 2 * df['BB_STD20']
 
 def _add_ichimoku(df: pd.DataFrame) -> None:
-    # ICHIMOKU Cloud (9, 26, 52) 
     high9 = df['High'].rolling(9).max()
     low9 = df['Low'].rolling(9).min()
     df['Tenkan'] = (high9 + low9) / 2
@@ -290,24 +317,19 @@ def _add_ichimoku(df: pd.DataFrame) -> None:
     df['Cloud_Twist'] = (df['SenkouA'] > df['SenkouB']).astype(int)
 
 def _add_event_risk(df: pd.DataFrame) -> None:
-    """新增：轻量级事件风险评分引擎（财报/黑天鹅防雷网）"""
     if len(df) < 60:
         df['Event_Risk'] = 0.0
         return
         
-    # 1. 成交量异常（过去10天均量 vs 之前50天的80%分位数，过滤异常值）
     recent_vol = df['Volume'].iloc[-10:].mean()
     hist_vol = df['Volume'].iloc[-60:-10].quantile(0.8)
     vol_spike = recent_vol / (hist_vol + 1e-10) if hist_vol > 0 else 1.0
         
-    # 2. 最近5天是否有极端跳空或单日 >8% 的暴涨暴跌 (资金抢跑或业绩暴雷)
     recent_changes = df['Close'].pct_change().iloc[-5:].abs()
     gap_or_spike = (recent_changes > 0.08).any()
     
-    # 3. 连续放量天数（最近5天中成交量高于基准1.5倍的天数，捕捉财报前温和建仓抢跑）
     consecutive_high_vol = (df['Volume'].iloc[-5:] > hist_vol * 1.5).sum()
         
-    # 综合事件风险分数（0~1.0）
     risk_score = 0.0
     if vol_spike > 2.5:
         risk_score += 0.6
@@ -319,8 +341,6 @@ def _add_event_risk(df: pd.DataFrame) -> None:
     df['Event_Risk'] = min(1.0, risk_score)
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """将 DataFrame 贯穿所有技术指标引擎，模块化流水线"""
-    # 优化：全局预处理，防止因为少数几天无交易引发的 NaN 导致后续指标错乱
     df['Close'] = df['Close'].ffill()
     df['Volume'] = df['Volume'].ffill()
     
@@ -329,7 +349,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     _add_atr_and_supertrend(df)
     _add_channels(df)
     _add_ichimoku(df)
-    _add_event_risk(df) # 接入财报/黑天鹅防雷网
+    _add_event_risk(df) 
     return df
 
 # ================= 5. 业务策略模块 =================
@@ -366,7 +386,7 @@ def run_volatility_sentinel() -> None:
             logger.debug(f"[{symbol}] 哨兵模式分析跳过: {e}")
 
     if alerts:
-        send_dingtalk("⚡ 极端异动警告", "\n\n".join(alerts))
+        send_alert("⚡ 极端异动警告", "\n\n".join(alerts))
 
 def run_tech_matrix() -> None:
     logger.info(">>> 启动复合技术指标诊断...")
@@ -410,7 +430,6 @@ def run_tech_matrix() -> None:
     health_score = max(-1.0, min(1.0, float(health_score)))
 
     weight_multiplier = 1.0 + health_score * 0.8
-    # 修正：使用 round() 替代 int() 避免极端情况下浮点数精度截断误差导致动态门槛不符预期
     min_score_dynamic = max(Config.MIN_SCORE_THRESHOLD, 8 + round(health_score * -6))
     
     logger.info(f"市场健康度: {health_score:.2f} | 权重倍增器: {weight_multiplier:.2f} | 动态门槛: {min_score_dynamic}")
@@ -439,7 +458,7 @@ def run_tech_matrix() -> None:
             event_risk = curr.get('Event_Risk', 0.0)
             if event_risk > 0.85:
                 logger.debug(f"[{symbol}] 检测到极高事件风险(量价突变)，防雷网直接跳过。")
-                continue  # 极高风险直接丢弃，技术面已完全失效
+                continue  
                 
             signals = []
             score = 0
@@ -596,7 +615,7 @@ def run_tech_matrix() -> None:
             # --- 事件风险惩罚 (财报/突发异动防雷网应用) ---
             event_risk = curr.get('Event_Risk', 0.0)
             if event_risk > 0.85:
-                score = int(score * 0.2)  # 保留一丝可能，但极大压制
+                score = int(score * 0.2)  
                 signals.append("🚨 **[极高事件风险]** 发生极端量价突变，技术面随时失效！")
             elif event_risk > 0.5:
                 score = int(score * (1 - event_risk))
@@ -624,13 +643,18 @@ def run_tech_matrix() -> None:
                     signals.append("⚠️ **[周线逆风]** 长期趋势空头，严防诱多陷阱")
                     score -= 4 
 
-            # --- 推送阈值验证 (统一受市场健康度接管) ---
+            # --- 推送阈值验证与即时新闻加载 (JIT News Context) ---
             if signals:
                 if score < min_score_dynamic:
                     continue
 
-                if len(signals) > 7:
-                    signals = signals[:7] + [f"*(...还有 {len(signals)-7} 个强趋势印证)*"]
+                # 借鉴：仅针对高置信度即将推送的标的，抓取最新的一条新闻，零成本实现大模型基本面解读感
+                news_context = get_latest_news(symbol)
+                if news_context:
+                    signals.append(news_context)
+
+                if len(signals) > 8:
+                    signals = signals[:8] + [f"*(...还有 {len(signals)-8} 个强趋势印证)*"]
                     
                 turnover = curr['Close'] * curr['Volume']
                 turnover_str = f"${turnover/1e9:.2f}B" if turnover >= 1e9 else f"${turnover/1e6:.2f}M"
@@ -645,14 +669,13 @@ def run_tech_matrix() -> None:
         reports.sort(key=lambda x: x['score'], reverse=True)
         top_reports_text = [r['text'] for r in reports[:15]]
         
-        # 修正：将权重因子等参数加入到最终推送报告尾部，确保推断溯源时可查
         final_report = f"*{vix_desc}*\n*{regime_desc}*\n\n" + "\n\n".join(top_reports_text)
         if len(reports) > 15:
             final_report += f"\n\n*(已过滤低质信号，为您优选展示最高分 Top 15 | 动态门槛: {min_score_dynamic} 分 | 权重因子: {weight_multiplier:.2f})*"
         else:
             final_report += f"\n\n*(动态门槛: {min_score_dynamic} 分 | 权重因子: {weight_multiplier:.2f})*"
             
-        send_dingtalk("📊 纳指 100 优选异动池", final_report)
+        send_alert("📊 纳指 100 优选异动池", final_report)
     else:
         logger.info(f"所有个股未通过 Ichimoku 趋势云过滤，或得分低于动态门槛 ({min_score_dynamic}分)。")
 
@@ -683,7 +706,7 @@ def run_daily_screener() -> None:
             logger.debug(f"[{symbol}] 每日复盘分析跳过: {e}")
 
     report = f"🎯 **今日纳斯达克 100 扫描总结**\n\n**📈 绝对多头排列 (强势)**\n> {', '.join(bullish) if bullish else '无'}\n\n**📉 绝对空头排列 (弱势)**\n> {', '.join(bearish) if bearish else '无'}"
-    send_dingtalk("📝 纳指 100 全景复盘", report)
+    send_alert("📝 纳指 100 全景复盘", report)
 
 # ================= 6. 入口模块 =================
 if __name__ == "__main__":
@@ -701,9 +724,9 @@ if __name__ == "__main__":
         regime, desc, qqq_df = get_market_regime()
         vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
         test_tickers = get_nasdaq_100()[:5]
-        send_dingtalk(
+        send_alert(
             "✅ Pro 量化引擎部署成功", 
-            f"逻辑一致性打磨完毕，动态门槛精度与报告透明度全面上线！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"已集成 [JIT 实时新闻解析] 与 [Telegram 多渠道推送]！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
