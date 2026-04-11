@@ -707,6 +707,9 @@ def run_tech_matrix() -> None:
             
         # 对每个板块进行拥挤惩罚
         for sector, stocks in sector_groups.items():
+            if sector == Config.INDEX_ETF:
+                continue  # 排除未分类股票（默认大盘），不参与板块拥挤降权
+                
             if len(stocks) < Config.CROWDING_MIN_STOCKS:
                 continue  # 板块内只有 1 只，不惩罚
                 
