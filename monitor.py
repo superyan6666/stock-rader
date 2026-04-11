@@ -7,6 +7,7 @@ import numpy as np
 import time
 import random
 import logging
+import re
 from typing import List, Tuple
 from datetime import datetime, timezone
 
@@ -141,6 +142,11 @@ def get_nasdaq_100() -> List[str]:
         logger.error(f"❌ 获取名单解析失败，使用备用核心名单: {e}")
         return Config.CORE_WATCHLIST
 
+def escape_md_v2(text: str) -> str:
+    """[备用功能] 针对 Telegram MarkdownV2 格式的保留字全量转义（注意：若启用需防范破坏原生 Markdown 样式）"""
+    escape_chars = r"_*[]()~`>#+-=|{}.!"
+    return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
+
 def send_alert(title: str, content: str) -> None:
     """多渠道广播中心 (Webhook + Telegram)"""
     formatted_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
@@ -172,7 +178,7 @@ def send_alert(title: str, content: str) -> None:
         tg_payload = {
             "chat_id": Config.TELEGRAM_CHAT_ID,
             "text": raw_text,
-            "parse_mode": "Markdown",  # 回退到兼容性最佳的原生 Markdown
+            "parse_mode": "Markdown",  # 保持回退到兼容性最佳的原生 Markdown
             "disable_web_page_preview": True
         }
         try:
