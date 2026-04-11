@@ -41,6 +41,11 @@ class Config:
         'XLP': ['PEP', 'COST', 'MDLZ', 'KDP', 'KHC', 'MNST', 'WBA']
     }
 
+    # 新增：板块拥挤度过滤强度（0.6~0.9 之间，数值越小惩罚越狠）
+    CROWDING_PENALTY: float = 0.75
+    # 触发拥挤过滤的最低股票数量（≥2 即认为拥挤）
+    CROWDING_MIN_STOCKS: int = 2
+
     @staticmethod
     def get_sector_etf(symbol: str) -> str:
         for etf, symbols in Config.SECTOR_MAP.items():
@@ -691,20 +696,54 @@ def run_tech_matrix() -> None:
                 turnover_str = f"${turnover/1e9:.2f}B" if turnover >= 1e9 else f"${turnover/1e6:.2f}M"
                     
                 report_text = f"**{symbol}** (${curr['Close']:.2f} | 额: {turnover_str} | 🌟动态评分: **{score}**)\n> " + "\n> ".join(signals)
-                reports.append({"symbol": symbol, "score": score, "text": report_text})
+                
+                # === 新增：板块拥挤度过滤（Crowding Filter）===
+                # 只对最终要推送的股票进行后处理，这里动态获取 sector 以防未定义
+                reports.append({
+                    "symbol": symbol,
+                    "score": score,
+                    "text": report_text,
+                    "sector": Config.get_sector_etf(symbol), 
+                    "raw_score": score
+                })
                 
         except Exception as e:
             logger.debug(f"[{symbol}] 分析发生静默错误: {e}")
 
+    # ====================== 板块拥挤度后处理（核心升级）======================
     if reports:
-        reports.sort(key=lambda x: x['score'], reverse=True)
-        top_reports_text = [r['text'] for r in reports[:15]]
+        from collections import defaultdict
+        sector_groups = defaultdict(list)
+        for r in reports:
+            sector_groups[r["sector"]].append(r)
+            
+        # 对每个板块进行拥挤惩罚
+        for sector, stocks in sector_groups.items():
+            if len(stocks) < Config.CROWDING_MIN_STOCKS:
+                continue  # 板块内只有 1 只，不惩罚
+                
+            # 找出本板块内得分最高的领涨股
+            stocks.sort(key=lambda x: x["raw_score"], reverse=True)
+            leader_score = stocks[0]["raw_score"]
+            
+            # 对非领涨股统一施加惩罚
+            for stock in stocks[1:]:
+                stock["score"] = int(stock["raw_score"] * Config.CROWDING_PENALTY)
+                
+                # 更新显示文本，标注拥挤降权 (使用精准替换防止破坏原生排版)
+                old_score_str = f"🌟动态评分: **{stock['raw_score']}**"
+                new_score_str = f"🌟动态评分: **{stock['score']}**（板块拥挤降权）"
+                stock["text"] = stock["text"].replace(old_score_str, new_score_str)
+
+        # 重新按最终得分排序
+        reports.sort(key=lambda x: x["score"], reverse=True)
+        top_reports_text = [r["text"] for r in reports[:15]]
         
         final_report = f"*{vix_desc}*\n*{regime_desc}*\n\n" + "\n\n".join(top_reports_text)
         if len(reports) > 15:
-            final_report += f"\n\n*(已过滤低质信号，为您优选展示最高分 Top 15 | 动态门槛: {min_score_dynamic} 分 | 权重因子: {weight_multiplier:.2f})*"
+            final_report += f"\n\n*(已过滤低质信号 + 板块拥挤降权，为您优选展示最高分 Top 15)*"
         else:
-            final_report += f"\n\n*(动态门槛: {min_score_dynamic} 分 | 权重因子: {weight_multiplier:.2f})*"
+            final_report += f"\n\n*(动态门槛: {min_score_dynamic} 分 | 权重因子: {weight_multiplier:.2f} | 已应用板块拥挤过滤)*"
             
         send_alert("📊 纳指 100 优选异动池", final_report)
     else:
