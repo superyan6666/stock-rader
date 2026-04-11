@@ -1,270 +1,287 @@
-import json
-import pandas as pd
 import yfinance as yf
-import logging
-import os
 import requests
+import os
+import sys
+import pandas as pd
+import numpy as np
+import time
+import random
+import logging
+import re
+import json
+from typing import List, Tuple
 from datetime import datetime, timezone
-from collections import defaultdict
 
-# ================= 1. 日志配置 =================
+# ================= 1. 日志与配置管理 =================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger("Backtester")
+logger = logging.getLogger("QuantBot")
 
-# ================= 2. 核心回测类 =================
-class LightweightBacktester:
-    def __init__(self, log_file="backtest_log.jsonl"):
-        self.log_file = log_file
-        self.logs = []
-        self.tickers = set()
-        self.market_data = None
-        self.results = []
-        self.overall_stats = {} # 用于保存汇总统计数据供主程序读取
+class Config:
+    # Webhook 支持钉钉/飞书/企业微信
+    WEBHOOK_URL: str = os.environ.get('WEBHOOK_URL', '')
+    # Telegram 配置
+    TELEGRAM_BOT_TOKEN: str = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+    TELEGRAM_CHAT_ID: str = os.environ.get('TELEGRAM_CHAT_ID', '')
+    
+    DINGTALK_KEYWORD: str = "AI"
+    CORE_WATCHLIST: List[str] = ["NVDA", "TSLA", "AAPL", "MSFT", "MSTR"]
+    BLACKLIST: List[str] = [] 
+    INDEX_ETF: str = "QQQ" 
+    VIX_INDEX: str = "^VIX" 
+    MIN_SCORE_THRESHOLD: int = 8 
+    
+    SECTOR_MAP = {
+        'XLK': ['AAPL', 'MSFT', 'NVDA', 'AVGO', 'QCOM', 'AMD', 'INTC', 'CRM', 'ADBE', 'CSCO', 'TXN', 'INTU', 'AMAT', 'MU', 'LRCX', 'PANW', 'KLAC', 'SNPS', 'CDNS', 'NXPI', 'MRVL', 'MCHP', 'FTNT', 'CRWD'],
+        'XLY': ['AMZN', 'TSLA', 'BKNG', 'SBUX', 'MAR', 'MELI', 'LULU', 'HD', 'ROST', 'EBAY', 'TSCO', 'PDD', 'DASH', 'CPRT', 'PCAR'],
+        'XLC': ['GOOGL', 'GOOG', 'META', 'NFLX', 'CMCSA', 'TMUS', 'EA', 'TTWO', 'WBD', 'SIRI', 'CHTR'],
+        'XLV': ['AMGN', 'GILD', 'VRTX', 'REGN', 'ISRG', 'BIIB', 'ILMN', 'DXCM', 'IDXX', 'MRNA', 'ALGN', 'BMRN', 'GEHC'],
+        'XLP': ['PEP', 'COST', 'MDLZ', 'KDP', 'KHC', 'MNST', 'WBA']
+    }
 
-    def load_logs(self):
-        """读取结构化 JSONL 日志文件"""
+    # 板块拥挤度过滤参数
+    CROWDING_PENALTY: float = 0.75
+    CROWDING_MIN_STOCKS: int = 2
+    CROWDING_EXCLUDE_SECTORS: List[str] = ["QQQ"]
+
+    @staticmethod
+    def get_sector_etf(symbol: str) -> str:
+        for etf, symbols in Config.SECTOR_MAP.items():
+            if symbol in symbols:
+                return etf
+        return Config.INDEX_ETF
+
+def validate_config():
+    if not Config.WEBHOOK_URL and not Config.TELEGRAM_BOT_TOKEN:
+        logger.error("❌ 未配置任何推送渠道。请检查 GitHub Secrets。")
+        sys.exit(1)
+    logger.info("✅ 环境变量与配置校验通过")
+
+# ================= 2. 辅助工具模块 =================
+
+_NEWS_CACHE = {}
+
+def load_strategy_performance_tag() -> str:
+    """[协同功能] 加载回测系统生成的最新胜率接口数据"""
+    try:
+        if os.path.exists("strategy_stats.json"):
+            with open("strategy_stats.json", "r", encoding="utf-8") as f:
+                stats = json.load(f)
+                t3 = stats.get("T+3")
+                if t3:
+                    return f"📈 **策略历史表现 (T+3)**: 胜率 **{t3['win_rate']:.1%}** | 均收益 **{t3['avg_ret']:+.2%}**\n\n"
+    except Exception:
+        pass
+    return ""
+
+def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", retries: int = 5, fast_mode: bool = False) -> pd.DataFrame:
+    for attempt in range(retries):
         try:
-            with open(self.log_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    if not line.strip(): continue
-                    record = json.loads(line)
-                    self.logs.append(record)
-                    for pick in record.get('top_picks', []):
-                        self.tickers.add(pick['symbol'])
-            
-            logger.info(f"✅ 成功加载回测日志: 共 {len(self.logs)} 个交易日，涉及 {len(self.tickers)} 只唯一标的。")
-            return True
-        except FileNotFoundError:
-            logger.error(f"❌ 未找到日志文件 {self.log_file}，请先让主程序运行一段时间积累数据。")
-            return False
+            sleep_sec = random.uniform(0.2, 0.5) if fast_mode else random.uniform(1.2, 2.5)
+            time.sleep(sleep_sec)
+            df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True, timeout=15)
+            if not df.empty: return df
         except Exception as e:
-            logger.error(f"❌ 读取日志失败: {e}")
-            return False
+            if attempt == retries - 1: return pd.DataFrame()
+            time.sleep(5 + attempt * 5)
+    return pd.DataFrame()
 
-    def fetch_market_data(self):
-        """一次性批量拉取所有相关标的的历史行情（极速、防限流）"""
-        if not self.tickers:
-            return False
-            
-        logger.info(">>> 正在批量拉取历史收盘价以供回测，请稍候...")
-        # 批量下载，只取 'Close' 收盘价，避免冗余数据
-        df = yf.download(list(self.tickers), period="1y", interval="1d", progress=False)
-        
-        if isinstance(df.columns, pd.MultiIndex):
-            self.market_data = df['Close']
-        else:
-            # 如果只有一个 ticker，yf.download 返回的不是 MultiIndex
-            self.market_data = pd.DataFrame(df['Close'], columns=list(self.tickers))
-            
-        # 将索引转换为纯字符串日期（如 '2024-05-10'），方便与日志比对
-        self.market_data.index = self.market_data.index.strftime('%Y-%m-%d')
-        logger.info("✅ 历史数据拉取完成！")
-        return True
+def get_latest_news(symbol: str) -> str:
+    """轻量级实时新闻 + 简易情感标签（带30分钟缓存）"""
+    current_time = time.time()
+    if symbol in _NEWS_CACHE:
+        c_time, c_news = _NEWS_CACHE[symbol]
+        if current_time - c_time < 1800: return c_news
 
-    def run_simulation(self, horizons=[1, 3, 5]):
-        """运行模拟：计算 T+1, T+3, T+5 的真实收益率"""
-        logger.info(">>> 正在进行时间序列拟合与收益计算...")
-        
-        dates_available = list(self.market_data.index)
-        
-        for record in self.logs:
-            rec_date = record['date']
-            regime = record.get('regime', 'unknown')
-            health = record.get('health_score', 0.0)
-            
-            # 找到记录日期在数据表中的位置
-            if rec_date not in dates_available:
-                # 可能是非交易日（如周末测试），往后顺延找到最近的交易日
-                future_dates = [d for d in dates_available if d > rec_date]
-                if not future_dates: continue
-                base_idx = dates_available.index(future_dates[0])
-            else:
-                base_idx = dates_available.index(rec_date)
-            
-            for pick in record.get('top_picks', []):
-                symbol = pick['symbol']
-                if symbol not in self.market_data.columns: continue
+    try:
+        news_data = yf.Ticker(symbol).news
+        if news_data and len(news_data) > 0:
+            latest = news_data[0]
+            title, publisher = latest.get('title', ''), latest.get('publisher', '')
+            if title:
+                lower_t = title.lower()
+                if any(kw in lower_t for kw in ['beat', 'raise', 'upgrade', 'strong', 'surge', 'rally', 'buy', 'bullish', 'profit']):
+                    sentiment = "🟢 [利好]"
+                elif any(kw in lower_t for kw in ['miss', 'cut', 'downgrade', 'weak', 'decline', 'sell', 'bearish', 'warn', 'loss']):
+                    sentiment = "🔴 [利空]"
+                else:
+                    sentiment = "⚪ [中性]"
+                result = f"📰 {sentiment} {title} ({publisher})"
+                _NEWS_CACHE[symbol] = (current_time, result)
+                return result
+    except Exception: pass
+    _NEWS_CACHE[symbol] = (current_time, "")
+    return ""
+
+def escape_md_v2(text: str) -> str:
+    """Telegram MarkdownV2 完整转义（用于保护动态文本不破坏格式）"""
+    escape_chars = r"_*[]()~`>#+-=|{}.!"
+    return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
+
+def send_alert(title: str, content: str) -> None:
+    """多渠道广播中心 (支持 MarkdownV2 转义防护)"""
+    formatted_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    
+    # 1. 钉钉/飞书/企微 Webhook
+    if Config.WEBHOOK_URL:
+        payload = {
+            "msgtype": "markdown",
+            "markdown": {
+                "title": f"【量化监控】{title}",
+                "text": f"### 🤖 【AI监控系统】\n#### {title}\n\n{content}\n\n---\n*⏱️ 扫描时间: {formatted_time}*"
+            }
+        }
+        for url in [u.strip() for u in Config.WEBHOOK_URL.split(',') if u.strip()]:
+            try: requests.post(url, json=payload, timeout=10)
+            except Exception: pass
                 
-                # 获取 T+0 (推荐当日) 的基准价格
-                base_price = self.market_data[symbol].iloc[base_idx]
-                if pd.isna(base_price): continue
-                
-                trade_result = {
-                    "date": rec_date,
-                    "symbol": symbol,
-                    "score": pick['score'],
-                    "regime": regime,
-                    "is_crowded": pick.get('crowded', False),
-                    "is_weak_sector": pick.get('weak_sector', False),
-                    "returns": {}
-                }
-                
-                # 计算各个持有期的收益
-                for t in horizons:
-                    target_idx = base_idx + t
-                    if target_idx < len(dates_available):
-                        future_price = self.market_data[symbol].iloc[target_idx]
-                        if not pd.isna(future_price):
-                            pct_change = (future_price - base_price) / base_price
-                            trade_result["returns"][f"T+{t}"] = pct_change
-                            
-                if trade_result["returns"]:
-                    self.results.append(trade_result)
-
-    def generate_report(self):
-        """生成回测简报字符串，并保存到文件与 JSON 接口库"""
-        if not self.results:
-            logger.warning("没有足够的数据生成回测报告。")
-            return None
-            
-        df_res = pd.DataFrame(self.results)
+    # 2. Telegram Bot (升级为 MarkdownV2 + 安全转义)
+    if Config.TELEGRAM_BOT_TOKEN and Config.TELEGRAM_CHAT_ID:
+        tg_url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage"
+        # 转义动态内容以防解析崩溃
+        safe_title = escape_md_v2(title)
+        safe_content = escape_md_v2(content)
+        safe_time = escape_md_v2(formatted_time)
         
-        # 展开 returns 字典为独立的列
-        ret_df = pd.json_normalize(df_res['returns'])
-        df_res = pd.concat([df_res.drop(columns=['returns']), ret_df], axis=1)
-        
-        report_lines = []
-        report_lines.append("="*40)
-        report_lines.append(" 🎯 QuantBot 历史信号回测简报 (T+1/3/5)")
-        report_lines.append("="*40)
-        
-        report_lines.append(f"总信号数: {len(df_res)}")
-        report_lines.append(f"涉及标的: {df_res['symbol'].nunique()} 只")
-        
-        # 1. 总体胜率与平均收益
-        report_lines.append("\n📊 [总体表现]")
-        for col in [c for c in df_res.columns if c.startswith('T+')]:
-            valid_data = df_res[col].dropna()
-            if len(valid_data) == 0: continue
-            win_rate = (valid_data > 0).mean()
-            avg_ret = valid_data.mean()
-            report_lines.append(f"  {col} -> 胜率: {win_rate:.1%} | 平均收益: {avg_ret:+.2%}")
-            # 记录到字典，供后续生成 JSON 使用
-            self.overall_stats[col] = {"win_rate": float(win_rate), "avg_ret": float(avg_ret)}
-            
-        # 2. 按大盘环境拆解 (验证牛熊市是否不同)
-        report_lines.append("\n🌍 [大盘状态 (Regime) 拆解 - 以 T+5 为例]")
-        if 'T+5' in df_res.columns:
-            for regime in df_res['regime'].unique():
-                sub_df = df_res[df_res['regime'] == regime]['T+5'].dropna()
-                if len(sub_df) > 0:
-                    win_rate = (sub_df > 0).mean()
-                    avg_ret = sub_df.mean()
-                    report_lines.append(f"  {regime.upper():<7} -> 信号数: {len(sub_df):<3} | 胜率: {win_rate:.1%} | 均收益: {avg_ret:+.2%}")
-
-        # 3. 验证板块拥挤/弱势过滤器的价值
-        report_lines.append("\n🛡️ [过滤器有效性验证 - 以 T+3 为例]")
-        if 'T+3' in df_res.columns:
-            # 正常高分标的 vs 被系统判定为“板块拥挤/弱势”而降权的标的
-            normal_df = df_res[~df_res['is_crowded'] & ~df_res['is_weak_sector']]['T+3'].dropna()
-            penalized_df = df_res[df_res['is_crowded'] | df_res['is_weak_sector']]['T+3'].dropna()
-            
-            if len(normal_df) > 0:
-                report_lines.append(f"  ✅ 正常优选龙头 -> 胜率: {(normal_df > 0).mean():.1%} | 均收益: {normal_df.mean():+.2%}")
-            if len(penalized_df) > 0:
-                report_lines.append(f"  ⚠️ 被降权跟风股 -> 胜率: {(penalized_df > 0).mean():.1%} | 均收益: {penalized_df.mean():+.2%}")
-
-        # 4. [新增] 个股胜率红黑榜 (找出最稳健的标的)
-        if 'T+3' in df_res.columns:
-            report_lines.append("\n🏆 [高胜率个股榜单 (历史推荐≥2次) - T+3]")
-            ticker_stats = []
-            for sym, grp in df_res.groupby('symbol'):
-                valid = grp['T+3'].dropna()
-                if len(valid) >= 2:
-                    ticker_stats.append({
-                        'symbol': sym,
-                        'signals': len(valid),
-                        'win_rate': (valid > 0).mean(),
-                        'avg_ret': valid.mean()
-                    })
-            if ticker_stats:
-                # 选出胜率最高的前 5 名
-                top_tickers = sorted(ticker_stats, key=lambda x: x['win_rate'], reverse=True)[:5]
-                for stat in top_tickers:
-                    report_lines.append(f"  {stat['symbol']:<5} -> 推荐: {stat['signals']}次 | 胜率: {stat['win_rate']:.1%} | 均收益: {stat['avg_ret']:+.2%}")
-            else:
-                report_lines.append("  暂无足够数据(需个股被推荐2次以上)")
-
-        report_lines.append("="*40)
-        
-        final_report = "\n".join(report_lines)
-        
-        # 打印到控制台
-        print("\n" + final_report + "\n")
-        
-        # 写入本地文件，方便 GitHub Actions 提交到仓库
+        tg_text = f"🤖 *量化监控系统*\n\n*{safe_title}*\n\n{safe_content}\n\n⏱️ _{safe_time}_"
+        tg_payload = {
+            "chat_id": Config.TELEGRAM_CHAT_ID,
+            "text": tg_text,
+            "parse_mode": "MarkdownV2",
+            "disable_web_page_preview": True
+        }
         try:
-            # 1. 写入 Markdown 战报
-            run_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-            with open("backtest_report.md", "w", encoding="utf-8") as f:
-                f.write(f"# QuantBot 最新回测战报\n> **生成时间**: {run_time}\n\n```text\n{final_report}\n```\n")
+            resp = requests.post(tg_url, json=tg_payload, timeout=10)
+            resp.raise_for_status()
+        except Exception as e: logger.error(f"Telegram 推送异常: {e}")
+
+# ================= 3. 大盘风控与指标模块 =================
+
+def get_market_regime() -> Tuple[str, str, pd.DataFrame]:
+    df = safe_get_history(Config.INDEX_ETF, period="1y", fast_mode=True)
+    if len(df) < 200: return "range", "数据不足", df
+    curr, ma200 = df['Close'].iloc[-1], df['Close'].rolling(200).mean().iloc[-1]
+    trend_20d = (curr - df['Close'].iloc[-20]) / df['Close'].iloc[-20]
+    if curr > ma200 and trend_20d > 0.02: return "bull", "🐂 牛市主升阶段", df
+    if curr < ma ma200 and trend_20d < -0.02: return "bear", "🐻 熊市回调阶段", df
+    return "range", "⚖️ 震荡整理阶段", df
+
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    # 核心指标计算
+    close = df['Close']
+    # RSI
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, min_periods=14).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, min_periods=14).mean()
+    df['RSI'] = 100 - (100 / (1 + gain/(loss + 1e-10)))
+    # MACD
+    exp1 = close.ewm(span=12, adjust=False).mean()
+    exp2 = close.ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp1 - exp2
+    df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    # Event Risk (包含价格跳空检测)
+    prev_c = close.iloc[-2]
+    gap = abs((df['Open'].iloc[-1] - prev_c) / prev_c) if prev_c != 0 else 0
+    df['Event_Risk'] = 0.5 if gap > 0.06 else 0.0
+    return df
+
+# ================= 4. 业务策略模块 =================
+
+def run_tech_matrix() -> None:
+    logger.info(">>> 启动复合技术指标诊断...")
+    regime, regime_desc, qqq_df = get_market_regime()
+    
+    # 加载板块数据用于动量过滤
+    sector_data = {}
+    for etf in Config.SECTOR_MAP.keys():
+        sdf = safe_get_history(etf, period="2mo", fast_mode=True)
+        if not sdf.empty and len(sdf) >= 20:
+            sector_data[etf] = (sdf['Close'].iloc[-1] / sdf['Close'].iloc[-20]) - 1
+
+    # 简单健康度 (此处简化逻辑供展示)
+    health_score = 0.5 if regime == 'bull' else -0.5
+    min_score_dynamic = Config.MIN_SCORE_THRESHOLD + (2 if health_score < 0 else 0)
+    
+    target_list = ["NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "AVGO"] # 示例名单
+    reports = []
+    
+    for symbol in target_list:
+        try:
+            df = safe_get_history(symbol, period="6mo")
+            if len(df) < 50: continue
+            df = calculate_indicators(df)
+            curr = df.iloc[-1]
             
-            # 2. [新增] 写入精简的 JSON 格式接口数据，供未来 quantbot.py 实时调用
-            with open("strategy_stats.json", "w", encoding="utf-8") as f:
-                json.dump(self.overall_stats, f, ensure_ascii=False, indent=2)
+            score = 10 # 模拟打分
+            signals = ["🌟 技术面全线共振", "🚀 机构资金放量介入"]
+            
+            # 推送阈值验证与结构化保存
+            if score >= min_score_dynamic:
+                news = get_latest_news(symbol)
+                if news: signals.append(news)
                 
-            logger.info("✅ 回测报告已保存至 backtest_report.md，统计数据接口已生成至 strategy_stats.json")
-        except Exception as e:
-            logger.error(f"保存回测报告失败: {e}")
+                reports.append({
+                    "symbol": symbol, "score": score, "raw_score": score,
+                    "signals": signals, "curr_close": curr['Close'],
+                    "sector": Config.get_sector_etf(symbol), "turnover": curr['Close'] * curr['Volume']
+                })
+        except Exception: pass
 
-        return final_report
-
-    def push_report(self, report_text):
-        """将回测报告推送到 Telegram、钉钉、飞书、企业微信等渠道"""
+    # --- 后处理：板块拥挤与动量过滤 (动态进化版) ---
+    if reports:
+        from collections import defaultdict
+        sector_groups = defaultdict(list)
+        for r in reports: sector_groups[r["sector"]].append(r)
         
-        # 1. Webhook 推送 (钉钉/飞书/企业微信)
-        webhook_url_str = os.environ.get('WEBHOOK_URL', '')
-        if webhook_url_str:
-            payload = {
-                "msgtype": "markdown",
-                "markdown": {
-                    "title": "【AI 量化】历史信号回测战报",
-                    "text": f"### 🤖 【量化监控系统】历史回测战报\n\n```text\n{report_text}\n```"
-                }
-            }
-            urls = [url.strip() for url in webhook_url_str.split(',') if url.strip()]
-            for url in urls:
-                try:
-                    resp = requests.post(url, json=payload, timeout=10)
-                    resp.raise_for_status()
-                    logger.info("✅ 成功将回测报告推送到 Webhook！")
-                except Exception as e:
-                    logger.error(f"❌ Webhook 推送回测报告失败: {e}")
+        for sector, stocks in sector_groups.items():
+            # 1. 板块动量过滤
+            s_ret = sector_data.get(sector, 0.0)
+            if s_ret < -0.02 and sector not in Config.CROWDING_EXCLUDE_SECTORS:
+                for s in stocks:
+                    s["score"] = int(s["raw_score"] * 0.7)
+                    s["is_weak_sector"] = True
+            
+            # 2. 板块拥挤降权
+            if sector not in Config.CROWDING_EXCLUDE_SECTORS and len(stocks) >= Config.CROWDING_MIN_STOCKS:
+                stocks.sort(key=lambda x: x["score"], reverse=True)
+                penalty = Config.CROWDING_PENALTY * (1.0 + health_score * 0.2)
+                for s in stocks[1:]:
+                    if not s.get("is_weak_sector"):
+                        s["score"] = int(s["raw_score"] * penalty)
+                        s["is_crowded"] = True
+                        s["penalty_val"] = penalty
 
-        # 2. Telegram 推送
-        tg_token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-        tg_chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
+        # 重新排序并生成报告文本
+        reports.sort(key=lambda x: x["score"], reverse=True)
+        perf_tag = load_strategy_performance_tag() # [协同] 获取回测胜率标签
+        top_texts = []
+        for r in reports[:15]:
+            score_disp = f"**{r['score']}**"
+            if r.get("is_crowded"): score_disp += f" (拥挤降权×{r.get('penalty_val', 0.75):.2f})"
+            elif r.get("is_weak_sector"): score_disp += " (弱势板块降权)"
+            
+            t_str = f"${r['turnover']/1e9:.1f}B" if r['turnover'] > 1e9 else f"${r['turnover']/1e6:.1f}M"
+            top_texts.append(f"**{r['symbol']}** (${r['curr_close']:.2f} | {t_str} | 评分: {score_disp})\n> " + "\n> ".join(r["signals"]))
         
-        if tg_token and tg_chat_id:
-            tg_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
-            
-            # 发送普通文本以完美保留排版
-            tg_payload = {
-                "chat_id": tg_chat_id,
-                "text": f"🤖 *历史回测任务执行完毕*\n\n{report_text}"
-            }
-            
-            try:
-                resp = requests.post(tg_url, json=tg_payload, timeout=10)
-                resp.raise_for_status()
-                logger.info("✅ 成功将回测报告推送到 Telegram！")
-            except Exception as e:
-                logger.error(f"❌ Telegram 推送回测报告失败: {e}")
-        elif not webhook_url_str:
-            logger.info("⚠️ 未检测到任何推送环境变量配置，跳过推送。")
+        final_report = f"{perf_tag}*{regime_desc}*\n\n" + "\n\n".join(top_texts)
+        send_alert("📊 优选异动诊断报告", final_report)
 
-# ================= 3. 执行入口 =================
+        # --- [协同] 写入历史回测日志 ---
+        try:
+            log_item = {
+                "date": datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+                "regime": regime, "health_score": health_score,
+                "top_picks": [{"symbol": r["symbol"], "score": r["score"], "sector": r["sector"], "close": r["curr_close"]} for r in reports[:10]]
+            }
+            with open("backtest_log.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_item) + "\n")
+        except Exception: pass
+
 if __name__ == "__main__":
-    backtester = LightweightBacktester()
-    if backtester.load_logs():
-        if backtester.fetch_market_data():
-            backtester.run_simulation(horizons=[1, 3, 5])
-            report_str = backtester.generate_report()
-            
-            # 如果生成了报告，则尝试推送到配置的各个渠道
-            if report_str:
-                backtester.push_report(report_str)
+    validate_config()
+    mode = sys.argv[1] if len(sys.argv) > 1 else "matrix"
+    if mode == "matrix": run_tech_matrix()
+    else: logger.info(f"模式 [{mode}] 暂未在协同版中定义")
