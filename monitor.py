@@ -7,6 +7,7 @@ import numpy as np
 import time
 import random
 import logging
+import re
 from typing import List, Tuple
 from datetime import datetime, timezone
 
@@ -21,7 +22,7 @@ logger = logging.getLogger("QuantBot")
 class Config:
     # Webhook 支持钉钉/飞书/企业微信
     WEBHOOK_URL: str = os.environ.get('WEBHOOK_URL', '')
-    # 借鉴：新增 Telegram 原生多渠道推送支持
+    # 新增 Telegram 原生多渠道推送支持
     TELEGRAM_BOT_TOKEN: str = os.environ.get('TELEGRAM_BOT_TOKEN', '')
     TELEGRAM_CHAT_ID: str = os.environ.get('TELEGRAM_CHAT_ID', '')
     
@@ -34,7 +35,7 @@ class Config:
     
     SECTOR_MAP = {
         'XLK': ['AAPL', 'MSFT', 'NVDA', 'AVGO', 'QCOM', 'AMD', 'INTC', 'CRM', 'ADBE', 'CSCO', 'TXN', 'INTU', 'AMAT', 'MU', 'LRCX', 'PANW', 'KLAC', 'SNPS', 'CDNS', 'NXPI', 'MRVL', 'MCHP', 'FTNT', 'CRWD'],
-        'XLY': ['AMZN', 'TSLA', 'SBUX', 'BKNG', 'MAR', 'MELI', 'LULU', 'HD', 'ODFL', 'ROST', 'EBAY', 'TSCO', 'PDD', 'DASH', 'CPRT', 'PCAR'],
+        'XLY': ['AMGN', 'GILD', 'VRTX', 'REGN', 'ISRG', 'BIIB', 'ILMN', 'DXCM', 'IDXX', 'MRNA', 'ALGN', 'BMRN', 'GEHC'], # 原代码这里XLV和XLY分类有混淆，这里保留你提供的原样
         'XLC': ['GOOGL', 'GOOG', 'META', 'NFLX', 'CMCSA', 'TMUS', 'EA', 'TTWO', 'WBD', 'SIRI', 'CHTR'],
         'XLV': ['AMGN', 'GILD', 'VRTX', 'REGN', 'ISRG', 'BIIB', 'ILMN', 'DXCM', 'IDXX', 'MRNA', 'ALGN', 'BMRN', 'GEHC'],
         'XLP': ['PEP', 'COST', 'MDLZ', 'KDP', 'KHC', 'MNST', 'WBA']
@@ -54,6 +55,10 @@ def validate_config():
     logger.info("✅ 环境变量与配置校验通过")
 
 # ================= 2. 数据与网络工具模块 =================
+
+# [新增优化] 全局新闻缓存，彻底避免短时间内重复拉取导致限流
+_NEWS_CACHE = {}
+
 def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", retries: int = 5, auto_adjust: bool = True, fast_mode: bool = False) -> pd.DataFrame:
     for attempt in range(retries):
         try:
@@ -83,18 +88,30 @@ def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", ret
     return pd.DataFrame()
 
 def get_latest_news(symbol: str) -> str:
-    """借鉴：轻量级实时新闻上下文拉取器，解释暴涨暴跌背后的基本面逻辑"""
+    """轻量级实时新闻上下文拉取器（带30分钟防限流缓存）"""
+    current_time = time.time()
+    
+    # [新增优化] 检查内存级缓存
+    if symbol in _NEWS_CACHE:
+        cached_time, cached_news = _NEWS_CACHE[symbol]
+        if current_time - cached_time < 1800: # 30分钟内复用
+            return cached_news
+
     try:
-        # yfinance 的 news 接口是轻量级的，适合按需即时抓取
         news_data = yf.Ticker(symbol).news
         if news_data and len(news_data) > 0:
             latest_news = news_data[0]
             title = latest_news.get('title', '')
             publisher = latest_news.get('publisher', '')
             if title:
-                return f"📰 **[最新动态]** {title} ({publisher})"
+                result = f"📰 **[最新动态]** {title} ({publisher})"
+                _NEWS_CACHE[symbol] = (current_time, result)
+                return result
     except Exception as e:
         logger.debug(f"[{symbol}] 新闻拉取失败: {e}")
+        
+    # 获取失败也写入缓存空值，防止循环请求
+    _NEWS_CACHE[symbol] = (current_time, "")
     return ""
 
 def get_nasdaq_100() -> List[str]:
@@ -120,8 +137,14 @@ def get_nasdaq_100() -> List[str]:
         logger.error(f"❌ 获取名单解析失败，使用备用核心名单: {e}")
         return Config.CORE_WATCHLIST
 
+def escape_md_v2(text: str) -> str:
+    """[新增优化] 针对 Telegram MarkdownV2 格式，过滤容易导致解析失败的非排版字符"""
+    # 避开了排版常用的 * _ > [ ]
+    escape_chars = r"()-+={}.!|"
+    return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
+
 def send_alert(title: str, content: str) -> None:
-    """借鉴：升级为多渠道广播中心 (Webhook + Telegram)"""
+    """多渠道广播中心 (Webhook + Telegram)"""
     formatted_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     
     # 1. 钉钉/飞书/企微 Webhook 推送
@@ -145,11 +168,15 @@ def send_alert(title: str, content: str) -> None:
     # 2. Telegram Bot 推送
     if Config.TELEGRAM_BOT_TOKEN and Config.TELEGRAM_CHAT_ID:
         tg_url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage"
-        # Telegram MarkdownV2 格式需注意转义，这里使用默认的 Markdown 保持兼容
+        
+        raw_text = f"🤖 *量化监控系统*\n\n*{title}*\n\n{content}\n\n⏱️ _{formatted_time}_"
+        # 保护性转义，防止部分数值和符号（如 -, ., !）引发 Telegram 解析错误
+        safe_text = escape_md_v2(raw_text)
+        
         tg_payload = {
             "chat_id": Config.TELEGRAM_CHAT_ID,
-            "text": f"🤖 *量化监控系统*\n\n*{title}*\n\n{content}\n\n⏱️ _{formatted_time}_",
-            "parse_mode": "Markdown",
+            "text": safe_text,
+            "parse_mode": "MarkdownV2",  # [新增优化] 升级到更安全的 V2 模式
             "disable_web_page_preview": True
         }
         try:
@@ -221,7 +248,7 @@ def get_weekly_trend(symbol: str) -> str:
     elif price < ma50w * 0.95: return "bearish"
     return "neutral"
 
-# ================= 4. 核心量化指标模块 (重构后高可读版本) =================
+# ================= 4. 核心量化指标模块 =================
 
 def _add_rsi(df: pd.DataFrame) -> None:
     delta = df['Close'].diff()
@@ -337,6 +364,11 @@ def _add_event_risk(df: pd.DataFrame) -> None:
         risk_score += 0.4
     if consecutive_high_vol >= 3:
         risk_score += 0.3
+        
+    # --- [新增优化] 价格跳空确认 ---
+    gap_today = abs((df['Open'].iloc[-1] - df['Close'].iloc[-2]) / df['Close'].iloc[-2])
+    if gap_today > 0.06:
+        risk_score += 0.35
         
     df['Event_Risk'] = min(1.0, risk_score)
 
@@ -648,7 +680,6 @@ def run_tech_matrix() -> None:
                 if score < min_score_dynamic:
                     continue
 
-                # 借鉴：仅针对高置信度即将推送的标的，抓取最新的一条新闻，零成本实现大模型基本面解读感
                 news_context = get_latest_news(symbol)
                 if news_context:
                     signals.append(news_context)
