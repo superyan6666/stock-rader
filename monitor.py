@@ -720,31 +720,41 @@ def run_tech_matrix() -> None:
         except Exception as e:
             logger.debug(f"[{symbol}] 分析发生静默错误: {e}")
 
-    # ====================== 板块拥挤度后处理（动态进化版）======================
+    # ====================== 板块拥挤度与动量后处理（动态进化版）======================
     if reports:
         from collections import defaultdict
         sector_groups = defaultdict(list)
         for r in reports:
             sector_groups[r["sector"]].append(r)
             
-        # 对每个板块进行拥挤惩罚
+        # 对每个板块进行后处理分析
         for sector, stocks in sector_groups.items():
-            if sector in Config.CROWDING_EXCLUDE_SECTORS or len(stocks) < Config.CROWDING_MIN_STOCKS:
-                continue
+            # 1. 板块动量过滤 (Sector Momentum Filter)
+            sector_ret = sector_data.get(sector, 0.0)
+            is_weak_sector = sector_ret < -0.02 and sector not in Config.CROWDING_EXCLUDE_SECTORS
+            momentum_penalty = 0.7 if health_score < 0 else 0.85
+            
+            if is_weak_sector:
+                for stock in stocks:
+                    stock["score"] = int(stock["raw_score"] * momentum_penalty)
+                    stock["is_weak_sector"] = True
+                    stock["momentum_penalty"] = momentum_penalty
+                    
+            # 2. 板块拥挤度惩罚 (Crowding Penalty)
+            if sector not in Config.CROWDING_EXCLUDE_SECTORS and len(stocks) >= Config.CROWDING_MIN_STOCKS:
+                # 重新按当前得分(可能已被弱势降权)排序，找出领涨股
+                stocks.sort(key=lambda x: x["score"], reverse=True)
                 
-            # 找出本板块内得分最高的领涨股
-            stocks.sort(key=lambda x: x["raw_score"], reverse=True)
-            leader_score = stocks[0]["raw_score"]
-            
-            # 动态惩罚系数：市场越健康，惩罚越轻（牛市允许适度抱团）
-            dynamic_penalty = Config.CROWDING_PENALTY * (1.0 + health_score * 0.3)
-            dynamic_penalty = max(0.6, min(0.9, dynamic_penalty))
-            
-            # 对非领涨股统一施加惩罚并打标
-            for stock in stocks[1:]:
-                stock["score"] = int(stock["raw_score"] * dynamic_penalty)
-                stock["is_crowded"] = True
-                stock["crowding_penalty"] = dynamic_penalty
+                # 动态惩罚系数：市场越健康，惩罚越轻（牛市允许适度抱团）
+                dynamic_penalty = Config.CROWDING_PENALTY * (1.0 + health_score * 0.3)
+                dynamic_penalty = max(0.6, min(0.9, dynamic_penalty))
+                
+                # 对非领涨股统一施加拥挤惩罚并打标
+                for stock in stocks[1:]:
+                    if not stock.get("is_weak_sector"): # 避免双重过度降权，或者可以视情况叠加
+                        stock["score"] = int(stock["raw_score"] * dynamic_penalty)
+                        stock["is_crowded"] = True
+                        stock["crowding_penalty"] = dynamic_penalty
 
         # 重新按最终得分排序
         reports.sort(key=lambda x: x["score"], reverse=True)
@@ -753,17 +763,21 @@ def run_tech_matrix() -> None:
         # 统一执行最终文本生成
         for r in reports[:15]:
             turnover_str = f"${r['turnover']/1e9:.2f}B" if r['turnover'] >= 1e9 else f"${r['turnover']/1e6:.2f}M"
-            score_display = f"**{r['score']}**（板块拥挤降权×{r.get('crowding_penalty', 1.0):.2f}）" \
-                            if r.get("is_crowded") else f"**{r['score']}**"
+            
+            score_display = f"**{r['score']}**"
+            if r.get("is_crowded"):
+                score_display += f"（板块拥挤降权×{r.get('crowding_penalty', 1.0):.2f}）"
+            elif r.get("is_weak_sector"):
+                score_display += f"（弱势板块降权×{r.get('momentum_penalty', 1.0):.2f}）"
             
             text = f"**{r['symbol']}** (${r['curr_close']:.2f} | 额: {turnover_str} | 🌟动态评分: {score_display})\n> " + "\n> ".join(r["signals"])
             top_reports_text.append(text)
         
         final_report = f"*{vix_desc}*\n*{regime_desc}*\n\n" + "\n\n".join(top_reports_text)
         if len(reports) > 15:
-            final_report += f"\n\n*(已过滤低质信号 + 板块拥挤动态降权，为您优选展示最高分 Top 15)*"
+            final_report += f"\n\n*(已过滤低质信号 + 拥挤/弱势动态降权，为您优选展示最高分 Top 15)*"
         else:
-            final_report += f"\n\n*(动态门槛: {min_score_dynamic} 分 | 权重因子: {weight_multiplier:.2f} | 已应用板块拥挤动态降权)*"
+            final_report += f"\n\n*(动态门槛: {min_score_dynamic} 分 | 权重因子: {weight_multiplier:.2f} | 已应用拥挤/弱势动态降权)*"
             
         send_alert("📊 纳指 100 优选异动池", final_report)
     else:
