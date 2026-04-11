@@ -23,6 +23,7 @@ class LightweightBacktester:
         self.tickers = set()
         self.market_data = None
         self.results = []
+        self.overall_stats = {} # 用于保存汇总统计数据供主程序读取
 
     def load_logs(self):
         """读取结构化 JSONL 日志文件"""
@@ -115,7 +116,7 @@ class LightweightBacktester:
                     self.results.append(trade_result)
 
     def generate_report(self):
-        """生成回测简报字符串，并保存到文件"""
+        """生成回测简报字符串，并保存到文件与 JSON 接口库"""
         if not self.results:
             logger.warning("没有足够的数据生成回测报告。")
             return None
@@ -142,6 +143,8 @@ class LightweightBacktester:
             win_rate = (valid_data > 0).mean()
             avg_ret = valid_data.mean()
             report_lines.append(f"  {col} -> 胜率: {win_rate:.1%} | 平均收益: {avg_ret:+.2%}")
+            # 记录到字典，供后续生成 JSON 使用
+            self.overall_stats[col] = {"win_rate": float(win_rate), "avg_ret": float(avg_ret)}
             
         # 2. 按大盘环境拆解 (验证牛熊市是否不同)
         report_lines.append("\n🌍 [大盘状态 (Regime) 拆解 - 以 T+5 为例]")
@@ -165,6 +168,27 @@ class LightweightBacktester:
             if len(penalized_df) > 0:
                 report_lines.append(f"  ⚠️ 被降权跟风股 -> 胜率: {(penalized_df > 0).mean():.1%} | 均收益: {penalized_df.mean():+.2%}")
 
+        # 4. [新增] 个股胜率红黑榜 (找出最稳健的标的)
+        if 'T+3' in df_res.columns:
+            report_lines.append("\n🏆 [高胜率个股榜单 (历史推荐≥2次) - T+3]")
+            ticker_stats = []
+            for sym, grp in df_res.groupby('symbol'):
+                valid = grp['T+3'].dropna()
+                if len(valid) >= 2:
+                    ticker_stats.append({
+                        'symbol': sym,
+                        'signals': len(valid),
+                        'win_rate': (valid > 0).mean(),
+                        'avg_ret': valid.mean()
+                    })
+            if ticker_stats:
+                # 选出胜率最高的前 5 名
+                top_tickers = sorted(ticker_stats, key=lambda x: x['win_rate'], reverse=True)[:5]
+                for stat in top_tickers:
+                    report_lines.append(f"  {stat['symbol']:<5} -> 推荐: {stat['signals']}次 | 胜率: {stat['win_rate']:.1%} | 均收益: {stat['avg_ret']:+.2%}")
+            else:
+                report_lines.append("  暂无足够数据(需个股被推荐2次以上)")
+
         report_lines.append("="*40)
         
         final_report = "\n".join(report_lines)
@@ -174,11 +198,16 @@ class LightweightBacktester:
         
         # 写入本地文件，方便 GitHub Actions 提交到仓库
         try:
-            # [升级] 加入精确的时间戳，让覆盖式文件也具备时效说明
+            # 1. 写入 Markdown 战报
             run_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
             with open("backtest_report.md", "w", encoding="utf-8") as f:
                 f.write(f"# QuantBot 最新回测战报\n> **生成时间**: {run_time}\n\n```text\n{final_report}\n```\n")
-            logger.info("✅ 回测报告已成功保存至 backtest_report.md")
+            
+            # 2. [新增] 写入精简的 JSON 格式接口数据，供未来 quantbot.py 实时调用
+            with open("strategy_stats.json", "w", encoding="utf-8") as f:
+                json.dump(self.overall_stats, f, ensure_ascii=False, indent=2)
+                
+            logger.info("✅ 回测报告已保存至 backtest_report.md，统计数据接口已生成至 strategy_stats.json")
         except Exception as e:
             logger.error(f"保存回测报告失败: {e}")
 
