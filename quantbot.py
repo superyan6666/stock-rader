@@ -2,6 +2,8 @@ import json
 import pandas as pd
 import yfinance as yf
 import logging
+import os
+import requests
 from datetime import datetime
 from collections import defaultdict
 
@@ -113,10 +115,10 @@ class LightweightBacktester:
                     self.results.append(trade_result)
 
     def generate_report(self):
-        """生成并打印高度可视化的回测简报"""
+        """生成回测简报字符串，并保存到文件"""
         if not self.results:
             logger.warning("没有足够的数据生成回测报告。")
-            return
+            return None
             
         df_res = pd.DataFrame(self.results)
         
@@ -124,45 +126,86 @@ class LightweightBacktester:
         ret_df = pd.json_normalize(df_res['returns'])
         df_res = pd.concat([df_res.drop(columns=['returns']), ret_df], axis=1)
         
-        print("\n" + "="*50)
-        print(" 🎯 QuantBot 历史信号回测简报 (T+1/3/5)")
-        print("="*50)
+        report_lines = []
+        report_lines.append("="*40)
+        report_lines.append(" 🎯 QuantBot 历史信号回测简报 (T+1/3/5)")
+        report_lines.append("="*40)
         
-        print(f"总信号数: {len(df_res)}")
-        print(f"涉及标的: {df_res['symbol'].nunique()} 只")
+        report_lines.append(f"总信号数: {len(df_res)}")
+        report_lines.append(f"涉及标的: {df_res['symbol'].nunique()} 只")
         
         # 1. 总体胜率与平均收益
-        print("\n📊 [总体表现]")
+        report_lines.append("\n📊 [总体表现]")
         for col in [c for c in df_res.columns if c.startswith('T+')]:
             valid_data = df_res[col].dropna()
             if len(valid_data) == 0: continue
             win_rate = (valid_data > 0).mean()
             avg_ret = valid_data.mean()
-            print(f"  {col} -> 胜率: {win_rate:.1%} | 平均收益: {avg_ret:+.2%}")
+            report_lines.append(f"  {col} -> 胜率: {win_rate:.1%} | 平均收益: {avg_ret:+.2%}")
             
         # 2. 按大盘环境拆解 (验证牛熊市是否不同)
-        print("\n🌍 [大盘状态 (Regime) 拆解 - 以 T+5 为例]")
+        report_lines.append("\n🌍 [大盘状态 (Regime) 拆解 - 以 T+5 为例]")
         if 'T+5' in df_res.columns:
             for regime in df_res['regime'].unique():
                 sub_df = df_res[df_res['regime'] == regime]['T+5'].dropna()
                 if len(sub_df) > 0:
                     win_rate = (sub_df > 0).mean()
                     avg_ret = sub_df.mean()
-                    print(f"  {regime.upper():<7} -> 信号数: {len(sub_df):<3} | 胜率: {win_rate:.1%} | 均收益: {avg_ret:+.2%}")
+                    report_lines.append(f"  {regime.upper():<7} -> 信号数: {len(sub_df):<3} | 胜率: {win_rate:.1%} | 均收益: {avg_ret:+.2%}")
 
         # 3. 验证板块拥挤/弱势过滤器的价值
-        print("\n🛡️ [过滤器有效性验证 - 以 T+3 为例]")
+        report_lines.append("\n🛡️ [过滤器有效性验证 - 以 T+3 为例]")
         if 'T+3' in df_res.columns:
             # 正常高分标的 vs 被系统判定为“板块拥挤/弱势”而降权的标的
             normal_df = df_res[~df_res['is_crowded'] & ~df_res['is_weak_sector']]['T+3'].dropna()
             penalized_df = df_res[df_res['is_crowded'] | df_res['is_weak_sector']]['T+3'].dropna()
             
             if len(normal_df) > 0:
-                print(f"  ✅ 正常优选龙头 -> 胜率: {(normal_df > 0).mean():.1%} | 均收益: {normal_df.mean():+.2%}")
+                report_lines.append(f"  ✅ 正常优选龙头 -> 胜率: {(normal_df > 0).mean():.1%} | 均收益: {normal_df.mean():+.2%}")
             if len(penalized_df) > 0:
-                print(f"  ⚠️ 被降权跟风股 -> 胜率: {(penalized_df > 0).mean():.1%} | 均收益: {penalized_df.mean():+.2%}")
+                report_lines.append(f"  ⚠️ 被降权跟风股 -> 胜率: {(penalized_df > 0).mean():.1%} | 均收益: {penalized_df.mean():+.2%}")
 
-        print("="*50 + "\n")
+        report_lines.append("="*40)
+        
+        final_report = "\n".join(report_lines)
+        
+        # 打印到控制台
+        print("\n" + final_report + "\n")
+        
+        # 写入本地文件，方便 GitHub Actions 提交到仓库
+        try:
+            with open("backtest_report.md", "w", encoding="utf-8") as f:
+                f.write(f"# QuantBot 回测战报\n\n```text\n{final_report}\n```\n")
+            logger.info("✅ 回测报告已成功保存至 backtest_report.md")
+        except Exception as e:
+            logger.error(f"保存回测报告失败: {e}")
+
+        return final_report
+
+    def push_report(self, report_text):
+        """将回测报告推送到 Telegram"""
+        tg_token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+        tg_chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
+        
+        if not tg_token or not tg_chat_id:
+            logger.info("⚠️ 未检测到 Telegram 环境变量，跳过推送。")
+            return
+            
+        tg_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+        
+        # 为了在手机上保留完美的对齐格式，我们直接发送普通文本，不启用 Markdown 解析
+        tg_payload = {
+            "chat_id": tg_chat_id,
+            "text": f"🤖 *历史回测任务执行完毕*\n\n{report_text}"
+        }
+        
+        try:
+            resp = requests.post(tg_url, json=tg_payload, timeout=10)
+            resp.raise_for_status()
+            logger.info("✅ 成功将回测报告推送到 Telegram！")
+        except Exception as e:
+            logger.error(f"❌ Telegram 推送回测报告失败: {e}")
+
 
 # ================= 3. 执行入口 =================
 if __name__ == "__main__":
@@ -170,4 +213,8 @@ if __name__ == "__main__":
     if backtester.load_logs():
         if backtester.fetch_market_data():
             backtester.run_simulation(horizons=[1, 3, 5])
-            backtester.generate_report()
+            report_str = backtester.generate_report()
+            
+            # 如果生成了报告，则尝试推送到 Telegram
+            if report_str:
+                backtester.push_report(report_str)
