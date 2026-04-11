@@ -8,6 +8,7 @@ import time
 import random
 import logging
 import re
+import json
 from typing import List, Tuple
 from datetime import datetime, timezone
 
@@ -780,6 +781,32 @@ def run_tech_matrix() -> None:
             final_report += f"\n\n*(动态门槛: {min_score_dynamic} 分 | 权重因子: {weight_multiplier:.2f} | 已应用拥挤/弱势动态降权)*"
             
         send_alert("📊 纳指 100 优选异动池", final_report)
+        
+        # --- [新增] 历史回测数据持久化 (JSON Lines) ---
+        try:
+            log_data = {
+                "date": datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+                "vix": round(float(vix), 2),
+                "regime": regime,
+                "health_score": round(float(health_score), 2),
+                "top_picks": [
+                    {
+                        "symbol": r["symbol"],
+                        "score": r["score"],
+                        "raw_score": r["raw_score"],
+                        "sector": r["sector"],
+                        "close": round(float(r["curr_close"]), 2),
+                        "crowded": r.get("is_crowded", False),
+                        "weak_sector": r.get("is_weak_sector", False)
+                    } for r in reports[:15]
+                ]
+            }
+            with open("backtest_log.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_data, ensure_ascii=False) + "\n")
+            logger.info("✅ 历史回测日志已追加至 backtest_log.jsonl")
+        except Exception as e:
+            logger.error(f"写入回测日志失败: {e}")
+            
     else:
         logger.info(f"所有个股未通过 Ichimoku 趋势云过滤，或得分低于动态门槛 ({min_score_dynamic}分)。")
 
