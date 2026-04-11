@@ -183,29 +183,48 @@ class LightweightBacktester:
         return final_report
 
     def push_report(self, report_text):
-        """将回测报告推送到 Telegram"""
+        """将回测报告推送到 Telegram、钉钉、飞书、企业微信等渠道"""
+        
+        # 1. Webhook 推送 (钉钉/飞书/企业微信)
+        webhook_url_str = os.environ.get('WEBHOOK_URL', '')
+        if webhook_url_str:
+            payload = {
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": "【AI 量化】历史信号回测战报",
+                    "text": f"### 🤖 【量化监控系统】历史回测战报\n\n```text\n{report_text}\n```"
+                }
+            }
+            urls = [url.strip() for url in webhook_url_str.split(',') if url.strip()]
+            for url in urls:
+                try:
+                    resp = requests.post(url, json=payload, timeout=10)
+                    resp.raise_for_status()
+                    logger.info("✅ 成功将回测报告推送到 Webhook！")
+                except Exception as e:
+                    logger.error(f"❌ Webhook 推送回测报告失败: {e}")
+
+        # 2. Telegram 推送
         tg_token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
         tg_chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
         
-        if not tg_token or not tg_chat_id:
-            logger.info("⚠️ 未检测到 Telegram 环境变量，跳过推送。")
-            return
+        if tg_token and tg_chat_id:
+            tg_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
             
-        tg_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
-        
-        # 为了在手机上保留完美的对齐格式，我们直接发送普通文本，不启用 Markdown 解析
-        tg_payload = {
-            "chat_id": tg_chat_id,
-            "text": f"🤖 *历史回测任务执行完毕*\n\n{report_text}"
-        }
-        
-        try:
-            resp = requests.post(tg_url, json=tg_payload, timeout=10)
-            resp.raise_for_status()
-            logger.info("✅ 成功将回测报告推送到 Telegram！")
-        except Exception as e:
-            logger.error(f"❌ Telegram 推送回测报告失败: {e}")
-
+            # 发送普通文本以完美保留排版
+            tg_payload = {
+                "chat_id": tg_chat_id,
+                "text": f"🤖 *历史回测任务执行完毕*\n\n{report_text}"
+            }
+            
+            try:
+                resp = requests.post(tg_url, json=tg_payload, timeout=10)
+                resp.raise_for_status()
+                logger.info("✅ 成功将回测报告推送到 Telegram！")
+            except Exception as e:
+                logger.error(f"❌ Telegram 推送回测报告失败: {e}")
+        elif not webhook_url_str:
+            logger.info("⚠️ 未检测到任何推送环境变量配置，跳过推送。")
 
 # ================= 3. 执行入口 =================
 if __name__ == "__main__":
@@ -215,6 +234,6 @@ if __name__ == "__main__":
             backtester.run_simulation(horizons=[1, 3, 5])
             report_str = backtester.generate_report()
             
-            # 如果生成了报告，则尝试推送到 Telegram
+            # 如果生成了报告，则尝试推送到配置的各个渠道
             if report_str:
                 backtester.push_report(report_str)
