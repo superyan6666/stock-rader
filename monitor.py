@@ -45,6 +45,8 @@ class Config:
     CROWDING_PENALTY: float = 0.75
     # 触发拥挤过滤的最低股票数量（≥2 即认为拥挤）
     CROWDING_MIN_STOCKS: int = 2
+    # 排除参与拥挤度计算的板块（避免将 fallback 的未映射股票全部当成同一个拥挤板块）
+    CROWDING_EXCLUDE_SECTORS: List[str] = ["QQQ"]
 
     @staticmethod
     def get_sector_etf(symbol: str) -> str:
@@ -141,11 +143,6 @@ def get_nasdaq_100() -> List[str]:
     except Exception as e:
         logger.error(f"❌ 获取名单解析失败，使用备用核心名单: {e}")
         return Config.CORE_WATCHLIST
-
-def escape_md_v2(text: str) -> str:
-    """[备用功能] 针对 Telegram MarkdownV2 格式的保留字全量转义（注意：若启用需防范破坏原生 Markdown 样式）"""
-    escape_chars = r"_*[]()~`>#+-=|{}.!"
-    return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
 
 def send_alert(title: str, content: str) -> None:
     """多渠道广播中心 (Webhook + Telegram)"""
@@ -713,8 +710,8 @@ def run_tech_matrix() -> None:
             
         # 对每个板块进行拥挤惩罚
         for sector, stocks in sector_groups.items():
-            if sector == Config.INDEX_ETF:
-                continue  # 排除未分类股票（默认大盘），不参与板块拥挤降权
+            if sector in Config.CROWDING_EXCLUDE_SECTORS:
+                continue  # 排除无需进行拥挤降权的板块
                 
             if len(stocks) < Config.CROWDING_MIN_STOCKS:
                 continue  # 板块内只有 1 只，不惩罚
