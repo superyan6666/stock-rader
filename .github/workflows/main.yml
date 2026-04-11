@@ -39,6 +39,8 @@ jobs:
       - name: 智能路由与执行
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           MODE="sentinel"
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
@@ -53,4 +55,12 @@ jobs:
             fi
           fi
           echo "准备以 [$MODE] 模式运行 AI 引擎..."
-          python monitor.py $MODE
+          # 统一使用 quantbot.py 作为入口文件
+          python quantbot.py $MODE
+
+      # [新增] 自动提交回测日志到仓库，且缩进已完美对齐
+      - name: 自动提交回测日志
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "📝 自动记录今日回测日志"
+          file_pattern: backtest_log.jsonl
