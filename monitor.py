@@ -7,7 +7,6 @@ import numpy as np
 import time
 import random
 import logging
-import re
 from typing import List, Tuple
 from datetime import datetime, timezone
 
@@ -35,7 +34,7 @@ class Config:
     
     SECTOR_MAP = {
         'XLK': ['AAPL', 'MSFT', 'NVDA', 'AVGO', 'QCOM', 'AMD', 'INTC', 'CRM', 'ADBE', 'CSCO', 'TXN', 'INTU', 'AMAT', 'MU', 'LRCX', 'PANW', 'KLAC', 'SNPS', 'CDNS', 'NXPI', 'MRVL', 'MCHP', 'FTNT', 'CRWD'],
-        'XLY': ['AMGN', 'GILD', 'VRTX', 'REGN', 'ISRG', 'BIIB', 'ILMN', 'DXCM', 'IDXX', 'MRNA', 'ALGN', 'BMRN', 'GEHC'], # 原代码这里XLV和XLY分类有混淆，这里保留你提供的原样
+        'XLY': ['AMZN', 'TSLA', 'BKNG', 'SBUX', 'MAR', 'MELI', 'LULU', 'HD', 'ROST', 'EBAY', 'TSCO', 'PDD', 'DASH', 'CPRT', 'PCAR'],
         'XLC': ['GOOGL', 'GOOG', 'META', 'NFLX', 'CMCSA', 'TMUS', 'EA', 'TTWO', 'WBD', 'SIRI', 'CHTR'],
         'XLV': ['AMGN', 'GILD', 'VRTX', 'REGN', 'ISRG', 'BIIB', 'ILMN', 'DXCM', 'IDXX', 'MRNA', 'ALGN', 'BMRN', 'GEHC'],
         'XLP': ['PEP', 'COST', 'MDLZ', 'KDP', 'KHC', 'MNST', 'WBA']
@@ -142,12 +141,6 @@ def get_nasdaq_100() -> List[str]:
         logger.error(f"❌ 获取名单解析失败，使用备用核心名单: {e}")
         return Config.CORE_WATCHLIST
 
-def escape_md_v2(text: str) -> str:
-    """[新增优化] 针对 Telegram MarkdownV2 格式，过滤容易导致解析失败的非排版字符"""
-    # 避开了排版常用的 * _ > [ ]
-    escape_chars = r"()-+={}.!|"
-    return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
-
 def send_alert(title: str, content: str) -> None:
     """多渠道广播中心 (Webhook + Telegram)"""
     formatted_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
@@ -175,13 +168,11 @@ def send_alert(title: str, content: str) -> None:
         tg_url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage"
         
         raw_text = f"🤖 *量化监控系统*\n\n*{title}*\n\n{content}\n\n⏱️ _{formatted_time}_"
-        # 保护性转义，防止部分数值和符号（如 -, ., !）引发 Telegram 解析错误
-        safe_text = escape_md_v2(raw_text)
         
         tg_payload = {
             "chat_id": Config.TELEGRAM_CHAT_ID,
-            "text": safe_text,
-            "parse_mode": "MarkdownV2",  # [新增优化] 升级到更安全的 V2 模式
+            "text": raw_text,
+            "parse_mode": "Markdown",  # 回退到兼容性最佳的原生 Markdown
             "disable_web_page_preview": True
         }
         try:
@@ -317,10 +308,8 @@ def _add_atr_and_supertrend(df: pd.DataFrame) -> None:
     df['SuperTrend_Up'] = in_uptrend.astype(int) 
 
 def _add_channels(df: pd.DataFrame) -> None:
-    if 'TR' in df:
-        df['ATR_20'] = df['TR'].rolling(window=20).mean()
-    else:
-        df['ATR_20'] = df['ATR'].rolling(window=20).mean()
+    # 明确使用 df['TR'] 保证不出现 NaN 回退问题
+    df['ATR_20'] = df['TR'].rolling(window=20).mean()
         
     df['KC_Upper'] = df['EMA_20'] + 1.5 * df['ATR_20']
     df['KC_Lower'] = df['EMA_20'] - 1.5 * df['ATR_20']
@@ -370,8 +359,9 @@ def _add_event_risk(df: pd.DataFrame) -> None:
     if consecutive_high_vol >= 3:
         risk_score += 0.3
         
-    # --- [新增优化] 价格跳空确认 ---
-    gap_today = abs((df['Open'].iloc[-1] - df['Close'].iloc[-2]) / df['Close'].iloc[-2])
+    # --- [新增优化] 价格跳空确认 (已加入除零保护) ---
+    prev_close = df['Close'].iloc[-2]
+    gap_today = abs((df['Open'].iloc[-1] - prev_close) / prev_close) if prev_close != 0 else 0
     if gap_today > 0.06:
         risk_score += 0.35
         
@@ -693,16 +683,14 @@ def run_tech_matrix() -> None:
                     signals = signals[:8] + [f"*(...还有 {len(signals)-8} 个强趋势印证)*"]
                     
                 turnover = curr['Close'] * curr['Volume']
-                turnover_str = f"${turnover/1e9:.2f}B" if turnover >= 1e9 else f"${turnover/1e6:.2f}M"
-                    
-                report_text = f"**{symbol}** (${curr['Close']:.2f} | 额: {turnover_str} | 🌟动态评分: **{score}**)\n> " + "\n> ".join(signals)
                 
-                # === 新增：板块拥挤度过滤（Crowding Filter）===
-                # 只对最终要推送的股票进行后处理，这里动态获取 sector 以防未定义
+                # === 优化：以结构化形式保存数据供后处理，移除字符串替换隐患 ===
                 reports.append({
                     "symbol": symbol,
                     "score": score,
-                    "text": report_text,
+                    "signals": signals,
+                    "curr_close": curr['Close'],
+                    "turnover": turnover,
                     "sector": Config.get_sector_etf(symbol), 
                     "raw_score": score
                 })
@@ -726,18 +714,22 @@ def run_tech_matrix() -> None:
             stocks.sort(key=lambda x: x["raw_score"], reverse=True)
             leader_score = stocks[0]["raw_score"]
             
-            # 对非领涨股统一施加惩罚
+            # 对非领涨股统一施加惩罚并打标
             for stock in stocks[1:]:
                 stock["score"] = int(stock["raw_score"] * Config.CROWDING_PENALTY)
-                
-                # 更新显示文本，标注拥挤降权 (使用精准替换防止破坏原生排版)
-                old_score_str = f"🌟动态评分: **{stock['raw_score']}**"
-                new_score_str = f"🌟动态评分: **{stock['score']}**（板块拥挤降权）"
-                stock["text"] = stock["text"].replace(old_score_str, new_score_str)
+                stock["is_crowded"] = True
 
         # 重新按最终得分排序
         reports.sort(key=lambda x: x["score"], reverse=True)
-        top_reports_text = [r["text"] for r in reports[:15]]
+        top_reports_text = []
+        
+        # 统一执行最终文本生成
+        for r in reports[:15]:
+            turnover_str = f"${r['turnover']/1e9:.2f}B" if r['turnover'] >= 1e9 else f"${r['turnover']/1e6:.2f}M"
+            score_display = f"**{r['score']}**（板块拥挤降权）" if r.get("is_crowded") else f"**{r['score']}**"
+            
+            text = f"**{r['symbol']}** (${r['curr_close']:.2f} | 额: {turnover_str} | 🌟动态评分: {score_display})\n> " + "\n> ".join(r["signals"])
+            top_reports_text.append(text)
         
         final_report = f"*{vix_desc}*\n*{regime_desc}*\n\n" + "\n\n".join(top_reports_text)
         if len(reports) > 15:
