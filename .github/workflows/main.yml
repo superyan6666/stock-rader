@@ -4,7 +4,7 @@ import yfinance as yf
 import logging
 import os
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 
 # ================= 1. 日志配置 =================
@@ -174,8 +174,10 @@ class LightweightBacktester:
         
         # 写入本地文件，方便 GitHub Actions 提交到仓库
         try:
+            # [升级] 加入精确的时间戳，让覆盖式文件也具备时效说明
+            run_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
             with open("backtest_report.md", "w", encoding="utf-8") as f:
-                f.write(f"# QuantBot 回测战报\n\n```text\n{final_report}\n```\n")
+                f.write(f"# QuantBot 最新回测战报\n> **生成时间**: {run_time}\n\n```text\n{final_report}\n```\n")
             logger.info("✅ 回测报告已成功保存至 backtest_report.md")
         except Exception as e:
             logger.error(f"保存回测报告失败: {e}")
