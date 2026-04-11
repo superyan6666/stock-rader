@@ -6,24 +6,25 @@ on:
     - cron: '*/30 * * * 1-5'
     - cron: '15 * * * 1-5'
     - cron: '0 22 * * 1-5'
+    - cron: '0 23 * * 5'  # 每周五 23:00 UTC 自动执行回测
   workflow_dispatch:
     inputs:
       run_mode:
-        description: '选择要手动执行的策略模式'
+        description: '选择执行模式'
         required: true
-        default: 'test'
+        default: 'sentinel'
         type: choice
         options:
-          - test
           - sentinel
           - matrix
           - daily
+          - backtest
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # [关键新增] 必须赋予 GitHub Actions 写入权限，否则无法自动提交文件
+      contents: write
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -34,7 +35,6 @@ jobs:
           python-version: '3.9'
 
       - name: 安装量化组件
-        # 注意这里新增了 lxml，它是 pd.read_html 解析网页必备的库
         run: |
           pip install yfinance requests pandas lxml
 
@@ -52,17 +52,24 @@ jobs:
               MODE="daily"
             elif [[ "${{ github.event.schedule }}" == "15 * * * 1-5" ]]; then
               MODE="matrix"
+            elif [[ "${{ github.event.schedule }}" == "0 23 * * 5" ]]; then
+              MODE="backtest"
             else
               MODE="sentinel"
             fi
           fi
-          echo "准备以 [$MODE] 模式运行 AI 引擎..."
-          # 统一使用 quantbot.py 作为入口文件
-          python quantbot.py $MODE
+          
+          # 对齐你的文件名：monitor.py 和 backtesterbot.py
+          if [[ "$MODE" == "backtest" ]]; then
+            echo ">>> 启动回测引擎 [backtesterbot.py]..."
+            python backtesterbot.py
+          else
+            echo ">>> 启动监控引擎 [monitor.py] | 模式: $MODE"
+            python monitor.py $MODE
+          fi
 
-      # [新增] 自动提交回测日志到仓库，且缩进已完美对齐
-      - name: 自动提交回测日志
+      - name: 自动提交回测日志与战报
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "📝 自动记录今日回测日志"
-          file_pattern: backtest_log.jsonl
+          commit_message: "📝 自动同步回测数据与战报"
+          file_pattern: "backtest_log.jsonl backtest_report.md strategy_stats.json"
