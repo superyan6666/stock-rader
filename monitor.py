@@ -95,7 +95,7 @@ def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", ret
     return pd.DataFrame()
 
 def get_latest_news(symbol: str) -> str:
-    """轻量级实时新闻上下文拉取器（带30分钟防限流缓存）"""
+    """轻量级实时新闻上下文拉取器 + 简易情感标签（带30分钟防限流缓存）"""
     current_time = time.time()
     
     # [新增优化] 检查内存级缓存
@@ -107,11 +107,20 @@ def get_latest_news(symbol: str) -> str:
     try:
         news_data = yf.Ticker(symbol).news
         if news_data and len(news_data) > 0:
-            latest_news = news_data[0]
-            title = latest_news.get('title', '')
-            publisher = latest_news.get('publisher', '')
+            latest = news_data[0]
+            title = latest.get('title', '')
+            publisher = latest.get('publisher', '')
             if title:
-                result = f"📰 **[最新动态]** {title} ({publisher})"
+                # 简易情感匹配（可继续扩充关键词）
+                lower_title = title.lower()
+                if any(kw in lower_title for kw in ['beat', 'raise', 'upgrade', 'strong', 'surge', 'rally', 'buy', 'bullish', 'record', 'profit', 'revenue growth']):
+                    sentiment = "🟢 [利好]"
+                elif any(kw in lower_title for kw in ['miss', 'cut', 'downgrade', 'weak', 'decline', 'sell', 'bearish', 'warn', 'loss', 'recall']):
+                    sentiment = "🔴 [利空]"
+                else:
+                    sentiment = "⚪ [中性]"
+                
+                result = f"📰 {sentiment} **{title}** ({publisher})"
                 _NEWS_CACHE[symbol] = (current_time, result)
                 return result
     except Exception as e:
@@ -144,6 +153,11 @@ def get_nasdaq_100() -> List[str]:
         logger.error(f"❌ 获取名单解析失败，使用备用核心名单: {e}")
         return Config.CORE_WATCHLIST
 
+def escape_md_v2(text: str) -> str:
+    """Telegram MarkdownV2 完整转义（必须在发送前调用）"""
+    escape_chars = r"_*[]()~`>#+-=|{}.!"
+    return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
+
 def send_alert(title: str, content: str) -> None:
     """多渠道广播中心 (Webhook + Telegram)"""
     formatted_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
@@ -166,22 +180,27 @@ def send_alert(title: str, content: str) -> None:
             except Exception as e:
                 logger.error(f"Webhook 推送异常: {e}")
                 
-    # 2. Telegram Bot 推送
+    # 2. Telegram Bot 推送（升级为 MarkdownV2）
     if Config.TELEGRAM_BOT_TOKEN and Config.TELEGRAM_CHAT_ID:
         tg_url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage"
         
-        raw_text = f"🤖 *量化监控系统*\n\n*{title}*\n\n{content}\n\n⏱️ _{formatted_time}_"
+        # 使用 escape_md_v2 对所有动态内容进行转义
+        safe_title = escape_md_v2(title)
+        safe_content = escape_md_v2(content)
+        safe_time = escape_md_v2(formatted_time)
+        
+        tg_text = f"🤖 *量化监控系统*\n\n*{safe_title}*\n\n{safe_content}\n\n⏱️ _{safe_time}_"
         
         tg_payload = {
             "chat_id": Config.TELEGRAM_CHAT_ID,
-            "text": raw_text,
-            "parse_mode": "Markdown",  # 保持回退到兼容性最佳的原生 Markdown
+            "text": tg_text,
+            "parse_mode": "MarkdownV2",   # ← 关键升级
             "disable_web_page_preview": True
         }
         try:
             resp = requests.post(tg_url, json=tg_payload, timeout=10)
             resp.raise_for_status()
-            logger.info(f"✅ 成功推送至 Telegram")
+            logger.info(f"✅ 成功推送至 Telegram (MarkdownV2)")
         except Exception as e:
             logger.error(f"Telegram 推送异常: {e}")
 
