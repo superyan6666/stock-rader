@@ -701,7 +701,7 @@ def run_tech_matrix() -> None:
         except Exception as e:
             logger.debug(f"[{symbol}] 分析发生静默错误: {e}")
 
-    # ====================== 板块拥挤度后处理（核心升级）======================
+    # ====================== 板块拥挤度后处理（动态进化版）======================
     if reports:
         from collections import defaultdict
         sector_groups = defaultdict(list)
@@ -710,20 +710,22 @@ def run_tech_matrix() -> None:
             
         # 对每个板块进行拥挤惩罚
         for sector, stocks in sector_groups.items():
-            if sector in Config.CROWDING_EXCLUDE_SECTORS:
-                continue  # 排除无需进行拥挤降权的板块
-                
-            if len(stocks) < Config.CROWDING_MIN_STOCKS:
-                continue  # 板块内只有 1 只，不惩罚
+            if sector in Config.CROWDING_EXCLUDE_SECTORS or len(stocks) < Config.CROWDING_MIN_STOCKS:
+                continue
                 
             # 找出本板块内得分最高的领涨股
             stocks.sort(key=lambda x: x["raw_score"], reverse=True)
             leader_score = stocks[0]["raw_score"]
             
+            # 动态惩罚系数：市场越健康，惩罚越轻（牛市允许适度抱团）
+            dynamic_penalty = Config.CROWDING_PENALTY * (1.0 + health_score * 0.3)
+            dynamic_penalty = max(0.6, min(0.9, dynamic_penalty))
+            
             # 对非领涨股统一施加惩罚并打标
             for stock in stocks[1:]:
-                stock["score"] = int(stock["raw_score"] * Config.CROWDING_PENALTY)
+                stock["score"] = int(stock["raw_score"] * dynamic_penalty)
                 stock["is_crowded"] = True
+                stock["crowding_penalty"] = dynamic_penalty
 
         # 重新按最终得分排序
         reports.sort(key=lambda x: x["score"], reverse=True)
@@ -732,16 +734,17 @@ def run_tech_matrix() -> None:
         # 统一执行最终文本生成
         for r in reports[:15]:
             turnover_str = f"${r['turnover']/1e9:.2f}B" if r['turnover'] >= 1e9 else f"${r['turnover']/1e6:.2f}M"
-            score_display = f"**{r['score']}**（板块拥挤降权）" if r.get("is_crowded") else f"**{r['score']}**"
+            score_display = f"**{r['score']}**（板块拥挤降权×{r.get('crowding_penalty', 1.0):.2f}）" \
+                            if r.get("is_crowded") else f"**{r['score']}**"
             
             text = f"**{r['symbol']}** (${r['curr_close']:.2f} | 额: {turnover_str} | 🌟动态评分: {score_display})\n> " + "\n> ".join(r["signals"])
             top_reports_text.append(text)
         
         final_report = f"*{vix_desc}*\n*{regime_desc}*\n\n" + "\n\n".join(top_reports_text)
         if len(reports) > 15:
-            final_report += f"\n\n*(已过滤低质信号 + 板块拥挤降权，为您优选展示最高分 Top 15)*"
+            final_report += f"\n\n*(已过滤低质信号 + 板块拥挤动态降权，为您优选展示最高分 Top 15)*"
         else:
-            final_report += f"\n\n*(动态门槛: {min_score_dynamic} 分 | 权重因子: {weight_multiplier:.2f} | 已应用板块拥挤过滤)*"
+            final_report += f"\n\n*(动态门槛: {min_score_dynamic} 分 | 权重因子: {weight_multiplier:.2f} | 已应用板块拥挤动态降权)*"
             
         send_alert("📊 纳指 100 优选异动池", final_report)
     else:
