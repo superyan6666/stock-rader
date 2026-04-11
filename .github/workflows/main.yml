@@ -22,6 +22,8 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # [关键新增] 必须赋予 GitHub Actions 写入权限，否则无法自动提交文件
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
