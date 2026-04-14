@@ -65,7 +65,7 @@ def validate_config():
     logger.info("✅ 环境变量与配置校验通过")
 
 # ================= 2. 数据与网络工具模块 =================
-def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", retries: int = 5, auto_adjust: bool = True, fast_mode: bool = False) -> pd.DataFrame:
+def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 5, auto_adjust: bool = True, fast_mode: bool = False) -> pd.DataFrame:
     for attempt in range(retries):
         try:
             sleep_sec = random.uniform(0.2, 0.5) if fast_mode else (random.uniform(2.0, 4.5) if "1d" in interval else random.uniform(1.2, 2.5))
@@ -80,7 +80,6 @@ def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", ret
     return pd.DataFrame()
 
 def get_latest_news(symbol: str) -> str:
-    """轻量级新闻获取，去除无意义的内存缓存"""
     try:
         news_data = yf.Ticker(symbol).news
         if news_data:
@@ -215,6 +214,13 @@ def get_market_regime() -> Tuple[str, str, pd.DataFrame]:
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['Close'], df['Volume'] = df['Close'].ffill(), df['Volume'].ffill()
     
+    # 基础均线计算 (支持 Minervini 模板所需的长周期均线)
+    df['SMA_50'] = df['Close'].rolling(window=50).mean()
+    df['SMA_150'] = df['Close'].rolling(window=150).mean()
+    df['SMA_200'] = df['Close'].rolling(window=200).mean()
+    df['High_52W'] = df['High'].rolling(window=252, min_periods=120).max()
+    df['Low_52W'] = df['Low'].rolling(window=252, min_periods=120).min()
+    
     # RSI
     delta = df['Close'].diff()
     rs = delta.where(delta > 0, 0).ewm(alpha=1/14, min_periods=14).mean() / (-delta.where(delta < 0, 0).ewm(alpha=1/14, min_periods=14).mean() + 1e-10)
@@ -275,14 +281,12 @@ def run_volatility_sentinel() -> None:
     if not (13 <= datetime.now(timezone.utc).hour <= 21): return logger.info("💤 非交易时段跳过高频扫描。")
     
     logger.info(">>> 启动高频哨兵：获取全市场近期最高活跃度异动池 (Top 40)...")
-    # 复用漏斗逻辑，提取前40只最活跃个股（降低数量以保高频巡逻效率）
     active_pool = get_filtered_watchlist(max_stocks=40)
     
     alerts = []
     for sym in active_pool:
         if sym in Config.BLACKLIST: continue
         try:
-            # 获取1小时级别数据，快速计算盘中异动
             df = safe_get_history(sym, period="2d", interval="1h", fast_mode=True)
             if len(df) < 2: continue
             
@@ -290,11 +294,9 @@ def run_volatility_sentinel() -> None:
             open_price = df['Open'].iloc[-1]
             hr_chg = (curr_price - open_price) / open_price * 100 if open_price != 0 else 0
             
-            # 定制化参数：由于高活跃股弹性更大，异动阈值适当提高至 3.5%
             if abs(hr_chg) > 3.5: 
                 alerts.append(f"> **{sym}** 盘中极端异动 {'🚀' if hr_chg>0 else '🩸'} | 1h 波动: **{hr_chg:+.2f}%** (现价: ${curr_price:.2f})")
             
-            # 扫描日线跳空缺口
             df_d = safe_get_history(sym, period="5d", interval="1d", fast_mode=True)
             if len(df_d) >= 2:
                 gap = (df_d['Open'].iloc[-1] - df_d['Close'].iloc[-2]) / df_d['Close'].iloc[-2] * 100
@@ -324,8 +326,10 @@ def run_tech_matrix() -> None:
     for idx, sym in enumerate(get_filtered_watchlist()):
         if sym in Config.BLACKLIST: continue
         try:
-            df = safe_get_history(sym, "6mo", "1d")
-            if len(df) < 100 or df['Volume'].tail(20).mean() < 1e6: continue
+            # 修改为抓取 1 年数据，为了满足 Minervini 模板的 200 日均线及 52 周高低点计算
+            df = safe_get_history(sym, "1y", "1d")
+            # 提高过滤门槛：必须有充足的历史数据来判定长线趋势
+            if len(df) < 150 or df['Volume'].tail(20).mean() < 1e6: continue
             
             df = calculate_indicators(df)
             curr, prev, ev_risk = df.iloc[-1], df.iloc[-2], df['Event_Risk'].iloc[-1]
@@ -335,6 +339,21 @@ def run_tech_matrix() -> None:
             is_vol = (curr['Volume'] / curr['Vol_MA20'] if curr['Vol_MA20'] > 0 else 1.0) > 1.5
             is_st = curr['SuperTrend_Up'] == 1
 
+            # --- 🚀 [升级1] 米奈尔维尼趋势模板 (Minervini Trend Template) ---
+            if pd.notna(curr['SMA_200']) and pd.notna(curr['Low_52W']):
+                # 判定条件：收盘>50>150>200，且200日线向上倾斜，距离52周最低点至少反弹25%，距离最高点不超过25%
+                minervini_pass = (
+                    curr['Close'] > curr['SMA_50'] > curr['SMA_150'] > curr['SMA_200'] and
+                    curr['SMA_200'] > df['SMA_200'].iloc[-20] and
+                    curr['Close'] > curr['Low_52W'] * 1.25 and
+                    curr['Close'] > curr['High_52W'] * 0.75
+                )
+                if minervini_pass:
+                    sig.append("🏆 **[米奈尔维尼模板]** 绝对主升浪形态确认，胜率极高！")
+                    score += int(8 * w_mul)
+                    st_cnt += 1
+
+            # 相对强度
             if not qqq_df.empty:
                 m_df = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, how='inner')
                 if len(m_df) >= 20:
@@ -344,6 +363,7 @@ def run_tech_matrix() -> None:
                     elif rs_20 < 0.92:
                         sig.append(f"🐢 **[相对弱势]** 跑输大盘 {1-rs_20:.1%}"); score -= 3
 
+            # 自适应 RSI
             dyn_rsi = curr['RSI_P20'] if pd.notna(curr['RSI_P20']) else 30.0
             if curr['RSI'] < dyn_rsi and prev['RSI'] >= dyn_rsi:
                 if curr['Close'] > curr['EMA_50'] and is_st:
@@ -351,11 +371,13 @@ def run_tech_matrix() -> None:
                 else:
                     sig.append(f"⚠️ **[弱势超卖]**"); score += int((13 if regime=='bear' else 8) * 0.4)
 
+            # MACD
             if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
                 w = 10 if regime == 'bull' else 6
                 if curr['MACD'] > 0: sig.append("🔥 **[零上金叉]**"); score += int(w * w_mul); st_cnt += 1
                 else: sig.append("🔸 **[零下金叉]**"); score += int(w * 0.6)
 
+            # TTM Squeeze
             is_sqz = (curr['BB_Upper'] - curr['BB_Lower']) < (curr['KC_Upper'] - curr['KC_Lower'])
             was_sqz = ((df['BB_Upper'].iloc[-6:-1] < df['KC_Upper'].iloc[-6:-1]) & (df['BB_Lower'].iloc[-6:-1] > df['KC_Lower'].iloc[-6:-1])).any() if len(df)>=6 else False
             
@@ -364,14 +386,17 @@ def run_tech_matrix() -> None:
             elif was_sqz and not is_sqz and curr['MACD_Hist'] > 0 and curr['MACD_Hist'] > prev['MACD_Hist']:
                 sig.append("🚀 **[TTM Squeeze FIRE ↑]**"); score += int((18 if regime=='bull' else 10) * w_mul); st_cnt += 1
 
+            # 均线突破
             if prev['Close'] < prev['EMA_50'] and curr['Close'] > curr['EMA_50']:
                 if is_st and is_vol: sig.append("📈 **[有效突破]** 站上50日线"); score += int((9 if regime=='bull' else 5) * w_mul); st_cnt += 1
                 else: sig.append("📉 **[疲软突破]**"); score -= 3
 
+            # 资金动向 CMF
             cmf = curr['CMF']
             if cmf > 0.20: sig.append(f"🏦 **[机构高控盘]** (CMF:{cmf:.2f})"); score += int(5 * w_mul); st_cnt += 1
             elif cmf < -0.15: sig.append(f"⚠️ **[资金派发]** (CMF:{cmf:.2f})"); score -= 4
 
+            # 云图与噪音过滤
             if curr['Above_Cloud'] == 0:
                 score = int(score * 0.4); sig.append("☁️ **[云层压制]**")
             elif curr['Tenkan'] > curr['Kijun'] and curr['Cloud_Twist'] == 1:
@@ -384,7 +409,20 @@ def run_tech_matrix() -> None:
             if sig and score >= min_score:
                 news = get_latest_news(sym)
                 if news: sig.append(news)
-                reports.append({"symbol": sym, "score": score, "signals": sig[:8], "curr_close": curr['Close'], "turnover": curr['Close']*curr['Volume'], "sector": Config.get_sector_etf(sym), "raw_score": score})
+                
+                # --- 🛡️ [升级2] 动态 ATR 止损线计算 ---
+                atr_stop = curr['Close'] - 1.5 * curr['ATR']
+                
+                reports.append({
+                    "symbol": sym, 
+                    "score": score, 
+                    "signals": sig[:8], 
+                    "curr_close": curr['Close'], 
+                    "atr_stop": atr_stop,          # 将科学止损价存入供渲染
+                    "turnover": curr['Close']*curr['Volume'], 
+                    "sector": Config.get_sector_etf(sym), 
+                    "raw_score": score
+                })
         except Exception as e: logger.debug(f"[{sym}] 扫描静默错误: {e}")
 
     if reports:
@@ -399,7 +437,9 @@ def run_tech_matrix() -> None:
                 for s in stks[1:]: s["score"] = int(s["raw_score"] * pen); s["is_crowded"] = True; s["crowding_penalty"] = pen
 
         reports.sort(key=lambda x: x["score"], reverse=True)
-        txts = [f"**{r['symbol']}** (${r['curr_close']:.2f} | 额: ${r['turnover']/1e6:.1f}M | 🌟 {r['score']})\n> " + "\n> ".join(r["signals"]) for r in reports[:15]]
+        # --- 🛡️ [升级2] 在最终推送文本中直接展示防守止损线 ---
+        txts = [f"**{r['symbol']}** (${r['curr_close']:.2f} | 🛡️ 止损: ${r['atr_stop']:.2f} | 🌟 {r['score']})\n> " + "\n> ".join(r["signals"]) for r in reports[:15]]
+        
         send_alert("📊 全市场优选异动", f"{load_strategy_performance_tag()}*{vix_desc}*\n*{regime_desc}*\n\n" + "\n\n".join(txts) + f"\n\n*(门槛: {min_score}分 | 降权机制开启)*")
         
         try:
@@ -463,4 +503,4 @@ if __name__ == "__main__":
     elif m == "matrix": run_tech_matrix()
     elif m == "daily": send_alert("📝 占位", "每日复盘逻辑合并至 Matrix")
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("✅ 测试", "引擎响应正常！")
+    elif m == "test": send_alert("✅ 测试", "引擎响应正常！已载入米奈尔维尼与ATR止损系统。")
