@@ -15,6 +15,7 @@ from datetime import datetime, timezone, timedelta
 
 # 忽略第三方库引发的各种杂音警告，保持 GitHub Actions 日志清爽
 warnings.filterwarnings('ignore')
+logging.getLogger('yfinance').setLevel(logging.CRITICAL) # 🛡️ 屏蔽 yfinance 烦人的报错刷屏
 
 # ================= 1. 日志与配置管理 =================
 logging.basicConfig(
@@ -364,7 +365,8 @@ def run_tech_matrix() -> None:
     for idx, sym in enumerate(get_filtered_watchlist()):
         if sym in Config.BLACKLIST: continue
         try:
-            df = safe_get_history(sym, "1y", "1d")
+            # 🚀 [提速修复] 开启 fast_mode=True，将每个标的的 3 秒等待压缩至 0.2 秒，突破 15 分钟熔断限制！
+            df = safe_get_history(sym, "1y", "1d", fast_mode=True)
             if len(df) < 150 or df['Volume'].tail(20).mean() < 1e6: continue
             
             df = calculate_indicators(df)
