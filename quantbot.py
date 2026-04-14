@@ -38,6 +38,7 @@ class Config:
     
     DINGTALK_KEYWORD: str = "AI"
     
+    # --- 🚀 [护城河] 绝对稳定的核心资产名单 ---
     CORE_WATCHLIST: List[str] = [
         "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA", "BRK-B", "AVGO", 
         "LLY", "JPM", "V", "XOM", "UNH", "MA", "PG", "JNJ", "HD", "MRK", 
@@ -129,7 +130,6 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
     logger.info(">>> 漏斗过滤：从多维度数据源拉取全市场名单 (含纳指与中盘)...")
     tickers = set(Config.CORE_WATCHLIST)
     
-    # 1. 抓取标普 500 (大盘蓝筹 - 最稳定源)
     try:
         sp500_url = 'https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv'
         resp = requests.get(sp500_url, headers=_GLOBAL_HEADERS, timeout=10)
@@ -141,10 +141,8 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
     except Exception as e:
         logger.warning(f"⚠️ 标普500拉取降级: {e}")
 
-    # 2. 抓取标普 400 (中盘股 Mid-Cap - 极具爆发力) & 纳斯达克 100
     try:
         from io import StringIO
-        # 使用带 User-Agent 的 requests 绕过维基百科 403 拦截
         wiki_urls = [
             'https://en.wikipedia.org/wiki/List_of_S%26P_400_companies',
             'https://en.wikipedia.org/wiki/Nasdaq-100'
@@ -152,7 +150,6 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
         for w_url in wiki_urls:
             w_resp = requests.get(w_url, headers=_GLOBAL_HEADERS, timeout=10)
             if w_resp.status_code == 200:
-                # 寻找表格中的 Ticker / Symbol 列
                 for table in pd.read_html(StringIO(w_resp.text)):
                     col = next((c for c in ['Symbol', 'Ticker symbol', 'Ticker'] if c in table.columns), None)
                     if col:
@@ -164,7 +161,6 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
     tickers_list = list(tickers)
     logger.info(f"✅ 扩容完成，初始海选池: {len(tickers_list)} 只标的。开始分块并发粗筛...")
 
-    # 粗筛漏斗：用 5 天数据快速淘汰僵尸股
     try:
         chunk_size = 50 
         dfs = []
@@ -186,15 +182,12 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
         closes = close_df.dropna(axis=1, how='all').ffill().iloc[-1]
         volumes = volume_df.dropna(axis=1, how='all').mean()
         
-        # 核心漏斗过滤条件
         turnovers = (closes * volumes).dropna()
-        # 过滤掉低于 $10 的低价股和日均成交量低于 100万 的不活跃股 (自动屏蔽罗素里的垃圾股)
         valid_turnovers = turnovers[(closes > 10.0) & (volumes > 1000000)]
         
-        # 按成交金额 (Turnover) 排序，取全市场当前资金最活跃的 max_stocks (默认 120 只)
         top_tickers = valid_turnovers.sort_values(ascending=False).head(max_stocks).index.tolist()
         if top_tickers:
-            logger.info(f"✅ 漏斗过滤完成！从千股中精选出全市场最活跃的 {len(top_tickers)} 只进入深度扫描。")
+            logger.info(f"✅ 漏斗过滤完成！精选出全市场最活跃的 {len(top_tickers)} 只进入深度扫描。")
             return top_tickers
         return Config.CORE_WATCHLIST[:max_stocks]
     except Exception as e:
@@ -208,7 +201,7 @@ def load_strategy_performance_tag() -> str:
                 stats_data = json.load(f)
                 t3 = stats_data.get("overall", {}).get("T+3") if "overall" in stats_data else stats_data.get("T+3")
                 if t3 and t3.get('total_trades', 0) > 0:
-                    return f"📈 策略表现 (T+3): 胜率 {t3['win_rate']:.1%} | 均收益 {t3['avg_ret']:+.2%}"
+                    return f"📈 **策略表现 (T+3):** 胜率 {t3['win_rate']:.1%} | 均收益 {t3['avg_ret']:+.2%}  "
     except Exception: pass
     return ""
 
@@ -216,7 +209,6 @@ def send_alert(title: str, content: str) -> None:
     if not content.strip(): return
     formatted_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     
-    # 🚀 发送至 DingTalk (支持标准 Markdown)
     if Config.WEBHOOK_URL:
         payload = {
             "msgtype": "markdown", 
@@ -229,10 +221,12 @@ def send_alert(title: str, content: str) -> None:
             try: requests.post(url, json=payload, timeout=10)
             except Exception: pass
                 
-    # 🚀 发送至 Telegram (启用极度稳定的 HTML 模式防排版错乱)
     if Config.TELEGRAM_BOT_TOKEN and Config.TELEGRAM_CHAT_ID:
         html_title = title.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         html_content = content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        
+        # 🚀 跨平台排版核心：将 Markdown 的双星号语法安全转换为 Telegram 支持的 <b> 标签
+        html_content = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', html_content)
         
         tg_text = f"🤖 <b>【量化监控】{html_title}</b>\n\n{html_content}\n\n⏱️ <i>{formatted_time}</i>"
         try:
@@ -241,7 +235,7 @@ def send_alert(title: str, content: str) -> None:
                 json={
                     "chat_id": Config.TELEGRAM_CHAT_ID,
                     "text": tg_text,
-                    "parse_mode": "HTML", # 彻底抛弃易崩坏的 MarkdownV2
+                    "parse_mode": "HTML",
                     "disable_web_page_preview": True
                 }, timeout=10)
         except Exception: pass
@@ -350,7 +344,7 @@ def run_volatility_sentinel() -> None:
             
             if abs(hr_chg) > 3.5: 
                 is_alert = True
-                alert_type = f"1h脉冲: {hr_chg:+.2f}%"
+                alert_type = f"  • ⚡ 1h脉冲: {hr_chg:+.2f}%  "
 
             df_d = safe_get_history(sym, period="1mo", interval="1d", fast_mode=True)
             atr_stop_str = ""
@@ -361,21 +355,27 @@ def run_volatility_sentinel() -> None:
                 
                 atr_stop = curr_price - 1.5 * atr
                 atr_target = curr_price + 3.0 * atr 
-                atr_stop_str = f"  🎯 止盈: ${atr_target:.2f} | 🛡️ 止损: ${atr_stop:.2f}\n"
+                # 🚀 Sentinel 结构化排版
+                atr_stop_str = (
+                    f"  \n\n💰 **交易计划:** \n"
+                    f"  • 💵 现价: ${curr_price:.2f}  \n"
+                    f"  • 🎯 止盈: ${atr_target:.2f}  \n"
+                    f"  • 🛡️ 止损: ${atr_stop:.2f}  "
+                )
                 
                 gap = (df_d['Open'].iloc[-1] - df_d['Close'].iloc[-2]) / df_d['Close'].iloc[-2] * 100
                 if abs(gap) > 4:
                     is_alert = True
-                    gap_str = f"跳空缺口: {gap:+.2f}%"
-                    alert_type = f"{alert_type} | {gap_str}" if alert_type else gap_str
+                    gap_str = f"  • 💥 跳空缺口: {gap:+.2f}%  "
+                    alert_type = f"{alert_type}\n{gap_str}" if alert_type else gap_str
             
             if is_alert:
                 news = get_latest_news(sym)
-                news_str = f"  📰 资讯: {news}\n" if news else ""
+                news_str = f"  \n\n📰 **最新资讯:** \n  • {news}  " if news else ""
                 alert_msg = (
-                    f"🚨 【{sym}】 盘中极端异动 {'🚀' if hr_chg>0 else '🩸'}\n"
-                    f"  💵 现价: ${curr_price:.2f}\n"
-                    f"  📊 异动: {alert_type}\n"
+                    f"🚨 **{sym}** |  盘中异动 {'🚀' if hr_chg>0 else '🩸'}  \n\n"
+                    f"💡 **异动捕捉:** \n"
+                    f"{alert_type}"
                     f"{atr_stop_str}{news_str}"
                 )
                 alerts.append(alert_msg.strip())
@@ -383,7 +383,7 @@ def run_volatility_sentinel() -> None:
         except Exception: pass
         
     if alerts: 
-        send_alert("⚡ 盘中高频哨兵预警", "━━━━━━━━━━━━━━━━━━\n\n" + "\n\n".join(alerts))
+        send_alert("盘中高频哨兵预警", "\n\n━━━━━━━━━━━━━━━━━━\n\n" + "\n\n━━━━━━━━━━━━━━━━━━\n\n".join(alerts))
 
 def run_tech_matrix() -> None:
     regime, regime_desc, qqq_df = get_market_regime()
@@ -483,25 +483,33 @@ def run_tech_matrix() -> None:
 
         reports.sort(key=lambda x: x["score"], reverse=True)
         
-        # 🚀 采用纵向层级排版，清晰划分基础信息与触发因子
+        # 🚀 UI 排版重构：标的凸显在前，指标随后，交易计划托底
         medals = ['🥇', '🥈', '🥉']
         txts = []
         for idx, r in enumerate(reports[:15]):
             icon = medals[idx] if idx < 3 else '🔸'
-            sigs_formatted = "\n".join([f"    • {s}" for s in r["signals"]])
+            
+            # 使用列表结构，并在每一行末尾加入安全空格 '  '，保证多端平台不塌陷
+            sigs_formatted = "\n".join([f"  • {s}  " for s in r["signals"]])
+            
             txt = (
-                f"{icon} 【{r['symbol']}】 综合评分: {r['score']}\n"
-                f"  💵 现价: ${r['curr_close']:.2f}\n"
-                f"  🎯 止盈: ${r['atr_target']:.2f} | 🛡️ 止损: ${r['atr_stop']:.2f}\n"
-                f"  💡 触发共振:\n{sigs_formatted}"
+                f"{icon} **{r['symbol']}** |  🌟 评分: {r['score']}  \n\n"
+                f"💡 **触发共振:** \n"
+                f"{sigs_formatted}  \n\n"
+                f"💰 **交易计划:** \n"
+                f"  • 💵 现价: ${r['curr_close']:.2f}  \n"
+                f"  • 🎯 止盈: ${r['atr_target']:.2f}  \n"
+                f"  • 🛡️ 止损: ${r['atr_stop']:.2f}  "
             )
             txts.append(txt)
 
         perf_text = load_strategy_performance_tag()
-        header = f"📊 大盘环境感知:\n  • {vix_desc}\n  • {regime_desc}"
+        header = f"📊 **大盘环境感知:** \n  • {vix_desc}  \n  • {regime_desc}  "
         if perf_text: header = f"{perf_text}\n\n{header}"
         
-        final_content = header + "\n━━━━━━━━━━━━━━━━━━\n\n" + "\n\n".join(txts) + f"\n\n*(入选门槛: {min_score}分 | 降权防诱多机制已开启)*"
+        # 使用明显的分隔线，保证卡片独立
+        final_content = header + "\n\n━━━━━━━━━━━━━━━━━━\n\n" + "\n\n━━━━━━━━━━━━━━━━━━\n\n".join(txts) + f"\n\n*(入选门槛: {min_score}分 | 降权防诱多机制已开启)*"
+        
         send_alert("多因子优选异动 (矩阵共振版)", final_content)
         
         with open(Config.LOG_FILE, "a", encoding="utf-8") as f:
@@ -583,17 +591,17 @@ def run_backtest_engine() -> None:
     except Exception as e:
         logger.error(f"写入 Markdown 失败: {e}")
         
-    # 🚀 采用纵向层级排版的周末战报
-    alert_lines = ["📊 周期胜率总览"]
+    # 🚀 回测战报也升级为结构化列表
+    alert_lines = ["📊 **周期胜率总览** "]
     for p, d in res.items():
-        alert_lines.append(f"  • {p}: 胜率 {d['win_rate']*100:.1f}% | 均收益 {d['avg_ret']*100:+.2f}%")
+        alert_lines.append(f"  • {p}: 胜率 {d['win_rate']*100:.1f}% | 均收益 {d['avg_ret']*100:+.2f}%  ")
         
     if f_res:
-        alert_lines.extend(["", "━━━━━━━━━━━━━━━━━━", "", "🧬 核心因子排行 (T+3 波段)"])
+        alert_lines.extend(["  ", "━━━━━━━━━━━━━━━━━━", "  ", "🧬 **核心因子排行 (T+3 波段)** "])
         medals = ['1️⃣', '2️⃣', '3️⃣']
         for idx, (tag, d) in enumerate(sorted_factors[:3]):
             icon = medals[idx] if idx < 3 else '🔸'
-            alert_lines.append(f"  {icon} {tag}\n      胜率 {d['win_rate']*100:.1f}% | 触发 {d['count']}次")
+            alert_lines.append(f"  {icon} {tag}  \n      胜率 {d['win_rate']*100:.1f}% | 触发 {d['count']}次  ")
             
     send_alert("策略终极回测战报", "\n".join(alert_lines))
 
@@ -603,4 +611,4 @@ if __name__ == "__main__":
     if m == "sentinel": run_volatility_sentinel()
     elif m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("✅ 连通性测试", "系统环境正常，全新的 HTML 纵排结构卡片引擎已上线！")
+    elif m == "test": send_alert("✅ 连通性测试", "系统环境正常，全新的结构化层级卡片排版已上线！")
