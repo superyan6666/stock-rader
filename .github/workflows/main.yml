@@ -6,7 +6,7 @@ on:
     - cron: '*/30 * * * 1-5'
     - cron: '15 * * * 1-5'
     - cron: '0 22 * * 1-5'
-    - cron: '0 23 * * 5'  # [新增] 每周五 23:00 UTC (北京时间周六早晨) 执行终极回测
+    - cron: '0 23 * * 5'  # 每周五 23:00 UTC 执行终极回测
   workflow_dispatch:
     inputs:
       run_mode:
@@ -19,13 +19,13 @@ on:
           - sentinel
           - matrix
           - daily
-          - backtest      # [新增] 允许手动一键触发回测
+          - backtest      # 一键触发回测并推送到手机
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     permissions:
-      contents: write     # [关键] 必须赋予 GitHub Actions 写入权限，否则无法提交日志
+      contents: write     
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -47,7 +47,6 @@ jobs:
         run: |
           MODE="sentinel"
           
-          # 判断触发方式与时间，决定运行模式
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             MODE="${{ github.event.inputs.run_mode }}"
           elif [[ "${{ github.event_name }}" == "schedule" ]]; then
@@ -56,24 +55,18 @@ jobs:
             elif [[ "${{ github.event.schedule }}" == "15 * * * 1-5" ]]; then
               MODE="matrix"
             elif [[ "${{ github.event.schedule }}" == "0 23 * * 5" ]]; then
-              MODE="backtest"  # 周五自动触发回测脚本
+              MODE="backtest"
             else
               MODE="sentinel"
             fi
           fi
           
-          # 核心执行分支
-          if [[ "$MODE" == "backtest" ]]; then
-            echo "准备运行历史回测引擎..."
-            python backtest.py
-          else
-            echo "准备以 [$MODE] 模式运行 AI 引擎..."
-            python quantbot.py $MODE
-          fi
+          # 【极简路由】所有模式均由唯一的 quantbot.py 处理
+          echo "🤖 准备以 [$MODE] 模式运行 AI 引擎..."
+          python quantbot.py $MODE
 
-      # 自动提交回测日志与战报到代码仓库
       - name: 自动提交回测日志与战报
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "📝 自动记录今日回测日志与战报"
-          file_pattern: "backtest_log.jsonl backtest_report.md"
+          commit_message: "📝 自动记录今日回测日志与战绩"
+          file_pattern: "backtest_log.jsonl backtest_report.md strategy_stats.json"
