@@ -1,8 +1,8 @@
 #Tickeron Pro AI Bot 核心环境依赖
 
-#严格锁定版本，确保 GitHub Actions 无人值守时的绝对稳定
+#yfinance 必须解除锁定！以便随时获取社区最新的雅虎反爬虫修复补丁
 
-yfinance==0.2.36
+yfinance>=0.2.40
 pandas==2.1.0
 numpy==1.26.0
 requests==2.31.0
