@@ -38,6 +38,7 @@ class Config:
     
     DINGTALK_KEYWORD: str = "AI"
     
+    # --- 🚀 [护城河] 绝对稳定的核心资产名单 ---
     CORE_WATCHLIST: List[str] = [
         "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA", "BRK-B", "AVGO", 
         "LLY", "JPM", "V", "XOM", "UNH", "MA", "PG", "JNJ", "HD", "MRK", 
@@ -309,7 +310,6 @@ def run_volatility_sentinel() -> None:
     
     for sym in active_pool:
         try:
-            # 获取 1小时 级别数据监控短线脉冲
             df_h = safe_get_history(sym, period="2d", interval="1h", fast_mode=True)
             if len(df_h) < 2: continue
             
@@ -324,18 +324,18 @@ def run_volatility_sentinel() -> None:
                 is_alert = True
                 alert_type = f"1h脉冲: **{hr_chg:+.2f}%**"
 
-            # 🚀 [哨兵借鉴 Matrix]：拉取日线数据，监控跳空缺口并提供 ATR 动态防守线
             df_d = safe_get_history(sym, period="1mo", interval="1d", fast_mode=True)
             atr_stop_str = ""
             
             if len(df_d) >= 15:
-                # 计算 14日 ATR 支撑位
                 df_d['TR'] = pd.concat([df_d['High']-df_d['Low'], (df_d['High']-df_d['Close'].shift()).abs(), (df_d['Low']-df_d['Close'].shift()).abs()], axis=1).max(axis=1)
                 atr = df_d['TR'].rolling(14).mean().iloc[-1]
-                atr_stop = curr_price - 1.5 * atr
-                atr_stop_str = f" | 🛡️ 支撑: ${atr_stop:.2f}"
                 
-                # 监控日线跳空缺口
+                # 🚀 新增 1:2 盈亏比目标点位 (Target)
+                atr_stop = curr_price - 1.5 * atr
+                atr_target = curr_price + 3.0 * atr 
+                atr_stop_str = f" | 🎯 止盈: ${atr_target:.2f} | 🛡️ 止损: ${atr_stop:.2f}"
+                
                 gap = (df_d['Open'].iloc[-1] - df_d['Close'].iloc[-2]) / df_d['Close'].iloc[-2] * 100
                 if abs(gap) > 4:
                     is_alert = True
@@ -343,7 +343,6 @@ def run_volatility_sentinel() -> None:
                     alert_type = f"{alert_type} | {gap_str}" if alert_type else gap_str
             
             if is_alert:
-                # 🚀 [哨兵借鉴 Matrix]：在报警时附带最新新闻，提供异动上下文
                 news = get_latest_news(sym)
                 news_str = f"\n    > {news}" if news else ""
                 alerts.append(f"> **{sym}** 盘中极端异动 {'🚀' if hr_chg>0 else '🩸'} | {alert_type} (现价: ${curr_price:.2f}){atr_stop_str}{news_str}")
@@ -376,15 +375,12 @@ def run_tech_matrix() -> None:
             is_vol = (curr['Volume'] / curr['Vol_MA20']) > 1.5
             is_st = curr['SuperTrend_Up'] == 1
 
-            # 1. 🏆 米奈尔维尼模板
             if pd.notna(curr['SMA_200']) and curr['Close'] > curr['SMA_50'] > curr['SMA_150'] > curr['SMA_200'] and curr['SMA_200'] > df['SMA_200'].iloc[-20]:
                 sig.append("🏆 **[米奈尔维尼模板]** 主升浪形态"); score += int(8 * w_mul); st_cnt += 1
             
-            # 2. 🌊 OBV 底背离
             if len(df) >= 40 and df['Close'].iloc[-20:].min() < df['Close'].iloc[-40:-20].min() and df['OBV'].iloc[-20:].min() > df['OBV'].iloc[-40:-20].min():
                 sig.append("🌊 **[OBV底背离]** 主力暗中建仓"); score += int(7 * w_mul); st_cnt += 1
 
-            # 3. ⚡ 强相对强度 (RS)
             if not qqq_df.empty:
                 m_df = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, how='inner')
                 if len(m_df) >= 20:
@@ -394,17 +390,14 @@ def run_tech_matrix() -> None:
                     elif rs_20 < 0.92:
                         sig.append(f"🐢 **[相对弱势]** 跑输大盘 {1-rs_20:.1%}"); score -= 3
 
-            # 4. 🟢 动态 RSI 回踩
             dyn_rsi = curr['RSI_P20'] if pd.notna(curr['RSI_P20']) else 30.0
             if curr['RSI'] < dyn_rsi and prev['RSI'] >= dyn_rsi:
                 if curr['Close'] > curr['EMA_50'] and is_st:
                     sig.append(f"🟢 **[强势回踩]** (RSI:{curr['RSI']:.1f})"); score += int((13 if regime=='bear' else 8) * w_mul); st_cnt += 1
 
-            # 5. 🔥 MACD 金叉
             if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
                 sig.append("🔥 **[MACD金叉]**"); score += int(10 * w_mul); st_cnt += 1
 
-            # 6. 📦 TTM Squeeze
             is_sqz = (curr['BB_Upper'] - curr['BB_Lower']) < (curr['KC_Upper'] - curr['KC_Lower'])
             was_sqz = ((df['BB_Upper'].iloc[-6:-1] < df['KC_Upper'].iloc[-6:-1]) & (df['BB_Lower'].iloc[-6:-1] > df['KC_Lower'].iloc[-6:-1])).any() if len(df)>=6 else False
             if is_sqz:
@@ -412,24 +405,19 @@ def run_tech_matrix() -> None:
             elif was_sqz and not is_sqz and curr['MACD_Hist'] > 0 and curr['MACD_Hist'] > prev['MACD_Hist']:
                 sig.append("🚀 **[TTM Squeeze FIRE ↑]**"); score += int((18 if regime=='bull' else 10) * w_mul); st_cnt += 1
 
-            # 7. 🏦 机构高控盘 CMF
             cmf = curr['CMF']
             if cmf > 0.20: sig.append(f"🏦 **[机构高控盘]** (CMF:{cmf:.2f})"); score += int(5 * w_mul); st_cnt += 1
             elif cmf < -0.15: sig.append(f"⚠️ **[资金派发]** (CMF:{cmf:.2f})"); score -= 4
 
-            # 8. 🌥️ 一目均衡云
             if curr['Above_Cloud'] == 0:
                 score = int(score * 0.4); sig.append("☁️ **[云层压制]**")
             elif curr['Tenkan'] > curr['Kijun'] and curr['Cloud_Twist'] == 1:
                 sig.append("🌥️ **[一目强多头]**"); score += int(6 * w_mul); st_cnt += 1
                 
-            # 9. 💥 [Matrix借鉴哨兵] 突破缺口因子
-            # 将极端跳空过滤(Event Risk)后剩下的 1.5%~6% 良性放量跳空作为主升浪奖励因子
             gap_pct = (curr['Open'] - prev['Close']) / prev['Close']
             if 0.015 < gap_pct < 0.06 and is_vol and curr['Close'] > curr['Open']:
                 sig.append(f"💥 **[突破缺口]** 强势放量跳空 (+{gap_pct*100:.1f}%)"); score += int(6 * w_mul); st_cnt += 1
 
-            # 10. 🎯 严密共振与量价奖励
             if score > 0 and st_cnt < 1 and not is_vol: score = int(score * 0.3)
             if is_vol and score >= 5: sig.append("🌊 **[量价共振]**"); score += 3
             if st_cnt >= 2: sig.append("🎯 **[严密共振]**"); score += 5
@@ -437,10 +425,14 @@ def run_tech_matrix() -> None:
             if sig and score >= min_score:
                 news = get_latest_news(sym)
                 if news: sig.append(news)
+                
+                # 🚀 新增 1:2 盈亏比目标点位 (Target)
                 atr_stop = curr['Close'] - 1.5 * curr['ATR']
+                atr_target = curr['Close'] + 3.0 * curr['ATR']
+                
                 reports.append({
                     "symbol": sym, "score": score, "signals": sig[:8], 
-                    "curr_close": curr['Close'], "atr_stop": atr_stop,
+                    "curr_close": curr['Close'], "atr_stop": atr_stop, "atr_target": atr_target,
                     "sector": Config.get_sector_etf(sym), "raw_score": score
                 })
         except Exception: pass
@@ -457,7 +449,9 @@ def run_tech_matrix() -> None:
                 for s in stks[1:]: s["score"] = int(s["raw_score"] * pen)
 
         reports.sort(key=lambda x: x["score"], reverse=True)
-        txts = [f"**{r['symbol']}** (${r['curr_close']:.2f} | 🛡️ 止损: ${r['atr_stop']:.2f} | 🌟 {r['score']})\n> " + "\n> ".join(r["signals"]) for r in reports[:15]]
+        
+        # 🚀 UI 显示升级：明确标注“止盈”与“评分”
+        txts = [f"**{r['symbol']}** (${r['curr_close']:.2f} | 🎯 止盈: ${r['atr_target']:.2f} | 🛡️ 止损: ${r['atr_stop']:.2f} | 🌟 评分: {r['score']})\n> " + "\n> ".join(r["signals"]) for r in reports[:15]]
         
         send_alert("📊 多因子优选异动 (矩阵共振版)", f"{load_strategy_performance_tag()}*{vix_desc}*\n*{regime_desc}*\n\n" + "\n\n".join(txts) + f"\n\n*(门槛: {min_score}分 | 降权防诱多机制已开启)*")
         
@@ -506,7 +500,6 @@ def run_backtest_engine() -> None:
     f_res = {t: {'win_rate': sum(1 for x in r if x > 0)/len(r), 'avg_ret': sum(r)/len(r), 'count': len(r)} for t, r in factor_rets.items() if len(r) >= 2}
     with open(Config.STATS_FILE, 'w') as f: json.dump({"overall": res, "factors": f_res}, f)
     
-    # 🚀 [交叉借鉴补回] 恢复并强化生成人类可读的 Markdown 战报功能
     report_lines = [
         "# 📈 自动化量化监控战报 (Auto-Backtest Report)",
         f"**最后更新时间:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
@@ -554,4 +547,4 @@ if __name__ == "__main__":
     if m == "sentinel": run_volatility_sentinel()
     elif m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("✅ 测试", "系统环境正常，Matrix 与 Sentinel 的基因互通已完成！")
+    elif m == "test": send_alert("✅ 测试", "系统环境正常，已新增 1:2 盈亏比自动「止盈止损」计算模块！")
