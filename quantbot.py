@@ -131,7 +131,7 @@ def get_latest_news(symbol: str) -> str:
     except Exception as e:
         logger.debug(f"[{symbol}] 新闻拉取失败: {e}")
         
-        # 获取失败也写入缓存空值，防止循环请求
+    # 获取失败也写入缓存空值，防止循环请求
     _NEWS_CACHE[symbol] = (current_time, "")
     return ""
 
@@ -924,6 +924,11 @@ def run_tech_matrix() -> None:
         send_alert("📊 全市场优选异动池", final_report)
         
         # --- 历史回测数据持久化 (JSON Lines) ---
+        try:
+            log_data = {
+                "date": datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+                "vix": round(float(vix), 2),
+                "regime": regime,
                 "health_score": round(float(health_score), 2),
                 "top_picks": [
                     {
