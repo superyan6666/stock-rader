@@ -97,7 +97,7 @@ def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retr
             sleep_sec = random.uniform(0.2, 0.5) if fast_mode else (random.uniform(2.0, 4.5) if "1d" in interval else random.uniform(1.2, 2.5))
             time.sleep(sleep_sec)
             
-            # [修复] 移除 session=_YF_SESSION，让新版 yfinance 自动接管底层反爬伪装
+            # 移除 session，让新版 yfinance 自动接管底层反爬伪装
             df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=auto_adjust, timeout=15)
             if not df.empty: return df
         except Exception as e:
@@ -108,7 +108,7 @@ def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retr
 
 def get_latest_news(symbol: str) -> str:
     try:
-        # [修复] 移除 session=_YF_SESSION
+        # 移除 session
         news_data = yf.Ticker(symbol).news
         if news_data:
             latest = news_data[0]
@@ -130,12 +130,28 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
     logger.info(">>> 漏斗过滤：尝试从稳定的开源数据源拉取全市场名单...")
     tickers = set(Config.CORE_WATCHLIST)
     
+    # --- 修复：补回漏掉的 GitHub CSV 拉取与变量声明 ---
+    try:
+        sp500_url = 'https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv'
+        resp = requests.get(sp500_url, headers=_GLOBAL_HEADERS, timeout=15)
+        if resp.status_code == 200:
+            from io import StringIO
+            df_sp500 = pd.read_csv(StringIO(resp.text))
+            if 'Symbol' in df_sp500.columns:
+                tickers.update(df_sp500['Symbol'].dropna().astype(str).str.replace('.', '-').tolist())
+    except Exception as e:
+        logger.warning(f"⚠️ 开源 CSV 拉取失败，将完全使用内置的硬核股票池进行扫描。 ({e})")
+    
+    tickers_list = list(tickers)
+    logger.info(f"✅ 获取待筛名单: {len(tickers_list)} 只。开始分块拉取粗筛...")
+    # ---------------------------------------------------
+
     try:
         chunk_size = 50  # 降低分块大小，防止触发 Yahoo DDoS 防护
         dfs = []
         for i in range(0, len(tickers_list), chunk_size):
             chunk = tickers_list[i:i + chunk_size]
-            # [修复] 移除 session，让新版 yfinance 自动接管防封禁
+            # 移除 session，让新版 yfinance 自动接管防封禁
             chunk_df = yf.download(chunk, period="5d", progress=False, threads=2)
             if not chunk_df.empty: dfs.append(chunk_df)
             if i + chunk_size < len(tickers_list): time.sleep(random.uniform(2.5, 4.0))
@@ -474,7 +490,7 @@ def run_backtest_engine() -> None:
     start_dt = (datetime.strptime(min([t['date'] for t in trades]), '%Y-%m-%d') - timedelta(days=5)).strftime('%Y-%m-%d')
 
     try:
-        # [修复] 同样为回测的批量下载移除 session
+        # 回测批量下载移除 session
         df_c = yf.download(syms, start=start_dt, progress=False, threads=2)['Close']
         if len(syms) == 1: df_c = pd.DataFrame(df_c, columns=syms)
         df_c.index = df_c.index.strftime('%Y-%m-%d')
