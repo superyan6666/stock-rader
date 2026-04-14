@@ -236,6 +236,20 @@ def escape_md_v2(text: str) -> str:
     escape_chars = r"_*[]()~`>#+-=|{}.!"
     return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
 
+def load_strategy_performance_tag() -> str:
+    """[协同功能] 读取回测系统生成的最新胜率数据，作为推送战绩标签"""
+    try:
+        if os.path.exists("strategy_stats.json"):
+            with open("strategy_stats.json", "r", encoding="utf-8") as f:
+                stats = json.load(f)
+                # 默认展示 T+3 的表现，这通常是波段交易最核心的指标
+                t3 = stats.get("T+3")
+                if t3 and t3.get('total_trades', 0) > 0:
+                    return f"📈 **策略历史表现 (T+3)**: 胜率 **{t3['win_rate']:.1%}** | 均收益 **{t3['avg_ret']:+.2%}**\n\n"
+    except Exception as e:
+        logger.debug(f"读取回测统计失败，可能是第一次运行还未生成: {e}")
+    return ""
+
 def send_alert(title: str, content: str) -> None:
     """多渠道广播中心 (Webhook + Telegram)"""
     formatted_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
@@ -896,7 +910,12 @@ def run_tech_matrix() -> None:
             text = f"**{r['symbol']}** (${r['curr_close']:.2f} | 额: {turnover_str} | 🌟动态评分: {score_display})\n> " + "\n> ".join(r["signals"])
             top_reports_text.append(text)
         
-        final_report = f"*{vix_desc}*\n*{regime_desc}*\n\n" + "\n\n".join(top_reports_text)
+        # [联动回测系统] 获取历史战绩标签
+        perf_tag = load_strategy_performance_tag()
+        
+        # 将胜率标签拼接在报告最上方
+        final_report = f"{perf_tag}*{vix_desc}*\n*{regime_desc}*\n\n" + "\n\n".join(top_reports_text)
+        
         if len(reports) > 15:
             final_report += f"\n\n*(已过滤低质信号 + 拥挤/弱势动态降权，为您优选展示最高分 Top 15)*"
         else:
@@ -904,12 +923,7 @@ def run_tech_matrix() -> None:
             
         send_alert("📊 全市场优选异动池", final_report)
         
-        # --- [新增] 历史回测数据持久化 (JSON Lines) ---
-        try:
-            log_data = {
-                "date": datetime.now(timezone.utc).strftime('%Y-%m-%d'),
-                "vix": round(float(vix), 2),
-                "regime": regime,
+        # --- 历史回测数据持久化 (JSON Lines) ---
                 "health_score": round(float(health_score), 2),
                 "top_picks": [
                     {
