@@ -1,28 +1,24 @@
-🤖 QuantBot - GitHub Actions 量化盯盘机器人
+🤖 QuantBot - GitHub Actions 顶级量化盯盘机器人
 
-这是一个专为 GitHub Actions 设计的零成本、免维护量化多因子盯盘机器人。无需购买云服务器，依托 GitHub 官方容器，7x24 小时监控全球市场异动，并将投资机会实时推送给您。
+这是一个专为 GitHub Actions 设计的零成本、免维护量化多因子盯盘机器人。依托 GitHub 官方容器，7x24 小时监控全球市场异动，并将自带“止损建议”与“因子评级”的投资机会实时推送给您。
 
 ✨ 核心特性 (Features)
 
-🆓 零成本托管：基于 GitHub Actions 定时触发（Cron），告别云服务器续费烦恼。
+🆓 零成本永不停机：基于 GitHub Actions 定时触发（Cron），无服务器维护成本。
 
-🧠 智能“四合一”极简架构：
+🛡️ 绝对降级护城河：摒弃脆弱的爬虫依赖。内置硬核 150 大流动性票池，配合 yfinance 原生免封禁底层，确保数年稳定运行。
 
-⚡ sentinel (高频异动哨兵)：每半小时动态扫描全市场近期成交最活跃的 Top 40 龙头股，实时捕捉盘中暴涨/暴跌与极端跳空异动。
+🧠 智能“三合一”架构：
 
-🎯 matrix (多因子信号矩阵)：监控 MACD 金叉、RSI 背离、均线突破、布林挤压与 TTM Squeeze。
+⚡ sentinel (高频哨兵)：盘中每半小时扫描全市场活跃资金池，秒级捕获 >3.5% 的分时脉冲与 >4% 的跳空缺口，附带日线 ATR 支撑位与实时新闻。
 
-📝 daily (全景复盘)：每日收盘后扫描，梳理多空排列阵型（已并入 Matrix 统一路由）。
+🎯 matrix (多因子矩阵)：盘尾深度扫描共振点。聚合了 OBV 能量潮底背离、米奈尔维尼 (Minervini) 主升浪模板、TTM Squeeze 动能点火 以及 机构资金 (CMF) 等十大顶级因子。
 
-📅 backtest (自动阅卷闭环)：每周五自动比对历史推送记录与真实 K 线，生成 T+3 胜率战报。
+📅 backtest (自动回测与归因)：每周五自动对齐真实 K 线，生成 T+3 周期的胜率报表，并独立统计每个技术因子在当前市场的真实胜率。
 
-🌐 动态全市场漏斗：自动从 Wikipedia 抓取 S&P 500、S&P 400 和 Nasdaq 100，并按成交活跃度动态筛选 Top 120。
+⚖️ 大盘与板块防诱多风控：自动感知 VIX 恐慌指数与大盘趋势 (Regime)。一旦识别到单日“同板块高潮”，立即启动 CROWDING_PENALTY（板块拥挤度降权），拒绝接盘诱多。
 
-🛡️ 大盘与板块风控：自动感知 VIX 恐慌指数与大盘趋势，触发“防雷网”和“板块拥挤度”自适应降权。
-
-📢 多渠道消息推送：支持 钉钉/飞书/企业微信 Webhook，以及 Telegram Bot (支持 MarkdownV2)。
-
-🏭 企业级 DevOps 部署：内置防封禁分块下载 (Chunking)、依赖缓存加速、并发死锁熔断以及严格的版本锁定。
+🔔 交易的“最后一公里”：推送消息直接附带基于波动率计算的 ATR 科学止损价。支持 Telegram 与 钉钉/飞书 Webhook 实时接收。
 
 🚀 快速开始 (Quick Start)
 
@@ -34,7 +30,7 @@
 
 2. 配置环境变量 (Secrets)
 
-进入您 Fork 后的仓库，点击 Settings -> Secrets and variables -> Actions -> New repository secret，添加以下通知渠道配置（任选其一或全选）：
+进入您 Fork 后的仓库，点击 Settings -> Secrets and variables -> Actions -> New repository secret，添加以下通知配置：
 
 Secret 名称
 
@@ -44,7 +40,7 @@ Secret 名称
 
 WEBHOOK_URL
 
-钉钉/飞书/企业微信的群机器人 Webhook 地址（支持英文逗号分隔配置多个）
+钉钉/飞书/企业微信 Webhook 地址（支持逗号分隔配置多个）
 
 选填
 
@@ -60,43 +56,25 @@ Telegram 接收消息的 Chat ID
 
 选填
 
-注意：WEBHOOK_URL 和 TELEGRAM 相关的配置必须至少填写一种，否则程序将报错退出。
+注意：通知渠道必须至少填写一种，否则程序无处报警。
 
-3. 启用 GitHub Actions
+3. 启用与运行
 
-点击仓库顶部的 Actions 标签页。
+点击仓库顶部的 Actions 标签页，确认启用工作流。
 
-如果看到 "I understand my workflows, go ahead and enable them"，点击确认启用。
+在左侧列表中选择 Tickeron Pro AI Bot。
 
-在左侧工作流列表中选择 Tickeron Pro AI Bot。
+点击 Run workflow，您可以手动选择 matrix 模式进行一次全市场深度扫描，体验量化推送。
 
-点击 Run workflow，您可以手动选择 test 模式进行推送测试。
+🕒 自动化运行时间表
 
-🕒 自动化运行时间表 (Schedule)
+默认运行逻辑（UTC 时间，仅工作日执行）：
 
-机器人完全依靠 GitHub Actions 的 Cron 触发自动运行，默认时间表如下（均为 UTC 时间，工作日运行）：
+Sentinel: 每半小时 (xx:00, xx:30)
 
-高频哨兵 (Sentinel): 每半小时执行一次。
+Matrix: 每小时 (xx:15)
 
-多因子矩阵 (Matrix): 每小时的第 15 分钟执行一次。
-
-每日复盘 (Daily): 每天 22:00 UTC 执行。
-
-历史回测 (Backtest): 每周五 23:00 UTC 执行自动数据统计。
-
-💡 调度逻辑由 main.yml 结合实际 UTC 时间戳严格接管，杜绝了并发拥堵与调度漂移。
-
-📁 核心文件结构
-
-quantbot.py: The Single Core (统一核心)。包含数据漏斗、指标计算、风控策略、推送与回测闭环的所有逻辑（不到 500 行）。
-
-requirements.txt: 严格锁定的 Python 环境依赖库。
-
-.github/workflows/main.yml: GitHub Actions 自动化运维部署文件。
-
-backtest_log.jsonl: 自动生成并提交的策略选股历史日志文件（无需手动创建）。
-
-strategy_stats.json: 回测引擎生成的历史胜率库（自动挂载至推送消息头部）。
+Backtest: 每周五 (23:00)
 
 ⚠️ 免责声明 (Disclaimer)
 
