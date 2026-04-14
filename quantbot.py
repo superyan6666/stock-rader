@@ -15,7 +15,7 @@ from datetime import datetime, timezone, timedelta
 
 # 忽略第三方库引发的各种杂音警告，保持 GitHub Actions 日志清爽
 warnings.filterwarnings('ignore')
-logging.getLogger('yfinance').setLevel(logging.CRITICAL) # 🛡️ 屏蔽 yfinance 报错刷屏
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 # ================= 1. 日志与配置管理 =================
 logging.basicConfig(
@@ -38,7 +38,6 @@ class Config:
     
     DINGTALK_KEYWORD: str = "AI"
     
-    # --- 🚀 [护城河] 绝对稳定的核心资产名单 ---
     CORE_WATCHLIST: List[str] = [
         "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA", "BRK-B", "AVGO", 
         "LLY", "JPM", "V", "XOM", "UNH", "MA", "PG", "JNJ", "HD", "MRK", 
@@ -122,28 +121,50 @@ def get_latest_news(symbol: str) -> str:
                     sentiment = "🔴 [利空]"
                 else:
                     sentiment = "⚪ [中性]"
-                return f"📰 {sentiment} **{title}** ({publisher})"
+                return f"{sentiment} {title} ({publisher})"
     except Exception: pass
     return ""
 
 def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
-    logger.info(">>> 漏斗过滤：从稳定数据源拉取全市场名单...")
+    logger.info(">>> 漏斗过滤：从多维度数据源拉取全市场名单 (含纳指与中盘)...")
     tickers = set(Config.CORE_WATCHLIST)
     
+    # 1. 抓取标普 500 (大盘蓝筹 - 最稳定源)
     try:
         sp500_url = 'https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv'
-        resp = requests.get(sp500_url, headers=_GLOBAL_HEADERS, timeout=15)
+        resp = requests.get(sp500_url, headers=_GLOBAL_HEADERS, timeout=10)
         if resp.status_code == 200:
             from io import StringIO
             df_sp500 = pd.read_csv(StringIO(resp.text))
             if 'Symbol' in df_sp500.columns:
                 tickers.update(df_sp500['Symbol'].dropna().astype(str).str.replace('.', '-').tolist())
     except Exception as e:
-        logger.warning(f"⚠️ CSV 降级运行: {e}")
+        logger.warning(f"⚠️ 标普500拉取降级: {e}")
+
+    # 2. 抓取标普 400 (中盘股 Mid-Cap - 极具爆发力) & 纳斯达克 100
+    try:
+        from io import StringIO
+        # 使用带 User-Agent 的 requests 绕过维基百科 403 拦截
+        wiki_urls = [
+            'https://en.wikipedia.org/wiki/List_of_S%26P_400_companies',
+            'https://en.wikipedia.org/wiki/Nasdaq-100'
+        ]
+        for w_url in wiki_urls:
+            w_resp = requests.get(w_url, headers=_GLOBAL_HEADERS, timeout=10)
+            if w_resp.status_code == 200:
+                # 寻找表格中的 Ticker / Symbol 列
+                for table in pd.read_html(StringIO(w_resp.text)):
+                    col = next((c for c in ['Symbol', 'Ticker symbol', 'Ticker'] if c in table.columns), None)
+                    if col:
+                        tickers.update(table[col].dropna().astype(str).str.replace('.', '-').tolist())
+                        break
+    except Exception as e:
+        logger.warning(f"⚠️ 中盘股与纳指拓展列表获取受限: {e}")
     
     tickers_list = list(tickers)
-    logger.info(f"✅ 待筛名单: {len(tickers_list)} 只。开始分块巡逻...")
+    logger.info(f"✅ 扩容完成，初始海选池: {len(tickers_list)} 只标的。开始分块并发粗筛...")
 
+    # 粗筛漏斗：用 5 天数据快速淘汰僵尸股
     try:
         chunk_size = 50 
         dfs = []
@@ -165,20 +186,20 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
         closes = close_df.dropna(axis=1, how='all').ffill().iloc[-1]
         volumes = volume_df.dropna(axis=1, how='all').mean()
         
+        # 核心漏斗过滤条件
         turnovers = (closes * volumes).dropna()
+        # 过滤掉低于 $10 的低价股和日均成交量低于 100万 的不活跃股 (自动屏蔽罗素里的垃圾股)
         valid_turnovers = turnovers[(closes > 10.0) & (volumes > 1000000)]
         
+        # 按成交金额 (Turnover) 排序，取全市场当前资金最活跃的 max_stocks (默认 120 只)
         top_tickers = valid_turnovers.sort_values(ascending=False).head(max_stocks).index.tolist()
         if top_tickers:
-            logger.info(f"✅ 漏斗完成！精选 {len(top_tickers)} 只进入深度扫描。")
+            logger.info(f"✅ 漏斗过滤完成！从千股中精选出全市场最活跃的 {len(top_tickers)} 只进入深度扫描。")
             return top_tickers
         return Config.CORE_WATCHLIST[:max_stocks]
     except Exception as e:
         logger.error(f"❌ 批量下载崩溃: {e}")
         return Config.CORE_WATCHLIST[:max_stocks]
-
-def escape_md_v2(text: str) -> str:
-    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", text)
 
 def load_strategy_performance_tag() -> str:
     try:
@@ -187,7 +208,7 @@ def load_strategy_performance_tag() -> str:
                 stats_data = json.load(f)
                 t3 = stats_data.get("overall", {}).get("T+3") if "overall" in stats_data else stats_data.get("T+3")
                 if t3 and t3.get('total_trades', 0) > 0:
-                    return f"📈 **策略历史表现 (T+3)**: 胜率 **{t3['win_rate']:.1%}** | 均收益 **{t3['avg_ret']:+.2%}**\n\n"
+                    return f"📈 策略表现 (T+3): 胜率 {t3['win_rate']:.1%} | 均收益 {t3['avg_ret']:+.2%}"
     except Exception: pass
     return ""
 
@@ -195,20 +216,32 @@ def send_alert(title: str, content: str) -> None:
     if not content.strip(): return
     formatted_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     
+    # 🚀 发送至 DingTalk (支持标准 Markdown)
     if Config.WEBHOOK_URL:
-        payload = {"msgtype": "markdown", "markdown": {"title": f"【{Config.DINGTALK_KEYWORD}】{title}", "text": f"### 🤖 【{Config.DINGTALK_KEYWORD}量化监控】\n#### {title}\n\n{content}\n\n---\n*⏱️ {formatted_time}*"}}
+        payload = {
+            "msgtype": "markdown", 
+            "markdown": {
+                "title": f"【{Config.DINGTALK_KEYWORD}】{title}", 
+                "text": f"### 🤖 【{Config.DINGTALK_KEYWORD}】{title}\n\n{content}\n\n---\n*⏱️ {formatted_time}*"
+            }
+        }
         for url in [u.strip() for u in Config.WEBHOOK_URL.split(',') if u.strip()]:
             try: requests.post(url, json=payload, timeout=10)
             except Exception: pass
                 
+    # 🚀 发送至 Telegram (启用极度稳定的 HTML 模式防排版错乱)
     if Config.TELEGRAM_BOT_TOKEN and Config.TELEGRAM_CHAT_ID:
+        html_title = title.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        html_content = content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        
+        tg_text = f"🤖 <b>【量化监控】{html_title}</b>\n\n{html_content}\n\n⏱️ <i>{formatted_time}</i>"
         try:
             requests.post(
                 f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage",
                 json={
                     "chat_id": Config.TELEGRAM_CHAT_ID,
-                    "text": f"🤖 *量化监控系统*\n\n*{escape_md_v2(title)}*\n\n{escape_md_v2(content)}\n\n⏱️ _{escape_md_v2(formatted_time)}_",
-                    "parse_mode": "MarkdownV2",
+                    "text": tg_text,
+                    "parse_mode": "HTML", # 彻底抛弃易崩坏的 MarkdownV2
                     "disable_web_page_preview": True
                 }, timeout=10)
         except Exception: pass
@@ -251,13 +284,11 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['Low_52W'] = df['Low'].rolling(window=252, min_periods=120).min()
     df['OBV'] = (np.sign(df['Close'].diff()).fillna(0) * df['Volume']).cumsum()
     
-    # RSI
     delta = df['Close'].diff()
     rs = delta.where(delta > 0, 0).ewm(alpha=1/14, min_periods=14).mean() / (-delta.where(delta < 0, 0).ewm(alpha=1/14, min_periods=14).mean() + 1e-10)
     df['RSI'] = 100 - (100 / (1 + rs))
     df['RSI_P20'] = df['RSI'].rolling(window=120, min_periods=60).quantile(0.20) if len(df) >= 60 else 30.0
 
-    # MACD & ATR
     df['MACD'] = df['Close'].ewm(span=12, adjust=False).mean() - df['Close'].ewm(span=26, adjust=False).mean()
     df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
@@ -266,7 +297,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['TR'] = pd.concat([df['High']-df['Low'], (df['High']-df['Close'].shift()).abs(), (df['Low']-df['Close'].shift()).abs()], axis=1).max(axis=1)
     df['ATR'] = df['TR'].rolling(window=14).mean()
     
-    # SuperTrend & Channels
     hl2, atr10 = (df['High'] + df['Low']) / 2, df['TR'].rolling(window=10).mean()
     ub, lb, in_up = (hl2 + 3 * atr10).values, (hl2 - 3 * atr10).values, np.ones(len(df), dtype=bool)
     for i in range(1, len(df)):
@@ -281,7 +311,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     bb_ma, bb_std = df['Close'].rolling(20).mean(), df['Close'].rolling(20).std()
     df['BB_Upper'], df['BB_Lower'] = bb_ma + 2 * bb_std, bb_ma - 2 * bb_std
 
-    # Ichimoku
     df['Tenkan'] = (df['High'].rolling(9).max() + df['Low'].rolling(9).min()) / 2
     df['Kijun'] = (df['High'].rolling(26).max() + df['Low'].rolling(26).min()) / 2
     df['SenkouA'] = ((df['Tenkan'] + df['Kijun']) / 2).shift(26)
@@ -289,7 +318,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['Above_Cloud'] = (df['Close'] > df[['SenkouA', 'SenkouB']].max(axis=1)).astype(int)
     df['Cloud_Twist'] = (df['SenkouA'] > df['SenkouB']).astype(int)
 
-    # Risk & CMF
     if len(df) >= 60:
         hist_vol = df['Volume'].iloc[-60:-10].quantile(0.8)
         risk_score = 0.6 if (df['Volume'].iloc[-10:].mean() / (hist_vol + 1e-10)) > 2.5 else 0.0
@@ -322,7 +350,7 @@ def run_volatility_sentinel() -> None:
             
             if abs(hr_chg) > 3.5: 
                 is_alert = True
-                alert_type = f"1h脉冲: **{hr_chg:+.2f}%**"
+                alert_type = f"1h脉冲: {hr_chg:+.2f}%"
 
             df_d = safe_get_history(sym, period="1mo", interval="1d", fast_mode=True)
             atr_stop_str = ""
@@ -331,25 +359,31 @@ def run_volatility_sentinel() -> None:
                 df_d['TR'] = pd.concat([df_d['High']-df_d['Low'], (df_d['High']-df_d['Close'].shift()).abs(), (df_d['Low']-df_d['Close'].shift()).abs()], axis=1).max(axis=1)
                 atr = df_d['TR'].rolling(14).mean().iloc[-1]
                 
-                # 🚀 新增 1:2 盈亏比目标点位 (Target)
                 atr_stop = curr_price - 1.5 * atr
                 atr_target = curr_price + 3.0 * atr 
-                atr_stop_str = f" | 🎯 止盈: ${atr_target:.2f} | 🛡️ 止损: ${atr_stop:.2f}"
+                atr_stop_str = f"  🎯 止盈: ${atr_target:.2f} | 🛡️ 止损: ${atr_stop:.2f}\n"
                 
                 gap = (df_d['Open'].iloc[-1] - df_d['Close'].iloc[-2]) / df_d['Close'].iloc[-2] * 100
                 if abs(gap) > 4:
                     is_alert = True
-                    gap_str = f"跳空缺口: **{gap:+.2f}%**"
+                    gap_str = f"跳空缺口: {gap:+.2f}%"
                     alert_type = f"{alert_type} | {gap_str}" if alert_type else gap_str
             
             if is_alert:
                 news = get_latest_news(sym)
-                news_str = f"\n    > {news}" if news else ""
-                alerts.append(f"> **{sym}** 盘中极端异动 {'🚀' if hr_chg>0 else '🩸'} | {alert_type} (现价: ${curr_price:.2f}){atr_stop_str}{news_str}")
+                news_str = f"  📰 资讯: {news}\n" if news else ""
+                alert_msg = (
+                    f"🚨 【{sym}】 盘中极端异动 {'🚀' if hr_chg>0 else '🩸'}\n"
+                    f"  💵 现价: ${curr_price:.2f}\n"
+                    f"  📊 异动: {alert_type}\n"
+                    f"{atr_stop_str}{news_str}"
+                )
+                alerts.append(alert_msg.strip())
                 
         except Exception: pass
         
-    if alerts: send_alert("⚡ 盘中高频哨兵预警", "\n\n".join(alerts))
+    if alerts: 
+        send_alert("⚡ 盘中高频哨兵预警", "━━━━━━━━━━━━━━━━━━\n\n" + "\n\n".join(alerts))
 
 def run_tech_matrix() -> None:
     regime, regime_desc, qqq_df = get_market_regime()
@@ -376,57 +410,56 @@ def run_tech_matrix() -> None:
             is_st = curr['SuperTrend_Up'] == 1
 
             if pd.notna(curr['SMA_200']) and curr['Close'] > curr['SMA_50'] > curr['SMA_150'] > curr['SMA_200'] and curr['SMA_200'] > df['SMA_200'].iloc[-20]:
-                sig.append("🏆 **[米奈尔维尼模板]** 主升浪形态"); score += int(8 * w_mul); st_cnt += 1
+                sig.append("🏆 [米奈尔维尼] 主升浪形态"); score += int(8 * w_mul); st_cnt += 1
             
             if len(df) >= 40 and df['Close'].iloc[-20:].min() < df['Close'].iloc[-40:-20].min() and df['OBV'].iloc[-20:].min() > df['OBV'].iloc[-40:-20].min():
-                sig.append("🌊 **[OBV底背离]** 主力暗中建仓"); score += int(7 * w_mul); st_cnt += 1
+                sig.append("🌊 [OBV底背离] 主力暗中建仓"); score += int(7 * w_mul); st_cnt += 1
 
             if not qqq_df.empty:
                 m_df = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, how='inner')
                 if len(m_df) >= 20:
                     rs_20 = (1 + (m_df['Close_x'].iloc[-1] / m_df['Close_x'].iloc[-20] - 1)) / max(1 + (m_df['Close_y'].iloc[-1] / m_df['Close_y'].iloc[-20] - 1), 0.5)
                     if rs_20 > 1.08:
-                        sig.append(f"⚡ **[强相对强度]** 跑赢大盘 {rs_20-1:+.1%}"); score += 7 if is_vol else 4
+                        sig.append(f"⚡ [强相对强度] 跑赢大盘 {rs_20-1:+.1%}"); score += 7 if is_vol else 4
                     elif rs_20 < 0.92:
-                        sig.append(f"🐢 **[相对弱势]** 跑输大盘 {1-rs_20:.1%}"); score -= 3
+                        sig.append(f"🐢 [相对弱势] 跑输大盘 {1-rs_20:.1%}"); score -= 3
 
             dyn_rsi = curr['RSI_P20'] if pd.notna(curr['RSI_P20']) else 30.0
             if curr['RSI'] < dyn_rsi and prev['RSI'] >= dyn_rsi:
                 if curr['Close'] > curr['EMA_50'] and is_st:
-                    sig.append(f"🟢 **[强势回踩]** (RSI:{curr['RSI']:.1f})"); score += int((13 if regime=='bear' else 8) * w_mul); st_cnt += 1
+                    sig.append(f"🟢 [强势回踩] (RSI:{curr['RSI']:.1f})"); score += int((13 if regime=='bear' else 8) * w_mul); st_cnt += 1
 
             if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
-                sig.append("🔥 **[MACD金叉]**"); score += int(10 * w_mul); st_cnt += 1
+                sig.append("🔥 [MACD金叉]"); score += int(10 * w_mul); st_cnt += 1
 
             is_sqz = (curr['BB_Upper'] - curr['BB_Lower']) < (curr['KC_Upper'] - curr['KC_Lower'])
             was_sqz = ((df['BB_Upper'].iloc[-6:-1] < df['KC_Upper'].iloc[-6:-1]) & (df['BB_Lower'].iloc[-6:-1] > df['KC_Lower'].iloc[-6:-1])).any() if len(df)>=6 else False
             if is_sqz:
-                sig.append("📦 **[TTM Squeeze ON]**"); score += int((12 if regime=='range' else 6) * w_mul)
+                sig.append("📦 [TTM Squeeze ON]"); score += int((12 if regime=='range' else 6) * w_mul)
             elif was_sqz and not is_sqz and curr['MACD_Hist'] > 0 and curr['MACD_Hist'] > prev['MACD_Hist']:
-                sig.append("🚀 **[TTM Squeeze FIRE ↑]**"); score += int((18 if regime=='bull' else 10) * w_mul); st_cnt += 1
+                sig.append("🚀 [TTM Squeeze FIRE ↑]"); score += int((18 if regime=='bull' else 10) * w_mul); st_cnt += 1
 
             cmf = curr['CMF']
-            if cmf > 0.20: sig.append(f"🏦 **[机构高控盘]** (CMF:{cmf:.2f})"); score += int(5 * w_mul); st_cnt += 1
-            elif cmf < -0.15: sig.append(f"⚠️ **[资金派发]** (CMF:{cmf:.2f})"); score -= 4
+            if cmf > 0.20: sig.append(f"🏦 [机构高控盘] (CMF:{cmf:.2f})"); score += int(5 * w_mul); st_cnt += 1
+            elif cmf < -0.15: sig.append(f"⚠️ [资金派发] (CMF:{cmf:.2f})"); score -= 4
 
             if curr['Above_Cloud'] == 0:
-                score = int(score * 0.4); sig.append("☁️ **[云层压制]**")
+                score = int(score * 0.4); sig.append("☁️ [云层压制]")
             elif curr['Tenkan'] > curr['Kijun'] and curr['Cloud_Twist'] == 1:
-                sig.append("🌥️ **[一目强多头]**"); score += int(6 * w_mul); st_cnt += 1
+                sig.append("🌥️ [一目强多头]"); score += int(6 * w_mul); st_cnt += 1
                 
             gap_pct = (curr['Open'] - prev['Close']) / prev['Close']
             if 0.015 < gap_pct < 0.06 and is_vol and curr['Close'] > curr['Open']:
-                sig.append(f"💥 **[突破缺口]** 强势放量跳空 (+{gap_pct*100:.1f}%)"); score += int(6 * w_mul); st_cnt += 1
+                sig.append(f"💥 [突破缺口] 强势放量跳空 (+{gap_pct*100:.1f}%)"); score += int(6 * w_mul); st_cnt += 1
 
             if score > 0 and st_cnt < 1 and not is_vol: score = int(score * 0.3)
-            if is_vol and score >= 5: sig.append("🌊 **[量价共振]**"); score += 3
-            if st_cnt >= 2: sig.append("🎯 **[严密共振]**"); score += 5
+            if is_vol and score >= 5: sig.append("🌊 [量价共振]"); score += 3
+            if st_cnt >= 2: sig.append("🎯 [严密共振]"); score += 5
 
             if sig and score >= min_score:
                 news = get_latest_news(sym)
                 if news: sig.append(news)
                 
-                # 🚀 新增 1:2 盈亏比目标点位 (Target)
                 atr_stop = curr['Close'] - 1.5 * curr['ATR']
                 atr_target = curr['Close'] + 3.0 * curr['ATR']
                 
@@ -450,10 +483,26 @@ def run_tech_matrix() -> None:
 
         reports.sort(key=lambda x: x["score"], reverse=True)
         
-        # 🚀 UI 显示升级：明确标注“止盈”与“评分”
-        txts = [f"**{r['symbol']}** (${r['curr_close']:.2f} | 🎯 止盈: ${r['atr_target']:.2f} | 🛡️ 止损: ${r['atr_stop']:.2f} | 🌟 评分: {r['score']})\n> " + "\n> ".join(r["signals"]) for r in reports[:15]]
+        # 🚀 采用纵向层级排版，清晰划分基础信息与触发因子
+        medals = ['🥇', '🥈', '🥉']
+        txts = []
+        for idx, r in enumerate(reports[:15]):
+            icon = medals[idx] if idx < 3 else '🔸'
+            sigs_formatted = "\n".join([f"    • {s}" for s in r["signals"]])
+            txt = (
+                f"{icon} 【{r['symbol']}】 综合评分: {r['score']}\n"
+                f"  💵 现价: ${r['curr_close']:.2f}\n"
+                f"  🎯 止盈: ${r['atr_target']:.2f} | 🛡️ 止损: ${r['atr_stop']:.2f}\n"
+                f"  💡 触发共振:\n{sigs_formatted}"
+            )
+            txts.append(txt)
+
+        perf_text = load_strategy_performance_tag()
+        header = f"📊 大盘环境感知:\n  • {vix_desc}\n  • {regime_desc}"
+        if perf_text: header = f"{perf_text}\n\n{header}"
         
-        send_alert("📊 多因子优选异动 (矩阵共振版)", f"{load_strategy_performance_tag()}*{vix_desc}*\n*{regime_desc}*\n\n" + "\n\n".join(txts) + f"\n\n*(门槛: {min_score}分 | 降权防诱多机制已开启)*")
+        final_content = header + "\n━━━━━━━━━━━━━━━━━━\n\n" + "\n\n".join(txts) + f"\n\n*(入选门槛: {min_score}分 | 降权防诱多机制已开启)*"
+        send_alert("多因子优选异动 (矩阵共振版)", final_content)
         
         with open(Config.LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps({"date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"]} for r in reports[:15]]}, ensure_ascii=False) + "\n")
@@ -534,12 +583,19 @@ def run_backtest_engine() -> None:
     except Exception as e:
         logger.error(f"写入 Markdown 失败: {e}")
         
-    alert_txt = "\n\n".join([f"> ⏱️ **{p}**: 胜率 **{d['win_rate']*100:.1f}%** | 均收益 **{d['avg_ret']*100:+.2f}%**" for p, d in res.items()])
+    # 🚀 采用纵向层级排版的周末战报
+    alert_lines = ["📊 周期胜率总览"]
+    for p, d in res.items():
+        alert_lines.append(f"  • {p}: 胜率 {d['win_rate']*100:.1f}% | 均收益 {d['avg_ret']*100:+.2f}%")
+        
     if f_res:
-        alert_txt += "\n\n*🧬 因子表现 Top (T+3)*\n"
-        for tag, d in sorted_factors[:3]:
-            alert_txt += f"> {tag}: 胜率 **{d['win_rate']*100:.1f}%** ({d['count']} 次)\n"
-    send_alert("📅 策略回测战报", alert_txt)
+        alert_lines.extend(["", "━━━━━━━━━━━━━━━━━━", "", "🧬 核心因子排行 (T+3 波段)"])
+        medals = ['1️⃣', '2️⃣', '3️⃣']
+        for idx, (tag, d) in enumerate(sorted_factors[:3]):
+            icon = medals[idx] if idx < 3 else '🔸'
+            alert_lines.append(f"  {icon} {tag}\n      胜率 {d['win_rate']*100:.1f}% | 触发 {d['count']}次")
+            
+    send_alert("策略终极回测战报", "\n".join(alert_lines))
 
 if __name__ == "__main__":
     validate_config()
@@ -547,4 +603,4 @@ if __name__ == "__main__":
     if m == "sentinel": run_volatility_sentinel()
     elif m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("✅ 测试", "系统环境正常，已新增 1:2 盈亏比自动「止盈止损」计算模块！")
+    elif m == "test": send_alert("✅ 连通性测试", "系统环境正常，全新的 HTML 纵排结构卡片引擎已上线！")
