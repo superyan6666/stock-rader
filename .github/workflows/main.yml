@@ -1,12 +1,15 @@
 # 存储路径: .github/workflows/main.yml
 name: Tickeron Pro AI Bot
 
+# [炫技升级 1] 动态展示每一次运行的名称与触发方式，让 Actions 面板极其专业、清晰
+run-name: 🤖 QuantBot 运行状态 - ${{ github.event.inputs.run_mode || '自动调度 (Schedule)' }}
+
 on:
   schedule:
     - cron: '*/30 * * * 1-5'
     - cron: '15 * * * 1-5'
     - cron: '0 22 * * 1-5'
-    - cron: '0 23 * * 5'  # 每周五 23:00 UTC 执行终极回测
+    - cron: '0 23 * * 5'  # 每周五 23:00 UTC 执行终极回测 (美股彻底收盘后)
   workflow_dispatch:
     inputs:
       run_mode:
@@ -21,11 +24,19 @@ on:
           - daily
           - backtest      # 一键触发回测并推送到手机
 
+# 并发控制：防止多个实例同时运行导致 Git 提交冲突
+concurrency:
+  group: bot-running-group
+  cancel-in-progress: true    # 遇到拥堵时取消旧任务，防止积压死锁引发的队列连环爆炸
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     permissions:
       contents: write     
+    # 超时保护：设定物理熔断时间，防止由于网络卡死耗尽 GitHub 免费额度
+    timeout-minutes: 15
+      
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -35,9 +46,25 @@ jobs:
         with:
           python-version: '3.9'
 
+      # Pip 依赖缓存机制：将几十秒的下载时间压缩至几秒，极大节省运行额度
+      - name: 缓存 pip 依赖包
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-quantbot
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # [DevOps 最佳实践] 核心组件版本锁定：通过 requirements.txt 统一管理
       - name: 安装量化组件
         run: |
-          pip install yfinance requests pandas lxml
+          pip install -r requirements.txt
+
+      # [炫技升级 2] 极客范儿：在真正执行策略前，进行基础的语法与规范严谨性检查
+      - name: 🔍 代码质量与语法检查 (Pre-flight Check)
+        run: |
+          # 只检查致命的语法错误 (Syntax errors) 和未定义的变量
+          flake8 quantbot.py --count --select=E9,F63,F7,F82 --show-source --statistics
 
       - name: 智能路由与执行
         env:
@@ -45,27 +72,57 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          MODE="sentinel"
+          # [安全加固] 移除默认 fallback 赋值，采用严格闭环判断
           
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             MODE="${{ github.event.inputs.run_mode }}"
           elif [[ "${{ github.event_name }}" == "schedule" ]]; then
-            if [[ "${{ github.event.schedule }}" == "0 22 * * 1-5" ]]; then
-              MODE="daily"
-            elif [[ "${{ github.event.schedule }}" == "15 * * * 1-5" ]]; then
-              MODE="matrix"
-            elif [[ "${{ github.event.schedule }}" == "0 23 * * 5" ]]; then
+            # 彻底抛弃不可靠的 github.event.schedule，改用真实 UTC 时间进行绝对路由
+            # 兼容 GitHub Actions 偶尔发生的 1-10 分钟队列调度延迟
+            UTC_H=$(date -u +%-H)
+            UTC_M=$(date -u +%-M)
+            UTC_D=$(date -u +%-u)
+            
+            if [[ "$UTC_D" == "5" && "$UTC_H" == "23" ]]; then
               MODE="backtest"
+            elif [[ "$UTC_H" == "22" ]]; then
+              MODE="daily"
+            elif [[ "$UTC_M" -ge 10 && "$UTC_M" -le 29 ]]; then
+              MODE="matrix"   # 匹配 :15 分执行的 cron (给足延迟缓冲)
             else
-              MODE="sentinel"
+              MODE="sentinel" # 匹配 :00 和 :30 分执行的 cron
             fi
+          else
+            # 阻断未知事件触发，防止发生静默失败(Silent Failure)消耗系统资源
+            echo "❌ 拒绝执行：检测到未知触发事件 (Unknown event) '${{ github.event_name }}'"
+            exit 1
           fi
+          
+          # [优化 9] 导出运行模式到环境变量，供后续按需触发 Git 提交
+          echo "RUN_MODE=$MODE" >> $GITHUB_ENV
           
           # 【极简路由】所有模式均由唯一的 quantbot.py 处理
           echo "🤖 准备以 [$MODE] 模式运行 AI 引擎..."
           python quantbot.py $MODE
 
+      # [炫技升级 3] 灾备守护：如果前面的 Python 脚本意外崩溃死机，这里会用原生 curl 发送最后一条求救信号
+      - name: 🚨 工作流崩溃告警 (Disaster Recovery Alert)
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
+            # [优化 8] 修复 curl 变量未引号包裹风险，采用 urlencode 防止文本特殊字符破坏请求
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=🚨 *QuantBot 紧急告警*%0A核心系统或网络发生严重崩溃，请立即登录 GitHub Actions 检查日志！" \
+              --data-urlencode "parse_mode=Markdown"
+          fi
+
       - name: 自动提交回测日志与战报
+        # [优化 9] 只有在 matrix（记录每日日志）或 backtest（更新统计战报）模式下才触发 Git 提交，消除无意义的空载运行
+        if: env.RUN_MODE == 'matrix' || env.RUN_MODE == 'backtest'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "📝 自动记录今日回测日志与战绩"
