@@ -24,6 +24,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("QuantBot")
 
+# --- 🚀 [防封禁核心升级] 全局网络伪装会话 ---
+# 突破 Yahoo Finance 与 Wikipedia 对云服务器/无头爬虫的 403 与 JSON 错误拦截
+_GLOBAL_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5'
+}
+_YF_SESSION = requests.Session()
+_YF_SESSION.headers.update(_GLOBAL_HEADERS)
+
 class Config:
     WEBHOOK_URL: str = os.environ.get('WEBHOOK_URL', '')
     TELEGRAM_BOT_TOKEN: str = os.environ.get('TELEGRAM_BOT_TOKEN', '')
@@ -71,7 +81,8 @@ def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retr
             sleep_sec = random.uniform(0.2, 0.5) if fast_mode else (random.uniform(2.0, 4.5) if "1d" in interval else random.uniform(1.2, 2.5))
             time.sleep(sleep_sec)
             
-            df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=auto_adjust, timeout=15)
+            # 使用伪装 session 突破雅虎拦截
+            df = yf.Ticker(symbol, session=_YF_SESSION).history(period=period, interval=interval, auto_adjust=auto_adjust, timeout=15)
             if not df.empty: return df
         except Exception as e:
             logger.warning(f"[{symbol}] 尝试 {attempt+1} 失败: {e}")
@@ -81,7 +92,8 @@ def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retr
 
 def get_latest_news(symbol: str) -> str:
     try:
-        news_data = yf.Ticker(symbol).news
+        # 使用伪装 session
+        news_data = yf.Ticker(symbol, session=_YF_SESSION).news
         if news_data:
             latest = news_data[0]
             title, publisher = latest.get('title', ''), latest.get('publisher', '')
@@ -103,15 +115,20 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
     tickers = set(Config.CORE_WATCHLIST)
     
     try:
+        # 使用 requests 伪装身份获取 HTML，绕过维基百科 403 Forbidden 拦截
         for url in ['https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', 'https://en.wikipedia.org/wiki/List_of_S%26P_400_companies']:
-            for table in pd.read_html(url):
+            resp = requests.get(url, headers=_GLOBAL_HEADERS, timeout=15)
+            for table in pd.read_html(resp.text):
                 col = next((c for c in ['Symbol', 'Ticker symbol'] if c in table.columns), None)
                 if col:
                     tickers.update(table[col].dropna().astype(str).str.replace('.', '-').tolist())
                     break
-        for table in pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100', match='Ticker|Symbol'):
+                    
+        resp_ndx = requests.get('https://en.wikipedia.org/wiki/Nasdaq-100', headers=_GLOBAL_HEADERS, timeout=15)
+        for table in pd.read_html(resp_ndx.text, match='Ticker|Symbol'):
             col = 'Ticker' if 'Ticker' in table.columns else 'Symbol'
             tickers.update(table[col].dropna().astype(str).str.replace('.', '-').tolist())
+            
     except Exception as e:
         logger.warning(f"⚠️ 维基百科名单获取部分失败，依赖 Fallback: {e}")
         
@@ -123,7 +140,8 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
         dfs = []
         for i in range(0, len(tickers_list), chunk_size):
             chunk = tickers_list[i:i + chunk_size]
-            chunk_df = yf.download(chunk, period="5d", progress=False)
+            # 引入 session 突破批量下载的拦截
+            chunk_df = yf.download(chunk, period="5d", progress=False, session=_YF_SESSION)
             if not chunk_df.empty: dfs.append(chunk_df)
             if i + chunk_size < len(tickers_list): time.sleep(random.uniform(2.0, 3.5))
                 
@@ -326,9 +344,7 @@ def run_tech_matrix() -> None:
     for idx, sym in enumerate(get_filtered_watchlist()):
         if sym in Config.BLACKLIST: continue
         try:
-            # 修改为抓取 1 年数据，为了满足 Minervini 模板的 200 日均线及 52 周高低点计算
             df = safe_get_history(sym, "1y", "1d")
-            # 提高过滤门槛：必须有充足的历史数据来判定长线趋势
             if len(df) < 150 or df['Volume'].tail(20).mean() < 1e6: continue
             
             df = calculate_indicators(df)
@@ -339,9 +355,7 @@ def run_tech_matrix() -> None:
             is_vol = (curr['Volume'] / curr['Vol_MA20'] if curr['Vol_MA20'] > 0 else 1.0) > 1.5
             is_st = curr['SuperTrend_Up'] == 1
 
-            # --- 🚀 [升级1] 米奈尔维尼趋势模板 (Minervini Trend Template) ---
             if pd.notna(curr['SMA_200']) and pd.notna(curr['Low_52W']):
-                # 判定条件：收盘>50>150>200，且200日线向上倾斜，距离52周最低点至少反弹25%，距离最高点不超过25%
                 minervini_pass = (
                     curr['Close'] > curr['SMA_50'] > curr['SMA_150'] > curr['SMA_200'] and
                     curr['SMA_200'] > df['SMA_200'].iloc[-20] and
@@ -353,7 +367,6 @@ def run_tech_matrix() -> None:
                     score += int(8 * w_mul)
                     st_cnt += 1
 
-            # 相对强度
             if not qqq_df.empty:
                 m_df = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, how='inner')
                 if len(m_df) >= 20:
@@ -363,7 +376,6 @@ def run_tech_matrix() -> None:
                     elif rs_20 < 0.92:
                         sig.append(f"🐢 **[相对弱势]** 跑输大盘 {1-rs_20:.1%}"); score -= 3
 
-            # 自适应 RSI
             dyn_rsi = curr['RSI_P20'] if pd.notna(curr['RSI_P20']) else 30.0
             if curr['RSI'] < dyn_rsi and prev['RSI'] >= dyn_rsi:
                 if curr['Close'] > curr['EMA_50'] and is_st:
@@ -371,13 +383,11 @@ def run_tech_matrix() -> None:
                 else:
                     sig.append(f"⚠️ **[弱势超卖]**"); score += int((13 if regime=='bear' else 8) * 0.4)
 
-            # MACD
             if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
                 w = 10 if regime == 'bull' else 6
                 if curr['MACD'] > 0: sig.append("🔥 **[零上金叉]**"); score += int(w * w_mul); st_cnt += 1
                 else: sig.append("🔸 **[零下金叉]**"); score += int(w * 0.6)
 
-            # TTM Squeeze
             is_sqz = (curr['BB_Upper'] - curr['BB_Lower']) < (curr['KC_Upper'] - curr['KC_Lower'])
             was_sqz = ((df['BB_Upper'].iloc[-6:-1] < df['KC_Upper'].iloc[-6:-1]) & (df['BB_Lower'].iloc[-6:-1] > df['KC_Lower'].iloc[-6:-1])).any() if len(df)>=6 else False
             
@@ -386,17 +396,14 @@ def run_tech_matrix() -> None:
             elif was_sqz and not is_sqz and curr['MACD_Hist'] > 0 and curr['MACD_Hist'] > prev['MACD_Hist']:
                 sig.append("🚀 **[TTM Squeeze FIRE ↑]**"); score += int((18 if regime=='bull' else 10) * w_mul); st_cnt += 1
 
-            # 均线突破
             if prev['Close'] < prev['EMA_50'] and curr['Close'] > curr['EMA_50']:
                 if is_st and is_vol: sig.append("📈 **[有效突破]** 站上50日线"); score += int((9 if regime=='bull' else 5) * w_mul); st_cnt += 1
                 else: sig.append("📉 **[疲软突破]**"); score -= 3
 
-            # 资金动向 CMF
             cmf = curr['CMF']
             if cmf > 0.20: sig.append(f"🏦 **[机构高控盘]** (CMF:{cmf:.2f})"); score += int(5 * w_mul); st_cnt += 1
             elif cmf < -0.15: sig.append(f"⚠️ **[资金派发]** (CMF:{cmf:.2f})"); score -= 4
 
-            # 云图与噪音过滤
             if curr['Above_Cloud'] == 0:
                 score = int(score * 0.4); sig.append("☁️ **[云层压制]**")
             elif curr['Tenkan'] > curr['Kijun'] and curr['Cloud_Twist'] == 1:
@@ -410,7 +417,6 @@ def run_tech_matrix() -> None:
                 news = get_latest_news(sym)
                 if news: sig.append(news)
                 
-                # --- 🛡️ [升级2] 动态 ATR 止损线计算 ---
                 atr_stop = curr['Close'] - 1.5 * curr['ATR']
                 
                 reports.append({
@@ -418,7 +424,7 @@ def run_tech_matrix() -> None:
                     "score": score, 
                     "signals": sig[:8], 
                     "curr_close": curr['Close'], 
-                    "atr_stop": atr_stop,          # 将科学止损价存入供渲染
+                    "atr_stop": atr_stop,          
                     "turnover": curr['Close']*curr['Volume'], 
                     "sector": Config.get_sector_etf(sym), 
                     "raw_score": score
@@ -437,7 +443,6 @@ def run_tech_matrix() -> None:
                 for s in stks[1:]: s["score"] = int(s["raw_score"] * pen); s["is_crowded"] = True; s["crowding_penalty"] = pen
 
         reports.sort(key=lambda x: x["score"], reverse=True)
-        # --- 🛡️ [升级2] 在最终推送文本中直接展示防守止损线 ---
         txts = [f"**{r['symbol']}** (${r['curr_close']:.2f} | 🛡️ 止损: ${r['atr_stop']:.2f} | 🌟 {r['score']})\n> " + "\n> ".join(r["signals"]) for r in reports[:15]]
         
         send_alert("📊 全市场优选异动", f"{load_strategy_performance_tag()}*{vix_desc}*\n*{regime_desc}*\n\n" + "\n\n".join(txts) + f"\n\n*(门槛: {min_score}分 | 降权机制开启)*")
@@ -465,7 +470,8 @@ def run_backtest_engine() -> None:
     start_dt = (datetime.strptime(min([t['date'] for t in trades]), '%Y-%m-%d') - timedelta(days=5)).strftime('%Y-%m-%d')
 
     try:
-        df_c = yf.download(syms, start=start_dt, progress=False)['Close']
+        # 同样为批量下载加入 session
+        df_c = yf.download(syms, start=start_dt, progress=False, session=_YF_SESSION)['Close']
         if len(syms) == 1: df_c = pd.DataFrame(df_c, columns=syms)
         df_c.index = df_c.index.strftime('%Y-%m-%d')
     except Exception as e: return logger.error(f"批量回测拉取失败: {e}")
@@ -503,4 +509,4 @@ if __name__ == "__main__":
     elif m == "matrix": run_tech_matrix()
     elif m == "daily": send_alert("📝 占位", "每日复盘逻辑合并至 Matrix")
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("✅ 测试", "引擎响应正常！已载入米奈尔维尼与ATR止损系统。")
+    elif m == "test": send_alert("✅ 测试", "引擎响应正常！已载入全局反爬防封机制。")
