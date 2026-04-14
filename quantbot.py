@@ -11,7 +11,7 @@ import re
 import json
 import warnings
 from typing import List, Tuple
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # 忽略第三方库引发的各种杂音警告，保持 GitHub Actions 日志清爽
 warnings.filterwarnings('ignore')
@@ -46,12 +46,15 @@ class Config:
         'XLP': ['PEP', 'COST', 'MDLZ', 'KDP', 'KHC', 'MNST', 'WBA']
     }
 
-    # 新增：板块拥挤度过滤强度（0.6~0.9 之间，数值越小惩罚越狠）
+    # 板块拥挤度过滤强度（0.6~0.9 之间，数值越小惩罚越狠）
     CROWDING_PENALTY: float = 0.75
-    # 触发拥挤过滤的最低股票数量（≥2 即认为拥挤）
     CROWDING_MIN_STOCKS: int = 2
-    # 排除参与拥挤度计算的板块（避免将 fallback 的未映射股票全部当成同一个拥挤板块）
     CROWDING_EXCLUDE_SECTORS: List[str] = ["QQQ"]
+    
+    # 统一管理回测与日志的文件路径
+    LOG_FILE: str = "backtest_log.jsonl"
+    STATS_FILE: str = "strategy_stats.json"
+    REPORT_FILE: str = "backtest_report.md"
 
     @staticmethod
     def get_sector_etf(symbol: str) -> str:
@@ -68,7 +71,6 @@ def validate_config():
 
 # ================= 2. 数据与网络工具模块 =================
 
-# [新增优化] 全局新闻缓存，彻底避免短时间内重复拉取导致限流
 _NEWS_CACHE = {}
 
 def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", retries: int = 5, auto_adjust: bool = True, fast_mode: bool = False) -> pd.DataFrame:
@@ -100,13 +102,11 @@ def safe_get_history(symbol: str, period: str = "6mo", interval: str = "1d", ret
     return pd.DataFrame()
 
 def get_latest_news(symbol: str) -> str:
-    """轻量级实时新闻上下文拉取器 + 简易情感标签（带30分钟防限流缓存）"""
     current_time = time.time()
     
-    # [新增优化] 检查内存级缓存
     if symbol in _NEWS_CACHE:
         cached_time, cached_news = _NEWS_CACHE[symbol]
-        if current_time - cached_time < 1800: # 30分钟内复用
+        if current_time - cached_time < 1800:
             return cached_news
 
     try:
@@ -116,7 +116,6 @@ def get_latest_news(symbol: str) -> str:
             title = latest.get('title', '')
             publisher = latest.get('publisher', '')
             if title:
-                # 简易情感匹配（可继续扩充关键词）
                 lower_title = title.lower()
                 if any(kw in lower_title for kw in ['beat', 'raise', 'upgrade', 'strong', 'surge', 'rally', 'buy', 'bullish', 'record', 'profit', 'revenue growth']):
                     sentiment = "🟢 [利好]"
@@ -131,21 +130,14 @@ def get_latest_news(symbol: str) -> str:
     except Exception as e:
         logger.debug(f"[{symbol}] 新闻拉取失败: {e}")
         
-    # 获取失败也写入缓存空值，防止循环请求
     _NEWS_CACHE[symbol] = (current_time, "")
     return ""
 
 def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
-    """
-    [漏斗式预过滤机制] 
-    抓取 S&P 500 + S&P 400 + Nasdaq 100 基础名单，通过批量极速下载5天数据，
-    筛选出全市场资金最活跃、流动性最好的标的进行深度扫描。
-    """
     logger.info(">>> 启动漏斗过滤：获取全市场基础名单 (S&P 500 + S&P 400 + Nasdaq 100)...")
-    tickers = set(Config.CORE_WATCHLIST) # 使用 Set 自动完美去重，杜绝任何重复计算
+    tickers = set(Config.CORE_WATCHLIST)
     
     try:
-        # 1. 抓取标普 500
         url_sp500 = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
         tables_sp500 = pd.read_html(url_sp500)
         for table in tables_sp500:
@@ -154,18 +146,15 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
                 tickers.update(sp500_tickers)
                 break
                 
-        # 2. [新增] 抓取标普中盘 400 (S&P MidCap 400)
         url_sp400 = 'https://en.wikipedia.org/wiki/List_of_S%26P_400_companies'
         tables_sp400 = pd.read_html(url_sp400)
         for table in tables_sp400:
-            # 维基百科的列名有时是 'Symbol' 或 'Ticker symbol'
             col = 'Symbol' if 'Symbol' in table.columns else ('Ticker symbol' if 'Ticker symbol' in table.columns else None)
             if col:
                 sp400_tickers = table[col].dropna().astype(str).str.replace('.', '-').tolist()
                 tickers.update(sp400_tickers)
                 break
         
-        # 3. 抓取纳指 100
         url_ndx = 'https://en.wikipedia.org/wiki/Nasdaq-100'
         tables_ndx = pd.read_html(url_ndx, match='Ticker|Symbol')
         for table in tables_ndx:
@@ -180,7 +169,6 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
     logger.info(f"✅ 成功获取基础名单 {len(tickers_list)} 只股票(已自动去重)。开始分块获取近期数据进行漏斗粗筛...")
     
     try:
-        # 4. [防封禁升级] 分块拉取最近 5 天的数据 (Chunking 机制)
         chunk_size = 300
         dfs = []
         
@@ -192,33 +180,26 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
             if not chunk_df.empty:
                 dfs.append(chunk_df)
                 
-            # 每批次拉取后，随机休眠 2~3.5 秒，完美伪装人类请求，杜绝 HTTP 429 封禁
             if i + chunk_size < len(tickers_list):
                 time.sleep(random.uniform(2.0, 3.5))
                 
         if not dfs:
             raise ValueError("所有分块批量下载均失败或返回空数据")
             
-        # 将所有分块的 DataFrame 横向安全拼接
         df = pd.concat(dfs, axis=1)
         
         if df.empty or not isinstance(df.columns, pd.MultiIndex):
             raise ValueError("分块拼接后的数据异常或结构非 MultiIndex")
             
-        # 5. 提取最新收盘价和 5 日平均成交量 (加入 dropna 剔除退市或无效的标的)
         close_df = df['Close'].dropna(axis=1, how='all')
         volume_df = df['Volume'].dropna(axis=1, how='all')
         
         closes = close_df.ffill().iloc[-1]
         volumes = volume_df.mean()
         
-        # 确保索引对齐后计算 5 日平均成交额 (换手力度)
         turnovers = (closes * volumes).dropna()
-        
-        # 5. 核心过滤逻辑：剔除低价股 (<10美元) 与不活跃股 (<100万均量)
         valid_turnovers = turnovers[(closes > 10.0) & (volumes > 1000000)]
         
-        # 排序并截取前 max_stocks 名
         top_tickers = valid_turnovers.sort_values(ascending=False).head(max_stocks).index.tolist()
         
         if top_tickers:
@@ -232,17 +213,15 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
         return Config.CORE_WATCHLIST
 
 def escape_md_v2(text: str) -> str:
-    """Telegram MarkdownV2 完整转义（必须在发送前调用）"""
     escape_chars = r"_*[]()~`>#+-=|{}.!"
     return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
 
 def load_strategy_performance_tag() -> str:
     """[协同功能] 读取回测系统生成的最新胜率数据，作为推送战绩标签"""
     try:
-        if os.path.exists("strategy_stats.json"):
-            with open("strategy_stats.json", "r", encoding="utf-8") as f:
+        if os.path.exists(Config.STATS_FILE):
+            with open(Config.STATS_FILE, "r", encoding="utf-8") as f:
                 stats = json.load(f)
-                # 默认展示 T+3 的表现，这通常是波段交易最核心的指标
                 t3 = stats.get("T+3")
                 if t3 and t3.get('total_trades', 0) > 0:
                     return f"📈 **策略历史表现 (T+3)**: 胜率 **{t3['win_rate']:.1%}** | 均收益 **{t3['avg_ret']:+.2%}**\n\n"
@@ -251,10 +230,12 @@ def load_strategy_performance_tag() -> str:
     return ""
 
 def send_alert(title: str, content: str) -> None:
-    """多渠道广播中心 (Webhook + Telegram)"""
+    if not content.strip():
+        logger.warning(f"⚠️ 警告内容为空，跳过推送：{title}")
+        return
+
     formatted_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     
-    # 1. 钉钉/飞书/企微 Webhook 推送
     if Config.WEBHOOK_URL:
         payload = {
             "msgtype": "markdown",
@@ -272,11 +253,9 @@ def send_alert(title: str, content: str) -> None:
             except Exception as e:
                 logger.error(f"Webhook 推送异常: {e}")
                 
-    # 2. Telegram Bot 推送（升级为 MarkdownV2）
     if Config.TELEGRAM_BOT_TOKEN and Config.TELEGRAM_CHAT_ID:
         tg_url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage"
         
-        # 使用 escape_md_v2 对所有动态内容进行转义
         safe_title = escape_md_v2(title)
         safe_content = escape_md_v2(content)
         safe_time = escape_md_v2(formatted_time)
@@ -286,7 +265,7 @@ def send_alert(title: str, content: str) -> None:
         tg_payload = {
             "chat_id": Config.TELEGRAM_CHAT_ID,
             "text": tg_text,
-            "parse_mode": "MarkdownV2",   # ← 关键升级
+            "parse_mode": "MarkdownV2",
             "disable_web_page_preview": True
         }
         try:
@@ -422,7 +401,6 @@ def _add_atr_and_supertrend(df: pd.DataFrame) -> None:
     df['SuperTrend_Up'] = in_uptrend.astype(int) 
 
 def _add_channels(df: pd.DataFrame) -> None:
-    # 明确使用 df['TR'] 保证不出现 NaN 回退问题
     df['ATR_20'] = df['TR'].rolling(window=20).mean()
         
     df['KC_Upper'] = df['EMA_20'] + 1.5 * df['ATR_20']
@@ -433,7 +411,6 @@ def _add_channels(df: pd.DataFrame) -> None:
     df['BB_Upper'] = df['BB_MA20'] + 2 * df['BB_STD20']
     df['BB_Lower'] = df['BB_MA20'] - 2 * df['BB_STD20']
     
-    # [新增] 布林带宽度 (Bollinger Bands Width)
     df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_MA20']
 
 def _add_ichimoku(df: pd.DataFrame) -> None:
@@ -476,7 +453,6 @@ def _add_event_risk(df: pd.DataFrame) -> None:
     if consecutive_high_vol >= 3:
         risk_score += 0.3
         
-    # --- [新增优化] 价格跳空确认 (已加入除零保护) ---
     prev_close = df['Close'].iloc[-2]
     gap_today = abs((df['Open'].iloc[-1] - prev_close) / prev_close) if prev_close != 0 else 0
     if gap_today > 0.06:
@@ -485,18 +461,12 @@ def _add_event_risk(df: pd.DataFrame) -> None:
     df['Event_Risk'] = min(1.0, risk_score)
 
 def _add_institutional_factor(df: pd.DataFrame) -> None:
-    """[新增] 计算 Chaikin Money Flow (CMF) 模拟机构控盘度与资金流向"""
-    # 避免 high == low 时的除零错误
     hl_diff = df['High'] - df['Low']
     hl_diff = hl_diff.replace(0, 1e-10)
     
-    # Money Flow Multiplier (资金流量乘数: 衡量收盘价在日内的强弱位置)
     mfm = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / hl_diff
-    
-    # Money Flow Volume (资金流量)
     mfv = mfm * df['Volume']
     
-    # 20日 CMF (周期内资金流量总和 / 周期内总成交量)
     if len(df) >= 20:
         df['CMF'] = mfv.rolling(window=20).sum() / df['Volume'].rolling(window=20).sum()
     else:
@@ -512,7 +482,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     _add_channels(df)
     _add_ichimoku(df)
     _add_event_risk(df) 
-    _add_institutional_factor(df) # 加入机构控盘度因子计算
+    _add_institutional_factor(df) 
     return df
 
 # ================= 5. 业务策略模块 =================
@@ -535,7 +505,6 @@ def run_volatility_sentinel() -> None:
             curr_price = df['Close'].ffill().iloc[-1]
             open_price = df['Open'].iloc[-1] 
             
-            # [加固] 防止极端情况下开盘价为 0 导致除零溢出崩溃
             hour_change = (curr_price - open_price) / open_price * 100 if open_price != 0 else 0.0
             if abs(hour_change) > 3:
                 alerts.append(f"> **{symbol}** 短线异动 {'🚀' if hour_change > 0 else '🩸'} \n> 1小时内波动: **{hour_change:+.2f}%** (现价: ${curr_price:.2f})")
@@ -573,7 +542,6 @@ def run_tech_matrix() -> None:
         if not sdf.empty and len(sdf) >= 20:
             sector_data[etf] = (sdf['Close'].ffill().iloc[-1] / sdf['Close'].iloc[-20]) - 1
 
-    # === 市场健康自适应权重引擎 ===
     avg_sector_strength = np.mean(list(sector_data.values())) if sector_data else 0.0
     health_score = 0.0
     
@@ -587,7 +555,7 @@ def run_tech_matrix() -> None:
         health_score = 0.6
     elif regime == 'bear':
         health_score = -0.7
-    else:  # range 震荡市
+    else:
         sector_strength_capped = max(-0.2, min(0.2, float(avg_sector_strength)))
         health_score = 0.0 if sector_strength_capped < 0.01 else sector_strength_capped * 2
 
@@ -618,7 +586,6 @@ def run_tech_matrix() -> None:
             curr = df.iloc[-1]
             prev = df.iloc[-2]
             
-            # --- 事件风险防雷网 (The Event Risk Filter) ---
             event_risk = curr.get('Event_Risk', 0.0)
             if event_risk > 0.85:
                 logger.debug(f"[{symbol}] 检测到极高事件风险(量价突变)，防雷网直接跳过。")
@@ -639,7 +606,6 @@ def run_tech_matrix() -> None:
 
             strong_signals_count = 0
 
-            # --- 相对强度 (RS) 包含板块轮动比较 ---
             rs_20, rs_5 = 1.0, 1.0
             if not qqq_df.empty:
                 merged = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, how='inner', suffixes=('_stock', '_qqq'))
@@ -673,9 +639,6 @@ def run_tech_matrix() -> None:
                 signals.append(f"🐢 **[相对弱势]** 跑输大盘 {(1-rs_20):.1%}")
                 score -= 3
 
-            # --- 严格共振引擎 (Adaptive Weights) ---
-            
-            # 1. 自适应 RSI 超卖策略
             if curr['RSI'] < dynamic_rsi_threshold and prev['RSI'] >= dynamic_rsi_threshold:
                 weight = 13 if regime == 'bear' else 8 
                 if curr['Close'] > curr['EMA_50'] and is_strong_trend:
@@ -686,7 +649,6 @@ def run_tech_matrix() -> None:
                     signals.append(f"⚠️ **[弱势超卖]** 逆势防范接飞刀")
                     score += int(weight * 0.4)
             
-            # 2. RSI 底背离
             price_low_5 = df['Close'].iloc[-5:].min()
             idx_low_5 = df['Close'].iloc[-5:].idxmin()
             rsi_at_low_5 = df['RSI'].loc[idx_low_5]
@@ -700,7 +662,6 @@ def run_tech_matrix() -> None:
                 score += int(weight * weight_multiplier)
                 strong_signals_count += 1
             
-            # 3. MACD 策略
             if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
                 weight = 10 if regime == 'bull' else 6 
                 if curr['MACD'] < 0:
@@ -711,7 +672,6 @@ def run_tech_matrix() -> None:
                     score += int(weight * weight_multiplier)
                     strong_signals_count += 1
 
-            # 4. TTM Squeeze 原汁原味破位点火版
             bb_abs = curr['BB_Upper'] - curr['BB_Lower']
             kc_abs = curr['KC_Upper'] - curr['KC_Lower']
             is_squeeze_on = bb_abs < kc_abs
@@ -750,7 +710,6 @@ def run_tech_matrix() -> None:
                 signals.append("🔻 **[TTM Squeeze FIRE ↓]** 空头动量释放，警惕下杀")
                 score -= 8 
 
-            # 5. 均线突破
             if prev['Close'] < prev['EMA_50'] and curr['Close'] > curr['EMA_50']:
                 weight = 9 if regime == 'bull' else 5
                 if is_strong_trend and is_volume_confirmed:
@@ -761,7 +720,6 @@ def run_tech_matrix() -> None:
                     signals.append(f"📉 **[疲软突破]** 站上50日均线 (缺乏量能或大级别趋势配合)")
                     score -= 3 
 
-            # --- [新增] 机构控盘度因子 (CMF) ---
             cmf = curr.get('CMF', 0.0)
             if cmf > 0.20:
                 signals.append(f"🏦 **[机构高度控盘]** 资金呈强净流入态势 (CMF: {cmf:.2f})")
@@ -774,16 +732,13 @@ def run_tech_matrix() -> None:
                 signals.append(f"⚠️ **[资金派发中]** 机构疑似撤退，动能不足 (CMF: {cmf:.2f})")
                 score -= 4
                 
-            # --- [新增] 布林带极致压缩形态 (大变盘前兆) ---
             bb_width = curr.get('BB_Width', 1.0)
             if len(df) >= 60:
                 past_width_min = df['BB_Width'].iloc[-60:-1].min()
-                # 若带宽极窄 (<6%)，或达到了过去60天的最低点附近，说明波动率枯竭
                 if bb_width < 0.06 or bb_width <= past_width_min * 1.1:
                     signals.append(f"🗜️ **[布林带极致收口]** 波动率降至冰点 (宽幅 {bb_width:.1%})，即将迎来大级别变盘！")
                     score += 4
 
-            # --- 全局趋势阀门 (ICHIMOKU Master Trend Filter) ---
             above_cloud = curr.get('Above_Cloud', 0) == 1
             cloud_twist = curr.get('Cloud_Twist', 0) == 1
             tenkan_above_kijun = curr.get('Tenkan', 0) > curr.get('Kijun', 0)
@@ -798,7 +753,6 @@ def run_tech_matrix() -> None:
                     score += int(6 * weight_multiplier)
                     strong_signals_count += 1
 
-            # --- 事件风险惩罚 (财报/突发异动防雷网应用) ---
             event_risk = curr.get('Event_Risk', 0.0)
             if event_risk > 0.85:
                 score = int(score * 0.2)  
@@ -807,7 +761,6 @@ def run_tech_matrix() -> None:
                 score = int(score * (1 - event_risk))
                 signals.append("⚠️ **[事件风险预警]** 近期量价异常(疑似事件窗口)，防守降权")
 
-            # === 全局共振噪音过滤器 ===
             if score > 0 and strong_signals_count < 1 and not is_volume_confirmed:
                 score = int(score * 0.3) 
 
@@ -819,7 +772,6 @@ def run_tech_matrix() -> None:
                 signals.append("🎯 **[严密共振确认]** 多维度技术面与趋势共振达成！")
                 score += 5
 
-            # --- 周线共振 (高门槛懒加载) ---
             if signals and score >= 15:
                 weekly_trend = get_weekly_trend(symbol)
                 if weekly_trend == "bullish":
@@ -829,7 +781,6 @@ def run_tech_matrix() -> None:
                     signals.append("⚠️ **[周线逆风]** 长期趋势空头，严防诱多陷阱")
                     score -= 4 
 
-            # --- 推送阈值验证与即时新闻加载 (JIT News Context) ---
             if signals:
                 if score < min_score_dynamic:
                     continue
@@ -843,7 +794,6 @@ def run_tech_matrix() -> None:
                     
                 turnover = curr['Close'] * curr['Volume']
                 
-                # === 优化：以结构化形式保存数据供后处理，移除字符串替换隐患 ===
                 reports.append({
                     "symbol": symbol,
                     "score": score,
@@ -857,16 +807,13 @@ def run_tech_matrix() -> None:
         except Exception as e:
             logger.debug(f"[{symbol}] 分析发生静默错误: {e}")
 
-    # ====================== 板块拥挤度与动量后处理（动态进化版）======================
     if reports:
         from collections import defaultdict
         sector_groups = defaultdict(list)
         for r in reports:
             sector_groups[r["sector"]].append(r)
             
-        # 对每个板块进行后处理分析
         for sector, stocks in sector_groups.items():
-            # 1. 板块动量过滤 (Sector Momentum Filter)
             sector_ret = sector_data.get(sector, 0.0)
             is_weak_sector = sector_ret < -0.02 and sector not in Config.CROWDING_EXCLUDE_SECTORS
             momentum_penalty = 0.7 if health_score < 0 else 0.85
@@ -877,27 +824,21 @@ def run_tech_matrix() -> None:
                     stock["is_weak_sector"] = True
                     stock["momentum_penalty"] = momentum_penalty
                     
-            # 2. 板块拥挤度惩罚 (Crowding Penalty)
             if sector not in Config.CROWDING_EXCLUDE_SECTORS and len(stocks) >= Config.CROWDING_MIN_STOCKS:
-                # 重新按当前得分(可能已被弱势降权)排序，找出领涨股
                 stocks.sort(key=lambda x: x["score"], reverse=True)
                 
-                # 动态惩罚系数：市场越健康，惩罚越轻（牛市允许适度抱团）
                 dynamic_penalty = Config.CROWDING_PENALTY * (1.0 + health_score * 0.3)
                 dynamic_penalty = max(0.6, min(0.9, dynamic_penalty))
                 
-                # 对非领涨股统一施加拥挤惩罚并打标
                 for stock in stocks[1:]:
-                    if not stock.get("is_weak_sector"): # 避免双重过度降权，或者可以视情况叠加
+                    if not stock.get("is_weak_sector"):
                         stock["score"] = int(stock["raw_score"] * dynamic_penalty)
                         stock["is_crowded"] = True
                         stock["crowding_penalty"] = dynamic_penalty
 
-        # 重新按最终得分排序
         reports.sort(key=lambda x: x["score"], reverse=True)
         top_reports_text = []
         
-        # 统一执行最终文本生成
         for r in reports[:15]:
             turnover_str = f"${r['turnover']/1e9:.2f}B" if r['turnover'] >= 1e9 else f"${r['turnover']/1e6:.2f}M"
             
@@ -910,10 +851,8 @@ def run_tech_matrix() -> None:
             text = f"**{r['symbol']}** (${r['curr_close']:.2f} | 额: {turnover_str} | 🌟动态评分: {score_display})\n> " + "\n> ".join(r["signals"])
             top_reports_text.append(text)
         
-        # [联动回测系统] 获取历史战绩标签
         perf_tag = load_strategy_performance_tag()
         
-        # 将胜率标签拼接在报告最上方
         final_report = f"{perf_tag}*{vix_desc}*\n*{regime_desc}*\n\n" + "\n\n".join(top_reports_text)
         
         if len(reports) > 15:
@@ -923,7 +862,6 @@ def run_tech_matrix() -> None:
             
         send_alert("📊 全市场优选异动池", final_report)
         
-        # --- 历史回测数据持久化 (JSON Lines) ---
         try:
             log_data = {
                 "date": datetime.now(timezone.utc).strftime('%Y-%m-%d'),
@@ -942,9 +880,9 @@ def run_tech_matrix() -> None:
                     } for r in reports[:15]
                 ]
             }
-            with open("backtest_log.jsonl", "a", encoding="utf-8") as f:
+            with open(Config.LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(log_data, ensure_ascii=False) + "\n")
-            logger.info("✅ 历史回测日志已追加至 backtest_log.jsonl")
+            logger.info(f"✅ 历史回测日志已追加至 {Config.LOG_FILE}")
         except Exception as e:
             logger.error(f"写入回测日志失败: {e}")
             
@@ -980,7 +918,130 @@ def run_daily_screener() -> None:
     report = f"🎯 **今日全市场高优股票扫描总结**\n\n**📈 绝对多头排列 (强势)**\n> {', '.join(bullish) if bullish else '无'}\n\n**📉 绝对空头排列 (弱势)**\n> {', '.join(bearish) if bearish else '无'}"
     send_alert("📝 全市场优选股复盘", report)
 
-# ================= 6. 入口模块 =================
+# ================= 6. 终极回测引击模块 =================
+def run_backtest_engine() -> None:
+    """自动化评估历史推荐表现，并推送周报"""
+    logger.info(">>> 启动终极历史绩效回测引擎...")
+    if not os.path.exists(Config.LOG_FILE):
+        logger.warning(f"⚠️ 找不到历史日志文件 {Config.LOG_FILE}，跳过回测。请先运行常规扫描积累数据。")
+        return
+
+    logs = []
+    with open(Config.LOG_FILE, 'r', encoding='utf-8') as f:
+        for line in f:
+            try:
+                logs.append(json.loads(line.strip()))
+            except:
+                pass
+
+    trades = []
+    for log in logs:
+        log_date = log.get('date')
+        for pick in log.get('top_picks', []):
+            trades.append({
+                'date': log_date,
+                'symbol': pick['symbol'],
+                'score': pick['score']
+            })
+
+    if not trades:
+        logger.warning("历史记录中没有有效的选股数据。")
+        return
+
+    unique_symbols = list(set([t['symbol'] for t in trades]))
+    earliest_date = min([t['date'] for t in trades])
+    start_date = (datetime.strptime(earliest_date, '%Y-%m-%d') - timedelta(days=5)).strftime('%Y-%m-%d')
+
+    logger.info(f"⏳ 正在向 Yahoo Finance 批量拉取 {len(unique_symbols)} 只曾上榜股票进行真实回测...")
+    try:
+        df_download = yf.download(unique_symbols, start=start_date, progress=False)
+        df_close = df_download['Close'] if 'Close' in df_download else df_download
+        if len(unique_symbols) == 1:
+            df_close = pd.DataFrame(df_close)
+            df_close.columns = unique_symbols
+        df_close.index = df_close.index.strftime('%Y-%m-%d')
+    except Exception as e:
+        logger.error(f"❌ 拉取历史数据失败: {e}")
+        return
+
+    stats = {'T+1': [], 'T+3': [], 'T+5': []}
+    logger.info("⚙️ 正在逐笔匹配交易日并计算 T+N 真实收益率...")
+    for trade in trades:
+        sym = trade['symbol']
+        rec_date = trade['date']
+        if sym not in df_close.columns:
+            continue
+
+        valid_dates = df_close.index[df_close.index >= rec_date]
+        if len(valid_dates) == 0:
+            continue
+
+        entry_date = valid_dates[0]
+        entry_idx = df_close.index.get_loc(entry_date)
+        entry_price = df_close.at[entry_date, sym]
+
+        if pd.isna(entry_price) or entry_price <= 0:
+            continue
+
+        for t_days in [1, 3, 5]:
+            exit_idx = entry_idx + t_days
+            if exit_idx < len(df_close):
+                exit_price = df_close.iloc[exit_idx][sym]
+                if not pd.isna(exit_price):
+                    ret = (exit_price - entry_price) / entry_price
+                    stats[f'T+{t_days}'].append(ret)
+
+    results = {}
+    for period, returns in stats.items():
+        if returns:
+            win_count = sum(1 for r in returns if r > 0)
+            results[period] = {
+                'win_rate': win_count / len(returns),
+                'avg_ret': sum(returns) / len(returns),
+                'total_trades': len(returns)
+            }
+
+    if not results:
+        logger.info("💤 暂无足够交易闭环数据进行评估。")
+        return
+
+    try:
+        with open(Config.STATS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=4)
+    except Exception as e:
+        logger.error(f"写入回测统计 JSON 失败: {e}")
+
+    alert_lines = []
+    md_lines = [
+        "# 📈 自动化量化监控战报 (Auto-Backtest Report)",
+        f"**最后更新时间:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        "",
+        "| 持仓周期 | 胜率 (Win Rate) | 平均收益 (Avg Return) | 样本交易笔数 |",
+        "| :---: | :---: | :---: | :---: |"
+    ]
+
+    for period in ['T+1', 'T+3', 'T+5']:
+        if period in results:
+            data = results[period]
+            wr_str = f"{data['win_rate']*100:.1f}%"
+            ar_str = f"{data['avg_ret']*100:+.2f}%"
+            trds = data['total_trades']
+            md_lines.append(f"| **{period}** | {wr_str} | {ar_str} | {trds} |")
+            alert_lines.append(f"> ⏱️ **{period} 持仓**: 胜率 **{wr_str}** | 均收益 **{ar_str}** (样本: {trds}笔)")
+        else:
+            md_lines.append(f"| **{period}** | N/A | N/A | 0 |")
+
+    try:
+        with open(Config.REPORT_FILE, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(md_lines))
+    except Exception as e:
+        logger.error(f"写入 Markdown 失败: {e}")
+
+    alert_text = "\n\n".join(alert_lines) + "\n\n*(注：数据已同步至 GitHub 代码库，回测包含所有往期历史表现，未剔除滑点摩擦)*"
+    send_alert("📅 终极策略历史回测周报", alert_text)
+    logger.info("====== ✅ 回测评估与周报推送完成 ======")
+
+# ================= 7. 统一入口 =================
 if __name__ == "__main__":
     validate_config()
     mode = sys.argv[1] if len(sys.argv) > 1 else "sentinel"
@@ -992,13 +1053,15 @@ if __name__ == "__main__":
         run_tech_matrix()
     elif mode == "daily":
         run_daily_screener()
+    elif mode == "backtest":
+        run_backtest_engine()
     elif mode == "test":
         regime, desc, qqq_df = get_market_regime()
         vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
         test_tickers = get_filtered_watchlist(max_stocks=5)
         send_alert(
             "✅ Pro 量化引擎部署成功", 
-            f"已集成 [JIT 实时新闻解析] 与 [漏斗过滤机制]！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"已集成 [JIT新闻] + [漏斗过滤] + [回测闭环]！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
