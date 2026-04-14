@@ -1,6 +1,6 @@
-Tickeron Pro AI Bot 核心环境依赖
+#Tickeron Pro AI Bot 核心环境依赖
 
-严格锁定版本，确保 GitHub Actions 无人值守时的绝对稳定
+#严格锁定版本，确保 GitHub Actions 无人值守时的绝对稳定
 
 yfinance==0.2.36
 pandas==2.1.0
@@ -8,6 +8,6 @@ numpy==1.26.0
 requests==2.31.0
 lxml==4.9.3
 
-DevOps 质检工具
+#DevOps 质检工具
 
 flake8==6.1.0
