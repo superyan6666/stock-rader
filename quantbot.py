@@ -9,8 +9,12 @@ import random
 import logging
 import re
 import json
+import warnings
 from typing import List, Tuple
 from datetime import datetime, timezone
+
+# 忽略第三方库引发的各种杂音警告，保持 GitHub Actions 日志清爽
+warnings.filterwarnings('ignore')
 
 # ================= 1. 日志与配置管理 =================
 logging.basicConfig(
@@ -127,31 +131,104 @@ def get_latest_news(symbol: str) -> str:
     except Exception as e:
         logger.debug(f"[{symbol}] 新闻拉取失败: {e}")
         
-    # 获取失败也写入缓存空值，防止循环请求
+        # 获取失败也写入缓存空值，防止循环请求
     _NEWS_CACHE[symbol] = (current_time, "")
     return ""
 
-def get_nasdaq_100() -> List[str]:
-    logger.info(">>> 正在联网获取最新 纳斯达克 100 成分股名单...")
+def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
+    """
+    [漏斗式预过滤机制] 
+    抓取 S&P 500 + S&P 400 + Nasdaq 100 基础名单，通过批量极速下载5天数据，
+    筛选出全市场资金最活跃、流动性最好的标的进行深度扫描。
+    """
+    logger.info(">>> 启动漏斗过滤：获取全市场基础名单 (S&P 500 + S&P 400 + Nasdaq 100)...")
+    tickers = set(Config.CORE_WATCHLIST) # 使用 Set 自动完美去重，杜绝任何重复计算
+    
     try:
-        url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
-        headers = {'User-Agent': 'Mozilla/5.0 (compatible; QuantBot/2.0)'}
-        response = requests.get(url, headers=headers, timeout=20)
+        # 1. 抓取标普 500
+        url_sp500 = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+        tables_sp500 = pd.read_html(url_sp500)
+        for table in tables_sp500:
+            if 'Symbol' in table.columns:
+                sp500_tickers = table['Symbol'].dropna().astype(str).str.replace('.', '-').tolist()
+                tickers.update(sp500_tickers)
+                break
+                
+        # 2. [新增] 抓取标普中盘 400 (S&P MidCap 400)
+        url_sp400 = 'https://en.wikipedia.org/wiki/List_of_S%26P_400_companies'
+        tables_sp400 = pd.read_html(url_sp400)
+        for table in tables_sp400:
+            # 维基百科的列名有时是 'Symbol' 或 'Ticker symbol'
+            col = 'Symbol' if 'Symbol' in table.columns else ('Ticker symbol' if 'Ticker symbol' in table.columns else None)
+            if col:
+                sp400_tickers = table[col].dropna().astype(str).str.replace('.', '-').tolist()
+                tickers.update(sp400_tickers)
+                break
         
-        tables = pd.read_html(response.text, match='Ticker|Symbol')
-        
-        for table in tables:
-            if ('Ticker' in table.columns or 'Symbol' in table.columns) and len(table) > 90:
-                col_name = 'Ticker' if 'Ticker' in table.columns else 'Symbol'
-                tickers = [str(t).replace('.', '-').strip() for t in table[col_name].dropna() if len(str(t).strip()) <= 6]
-                if len(tickers) > 90:
-                    logger.info(f"✅ 成功获取 {len(tickers)} 只纳斯达克 100 股票！")
-                    return tickers
-                    
-        logger.error("❌ 页面中未找到超过90行的有效成分股表格。")
-        return Config.CORE_WATCHLIST
+        # 3. 抓取纳指 100
+        url_ndx = 'https://en.wikipedia.org/wiki/Nasdaq-100'
+        tables_ndx = pd.read_html(url_ndx, match='Ticker|Symbol')
+        for table in tables_ndx:
+            col = 'Ticker' if 'Ticker' in table.columns else 'Symbol'
+            ndx_tickers = table[col].dropna().astype(str).str.replace('.', '-').tolist()
+            tickers.update(ndx_tickers)
+            
     except Exception as e:
-        logger.error(f"❌ 获取名单解析失败，使用备用核心名单: {e}")
+        logger.warning(f"⚠️ 获取维基百科名单部分失败: {e}")
+        
+    tickers_list = list(tickers)
+    logger.info(f"✅ 成功获取基础名单 {len(tickers_list)} 只股票(已自动去重)。开始分块获取近期数据进行漏斗粗筛...")
+    
+    try:
+        # 4. [防封禁升级] 分块拉取最近 5 天的数据 (Chunking 机制)
+        chunk_size = 300
+        dfs = []
+        
+        for i in range(0, len(tickers_list), chunk_size):
+            chunk = tickers_list[i:i + chunk_size]
+            logger.info(f"⏳ 正在拉取第 {i//chunk_size + 1} 批基础数据 (包含 {len(chunk)} 只股票)...")
+            
+            chunk_df = yf.download(chunk, period="5d", progress=False)
+            if not chunk_df.empty:
+                dfs.append(chunk_df)
+                
+            # 每批次拉取后，随机休眠 2~3.5 秒，完美伪装人类请求，杜绝 HTTP 429 封禁
+            if i + chunk_size < len(tickers_list):
+                time.sleep(random.uniform(2.0, 3.5))
+                
+        if not dfs:
+            raise ValueError("所有分块批量下载均失败或返回空数据")
+            
+        # 将所有分块的 DataFrame 横向安全拼接
+        df = pd.concat(dfs, axis=1)
+        
+        if df.empty or not isinstance(df.columns, pd.MultiIndex):
+            raise ValueError("分块拼接后的数据异常或结构非 MultiIndex")
+            
+        # 5. 提取最新收盘价和 5 日平均成交量 (加入 dropna 剔除退市或无效的标的)
+        close_df = df['Close'].dropna(axis=1, how='all')
+        volume_df = df['Volume'].dropna(axis=1, how='all')
+        
+        closes = close_df.ffill().iloc[-1]
+        volumes = volume_df.mean()
+        
+        # 确保索引对齐后计算 5 日平均成交额 (换手力度)
+        turnovers = (closes * volumes).dropna()
+        
+        # 5. 核心过滤逻辑：剔除低价股 (<10美元) 与不活跃股 (<100万均量)
+        valid_turnovers = turnovers[(closes > 10.0) & (volumes > 1000000)]
+        
+        # 排序并截取前 max_stocks 名
+        top_tickers = valid_turnovers.sort_values(ascending=False).head(max_stocks).index.tolist()
+        
+        if top_tickers:
+            logger.info(f"✅ 漏斗过滤完成！精选出全市场最活跃的 {len(top_tickers)} 只股票进入深度分析矩阵。")
+            return top_tickers
+        else:
+            raise ValueError("过滤后满足条件的名单为空")
+            
+    except Exception as e:
+        logger.error(f"❌ 批量拉取或漏斗过滤失败: {e}。启动降级安全方案。")
         return Config.CORE_WATCHLIST
 
 def escape_md_v2(text: str) -> str:
@@ -341,6 +418,9 @@ def _add_channels(df: pd.DataFrame) -> None:
     df['BB_STD20'] = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = df['BB_MA20'] + 2 * df['BB_STD20']
     df['BB_Lower'] = df['BB_MA20'] - 2 * df['BB_STD20']
+    
+    # [新增] 布林带宽度 (Bollinger Bands Width)
+    df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_MA20']
 
 def _add_ichimoku(df: pd.DataFrame) -> None:
     high9 = df['High'].rolling(9).max()
@@ -390,6 +470,24 @@ def _add_event_risk(df: pd.DataFrame) -> None:
         
     df['Event_Risk'] = min(1.0, risk_score)
 
+def _add_institutional_factor(df: pd.DataFrame) -> None:
+    """[新增] 计算 Chaikin Money Flow (CMF) 模拟机构控盘度与资金流向"""
+    # 避免 high == low 时的除零错误
+    hl_diff = df['High'] - df['Low']
+    hl_diff = hl_diff.replace(0, 1e-10)
+    
+    # Money Flow Multiplier (资金流量乘数: 衡量收盘价在日内的强弱位置)
+    mfm = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / hl_diff
+    
+    # Money Flow Volume (资金流量)
+    mfv = mfm * df['Volume']
+    
+    # 20日 CMF (周期内资金流量总和 / 周期内总成交量)
+    if len(df) >= 20:
+        df['CMF'] = mfv.rolling(window=20).sum() / df['Volume'].rolling(window=20).sum()
+    else:
+        df['CMF'] = 0.0
+
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['Close'] = df['Close'].ffill()
     df['Volume'] = df['Volume'].ffill()
@@ -400,6 +498,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     _add_channels(df)
     _add_ichimoku(df)
     _add_event_risk(df) 
+    _add_institutional_factor(df) # 加入机构控盘度因子计算
     return df
 
 # ================= 5. 业务策略模块 =================
@@ -422,7 +521,8 @@ def run_volatility_sentinel() -> None:
             curr_price = df['Close'].ffill().iloc[-1]
             open_price = df['Open'].iloc[-1] 
             
-            hour_change = (curr_price - open_price) / open_price * 100
+            # [加固] 防止极端情况下开盘价为 0 导致除零溢出崩溃
+            hour_change = (curr_price - open_price) / open_price * 100 if open_price != 0 else 0.0
             if abs(hour_change) > 3:
                 alerts.append(f"> **{symbol}** 短线异动 {'🚀' if hour_change > 0 else '🩸'} \n> 1小时内波动: **{hour_change:+.2f}%** (现价: ${curr_price:.2f})")
                 
@@ -484,7 +584,7 @@ def run_tech_matrix() -> None:
     
     logger.info(f"市场健康度: {health_score:.2f} | 权重倍增器: {weight_multiplier:.2f} | 动态门槛: {min_score_dynamic}")
             
-    target_list = get_nasdaq_100()
+    target_list = get_filtered_watchlist()
     total_stocks = len(target_list)
     reports = []
     
@@ -647,6 +747,28 @@ def run_tech_matrix() -> None:
                     signals.append(f"📉 **[疲软突破]** 站上50日均线 (缺乏量能或大级别趋势配合)")
                     score -= 3 
 
+            # --- [新增] 机构控盘度因子 (CMF) ---
+            cmf = curr.get('CMF', 0.0)
+            if cmf > 0.20:
+                signals.append(f"🏦 **[机构高度控盘]** 资金呈强净流入态势 (CMF: {cmf:.2f})")
+                score += int(5 * weight_multiplier)
+                strong_signals_count += 1
+            elif cmf > 0.05:
+                signals.append(f"💰 **[资金温和吸筹]** 机构资金呈流入迹象 (CMF: {cmf:.2f})")
+                score += 2
+            elif cmf < -0.15:
+                signals.append(f"⚠️ **[资金派发中]** 机构疑似撤退，动能不足 (CMF: {cmf:.2f})")
+                score -= 4
+                
+            # --- [新增] 布林带极致压缩形态 (大变盘前兆) ---
+            bb_width = curr.get('BB_Width', 1.0)
+            if len(df) >= 60:
+                past_width_min = df['BB_Width'].iloc[-60:-1].min()
+                # 若带宽极窄 (<6%)，或达到了过去60天的最低点附近，说明波动率枯竭
+                if bb_width < 0.06 or bb_width <= past_width_min * 1.1:
+                    signals.append(f"🗜️ **[布林带极致收口]** 波动率降至冰点 (宽幅 {bb_width:.1%})，即将迎来大级别变盘！")
+                    score += 4
+
             # --- 全局趋势阀门 (ICHIMOKU Master Trend Filter) ---
             above_cloud = curr.get('Above_Cloud', 0) == 1
             cloud_twist = curr.get('Cloud_Twist', 0) == 1
@@ -780,7 +902,7 @@ def run_tech_matrix() -> None:
         else:
             final_report += f"\n\n*(动态门槛: {min_score_dynamic} 分 | 权重因子: {weight_multiplier:.2f} | 已应用拥挤/弱势动态降权)*"
             
-        send_alert("📊 纳指 100 优选异动池", final_report)
+        send_alert("📊 全市场优选异动池", final_report)
         
         # --- [新增] 历史回测数据持久化 (JSON Lines) ---
         try:
@@ -811,8 +933,8 @@ def run_tech_matrix() -> None:
         logger.info(f"所有个股未通过 Ichimoku 趋势云过滤，或得分低于动态门槛 ({min_score_dynamic}分)。")
 
 def run_daily_screener() -> None:
-    logger.info(">>> 启动纳指 100 全量扫盘报告...")
-    target_list = get_nasdaq_100()
+    logger.info(">>> 启动动态优选全量扫盘报告...")
+    target_list = get_filtered_watchlist()
     bullish, bearish = [], []
     total_stocks = len(target_list)
     
@@ -836,8 +958,8 @@ def run_daily_screener() -> None:
         except Exception as e:
             logger.debug(f"[{symbol}] 每日复盘分析跳过: {e}")
 
-    report = f"🎯 **今日纳斯达克 100 扫描总结**\n\n**📈 绝对多头排列 (强势)**\n> {', '.join(bullish) if bullish else '无'}\n\n**📉 绝对空头排列 (弱势)**\n> {', '.join(bearish) if bearish else '无'}"
-    send_alert("📝 纳指 100 全景复盘", report)
+    report = f"🎯 **今日全市场高优股票扫描总结**\n\n**📈 绝对多头排列 (强势)**\n> {', '.join(bullish) if bullish else '无'}\n\n**📉 绝对空头排列 (弱势)**\n> {', '.join(bearish) if bearish else '无'}"
+    send_alert("📝 全市场优选股复盘", report)
 
 # ================= 6. 入口模块 =================
 if __name__ == "__main__":
@@ -854,10 +976,10 @@ if __name__ == "__main__":
     elif mode == "test":
         regime, desc, qqq_df = get_market_regime()
         vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
-        test_tickers = get_nasdaq_100()[:5]
+        test_tickers = get_filtered_watchlist(max_stocks=5)
         send_alert(
             "✅ Pro 量化引擎部署成功", 
-            f"已集成 [JIT 实时新闻解析] 与 [Telegram 多渠道推送]！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
+            f"已集成 [JIT 实时新闻解析] 与 [漏斗过滤机制]！\n{vix_desc}\n大盘: **{desc}**\n当前测试名单: {', '.join(test_tickers)}"
         )
     else:
         logger.error(f"未知的模式: {mode}")
