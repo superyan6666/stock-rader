@@ -1,62 +1,103 @@
-🤖 Tickeron Pro AI Bot (Serverless 极简量化监控)
+🤖 QuantBot - GitHub Actions 量化盯盘机器人
 
-这是一个专为 GitHub Actions 设计的零成本、免维护量化多因子盯盘机器人。无需购买云服务器，依托 GitHub 官方容器，7x24 小时监控全球市场异动，并将投资机会实时推送到钉钉。
+这是一个专为 GitHub Actions 设计的零成本、免维护量化多因子盯盘机器人。无需购买云服务器，依托 GitHub 官方容器，7x24 小时监控全球市场异动，并将投资机会实时推送给您。
 
 ✨ 核心特性 (Features)
 
-零成本托管：基于 GitHub Actions 定时触发（Cron），告别云服务器续费烦恼。
+🆓 零成本托管：基于 GitHub Actions 定时触发（Cron），告别云服务器续费烦恼。
 
-智能“三合一”架构：
+🧠 智能“四合一”极简架构：
 
-sentinel 高频异动哨兵：每半小时监控核心自选股的暴涨/暴跌与跳空。
+⚡ sentinel (高频异动哨兵)：每半小时监控核心自选股的暴涨/暴跌与跳空。
 
-matrix 多因子信号矩阵：监控 MACD 金叉、RSI 背离、均线突破与布林挤压。
+🎯 matrix (多因子信号矩阵)：监控 MACD 金叉、RSI 背离、均线突破、布林挤压与 TTM Squeeze。
 
-daily 全景复盘研报：每日收盘后扫描纳指 100，梳理多空排列阵型。
+📝 daily (全景复盘)：每日收盘后扫描，梳理多空排列阵型（已并入 Matrix 统一路由）。
 
-动态股票池抓取：自动从 Wikipedia 解析最新的 Nasdaq-100 成分股，永不脱节。
+📅 backtest (自动阅卷闭环)：每周五自动比对历史推送记录与真实 K 线，生成 T+3 胜率战报。
 
-企业级稳健性：内置随机延迟请求、失败重试、logging 规范输出及严格的类型推断。
+🌐 动态全市场漏斗：自动从 Wikipedia 抓取 S&P 500、S&P 400 和 Nasdaq 100，并按成交活跃度动态筛选 Top 120。
+
+🛡️ 大盘与板块风控：自动感知 VIX 恐慌指数与大盘趋势，触发“防雷网”和“板块拥挤度”自适应降权。
+
+📢 多渠道消息推送：支持 钉钉/飞书/企业微信 Webhook，以及 Telegram Bot (支持 MarkdownV2)。
+
+🏭 企业级 DevOps 部署：内置防封禁分块下载 (Chunking)、依赖缓存加速、并发死锁熔断以及严格的版本锁定。
 
 🚀 快速开始 (Quick Start)
 
-1. Fork 本项目
+只需 3 步，即可在您的 GitHub 账户下免费运行此机器人。
 
-点击右上角的 Fork 按钮，将此代码库复制到你的 GitHub 账号下。
+1. Fork 本仓库
 
-2. 配置 Webhook 机器人
+点击页面右上角的 Fork 按钮，将本项目复制到您自己的 GitHub 账号下。
 
-在钉钉中创建一个自定义机器人，安全设置建议勾选【自定义关键词】，并填入 AI。
-复制生成的 Webhook URL。
+2. 配置环境变量 (Secrets)
 
-3. 设置 GitHub Secrets
+进入您 Fork 后的仓库，点击 Settings -> Secrets and variables -> Actions -> New repository secret，添加以下通知渠道配置（任选其一或全选）：
 
-进入你 Fork 的仓库，点击 Settings > Secrets and variables > Actions。
+Secret 名称
 
-点击 New repository secret。
+描述
 
-Name 填入：WEBHOOK_URL
+是否必填
 
-Secret 填入你刚才复制的机器人链接。
+WEBHOOK_URL
 
-4. 激活工作流
+钉钉/飞书/企业微信的群机器人 Webhook 地址（支持英文逗号分隔配置多个）
 
-点击仓库顶部的 Actions 标签页，启用工作流。
+选填
 
-在左侧选择 Tickeron Pro AI Bot，点击右侧的 Run workflow。
+TELEGRAM_BOT_TOKEN
 
-在下拉菜单中选择 test 模式，点击运行进行连通性测试。
+Telegram 机器人的 Token (通过 @BotFather 获取)
 
-⚙️ 核心依赖
+选填
 
-详见 requirements.txt：
+TELEGRAM_CHAT_ID
 
-yfinance: 金融数据获取
+Telegram 接收消息的 Chat ID
 
-pandas: 数据处理与指标计算
+选填
 
-lxml & requests: 维基百科爬虫
+注意：WEBHOOK_URL 和 TELEGRAM 相关的配置必须至少填写一种，否则程序将报错退出。
 
-📄 协议 (License)
+3. 启用 GitHub Actions
 
-MIT License
+点击仓库顶部的 Actions 标签页。
+
+如果看到 "I understand my workflows, go ahead and enable them"，点击确认启用。
+
+在左侧工作流列表中选择 Tickeron Pro AI Bot。
+
+点击 Run workflow，您可以手动选择 test 模式进行推送测试。
+
+🕒 自动化运行时间表 (Schedule)
+
+机器人完全依靠 GitHub Actions 的 Cron 触发自动运行，默认时间表如下（均为 UTC 时间，工作日运行）：
+
+高频哨兵 (Sentinel): 每半小时执行一次。
+
+多因子矩阵 (Matrix): 每小时的第 15 分钟执行一次。
+
+每日复盘 (Daily): 每天 22:00 UTC 执行。
+
+历史回测 (Backtest): 每周五 23:00 UTC 执行自动数据统计。
+
+💡 调度逻辑由 main.yml 结合实际 UTC 时间戳严格接管，杜绝了并发拥堵与调度漂移。
+
+📁 核心文件结构
+
+quantbot.py: The Single Core (统一核心)。包含数据漏斗、指标计算、风控策略、推送与回测闭环的所有逻辑（不到 500 行）。
+
+requirements.txt: 严格锁定的 Python 环境依赖库。
+
+.github/workflows/main.yml: GitHub Actions 自动化运维部署文件。
+
+backtest_log.jsonl: 自动生成并提交的策略选股历史日志文件（无需手动创建）。
+
+strategy_stats.json: 回测引擎生成的历史胜率库（自动挂载至推送消息头部）。
+
+⚠️ 免责声明 (Disclaimer)
+
+本项目仅供编程学习与量化策略研究使用。所有技术指标与自动化产生的信号不构成任何投资建议。市场有风险，投资需谨慎！使用者需对自身的投资行为负责。
