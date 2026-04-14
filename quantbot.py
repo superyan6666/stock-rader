@@ -87,6 +87,13 @@ def validate_config():
     if not Config.WEBHOOK_URL and not Config.TELEGRAM_BOT_TOKEN:
         logger.error("❌ 未配置任何推送渠道。")
         sys.exit(1)
+    
+    # 自动补齐 Git 需要的占位文件，防止 Action 提交时报错
+    if not os.path.exists(Config.LOG_FILE): open(Config.LOG_FILE, 'a').close()
+    if not os.path.exists(Config.REPORT_FILE): open(Config.REPORT_FILE, 'a').close()
+    if not os.path.exists(Config.STATS_FILE):
+        with open(Config.STATS_FILE, 'w') as f: f.write("{}")
+            
     logger.info("✅ 环境校验通过")
 
 # ================= 2. 数据工具模块 =================
