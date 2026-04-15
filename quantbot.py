@@ -38,7 +38,6 @@ class Config:
     
     DINGTALK_KEYWORD: str = "AI"
     
-    # --- 🚀 [护城河] 绝对稳定的核心资产名单 ---
     CORE_WATCHLIST: List[str] = [
         "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA", "BRK-B", "AVGO", 
         "LLY", "JPM", "V", "XOM", "UNH", "MA", "PG", "JNJ", "HD", "MRK", 
@@ -55,7 +54,7 @@ class Config:
         "BABA", "BIDU", "JD", "NIO", "LI", "XPEV", "TCEHY", "NTES", "RYAAY", "LVMUY",
         "QQQ", "SPY", "DIA", "IWM", "SOXX", "SMH", "XLK", "XLF", "XLV", "XLP"
     ]
-    BLACKLIST: List[str] = [] 
+    
     INDEX_ETF: str = "QQQ" 
     VIX_INDEX: str = "^VIX" 
     MIN_SCORE_THRESHOLD: int = 8 
@@ -72,9 +71,16 @@ class Config:
     CROWDING_MIN_STOCKS: int = 2
     CROWDING_EXCLUDE_SECTORS: List[str] = ["QQQ"]
     
-    LOG_FILE: str = "backtest_log.jsonl"
+    # 🚀 修复2: 日志按月分片轮转，防止滚雪球式 I/O 拥堵
+    LOG_PREFIX: str = "backtest_log_"
     STATS_FILE: str = "strategy_stats.json"
     REPORT_FILE: str = "backtest_report.md"
+    CACHE_FILE: str = "tickers_cache.json"
+
+    @classmethod
+    def get_current_log_file(cls) -> str:
+        """动态获取当月日志文件名，例如 backtest_log_2026_04.jsonl"""
+        return f"{cls.LOG_PREFIX}{datetime.now(timezone.utc).strftime('%Y_%m')}.jsonl"
 
     @staticmethod
     def get_sector_etf(symbol: str) -> str:
@@ -87,18 +93,19 @@ def validate_config():
         logger.error("❌ 未配置任何推送渠道。")
         sys.exit(1)
     
-    if not os.path.exists(Config.LOG_FILE): open(Config.LOG_FILE, 'a').close()
+    curr_log = Config.get_current_log_file()
+    if not os.path.exists(curr_log): open(curr_log, 'a').close()
     if not os.path.exists(Config.REPORT_FILE): open(Config.REPORT_FILE, 'a').close()
     if not os.path.exists(Config.STATS_FILE):
-        with open(Config.STATS_FILE, 'w') as f: f.write("{}")
+        with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: f.write("{}")
             
-    logger.info("✅ 环境校验通过")
+    logger.info("✅ 环境与占位文件校验通过")
 
 # ================= 2. 数据工具模块 =================
 def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 5, auto_adjust: bool = True, fast_mode: bool = False) -> pd.DataFrame:
     for attempt in range(retries):
         try:
-            sleep_sec = random.uniform(0.1, 0.3) if fast_mode else (random.uniform(2.0, 4.0) if "1d" in interval else random.uniform(1.0, 2.0))
+            sleep_sec = random.uniform(0.1, 0.3) if fast_mode else random.uniform(1.5, 3.0)
             time.sleep(sleep_sec)
             df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=auto_adjust, timeout=15)
             if not df.empty: return df
@@ -126,10 +133,57 @@ def get_latest_news(symbol: str) -> str:
     except Exception: pass
     return ""
 
+def check_earnings_risk(symbol: str) -> bool:
+    try:
+        tk = yf.Ticker(symbol)
+        try:
+            ed_df = tk.earnings_dates
+            if ed_df is not None and not ed_df.empty:
+                for d in ed_df.index:
+                    d_val = d.date() if hasattr(d, 'date') else None
+                    if d_val:
+                        delta = (d_val - datetime.now(timezone.utc).date()).days
+                        if 0 <= delta <= 5: return True
+        except Exception: pass
+        
+        try:
+            cal = tk.calendar
+            if cal is not None:
+                if isinstance(cal, dict) and 'Earnings Date' in cal:
+                    ed = cal['Earnings Date']
+                    if isinstance(ed, list) and len(ed) > 0:
+                        ed_date = ed[0]
+                        if hasattr(ed_date, 'date'):
+                            delta = (ed_date.date() - datetime.now(timezone.utc).date()).days
+                            if 0 <= delta <= 5: return True
+                elif isinstance(cal, pd.DataFrame) and not cal.empty:
+                    if 'Earnings Date' in cal.index:
+                        ed = cal.loc['Earnings Date'].iloc[0]
+                        if hasattr(ed, 'date'):
+                            delta = (ed.date() - datetime.now(timezone.utc).date()).days
+                            if 0 <= delta <= 5: return True
+        except Exception: pass
+    except Exception: pass
+    return False
+
 def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
-    logger.info(">>> 漏斗过滤：从多维度数据源拉取全市场名单 (含纳指与中盘)...")
+    logger.info(">>> 漏斗过滤：从多维度数据源拉取名单 (含纳指与中盘)...")
     tickers = set(Config.CORE_WATCHLIST)
     
+    if os.path.exists(Config.CACHE_FILE):
+        try:
+            mtime = os.path.getmtime(Config.CACHE_FILE)
+            if time.time() - mtime < 7 * 86400:
+                with open(Config.CACHE_FILE, "r", encoding="utf-8") as f:
+                    cached_tickers = json.load(f)
+                    tickers.update(cached_tickers)
+                    logger.info(f"♻️ 成功加载本地存活缓存: {len(cached_tickers)} 只。")
+            else:
+                logger.info("🗑️ 本地缓存已过期(>7天)，将执行全局深度清洗重建。")
+        except Exception as e:
+            logger.warning(f"⚠️ 缓存读取失败: {e}")
+
+    online_fetched = 0
     try:
         sp500_url = 'https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv'
         resp = requests.get(sp500_url, headers=_GLOBAL_HEADERS, timeout=10)
@@ -137,9 +191,11 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
             from io import StringIO
             df_sp500 = pd.read_csv(StringIO(resp.text))
             if 'Symbol' in df_sp500.columns:
-                tickers.update(df_sp500['Symbol'].dropna().astype(str).str.replace('.', '-').tolist())
+                fetched = df_sp500['Symbol'].dropna().astype(str).str.replace('.', '-').tolist()
+                tickers.update(fetched)
+                online_fetched += len(fetched)
     except Exception as e:
-        logger.warning(f"⚠️ 标普500拉取降级: {e}")
+        logger.warning(f"⚠️ 标普500动态拉取受限: {e}")
 
     try:
         from io import StringIO
@@ -150,16 +206,22 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
         for w_url in wiki_urls:
             w_resp = requests.get(w_url, headers=_GLOBAL_HEADERS, timeout=10)
             if w_resp.status_code == 200:
-                for table in pd.read_html(StringIO(w_resp.text)):
+                # 🚀 修复3: 强制采用 flavor='lxml' 严苛模式，防止 html.parser 带来的脆弱性崩溃
+                for table in pd.read_html(StringIO(w_resp.text), flavor='lxml'):
                     col = next((c for c in ['Symbol', 'Ticker symbol', 'Ticker'] if c in table.columns), None)
                     if col:
-                        tickers.update(table[col].dropna().astype(str).str.replace('.', '-').tolist())
+                        fetched = table[col].dropna().astype(str).str.replace('.', '-').tolist()
+                        tickers.update(fetched)
+                        online_fetched += len(fetched)
                         break
     except Exception as e:
-        logger.warning(f"⚠️ 中盘股与纳指拓展列表获取受限: {e}")
+        logger.warning(f"⚠️ Wiki 拓展列表获取受限: {e}")
+        
+    if online_fetched == 0 and len(tickers) <= len(Config.CORE_WATCHLIST):
+        logger.warning("🔴 外部数据源全部脆断，将依靠【护城河名单】与【本地自洁缓存】安全运行！")
     
     tickers_list = list(tickers)
-    logger.info(f"✅ 扩容完成，初始海选池: {len(tickers_list)} 只标的。开始分块并发粗筛...")
+    logger.info(f"✅ 汇总海选池: {len(tickers_list)} 只标的。")
 
     try:
         chunk_size = 50 
@@ -179,15 +241,30 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
         else:
             close_df, volume_df = df, pd.DataFrame(1e6, index=df.index, columns=df.columns)
 
+        available_tickers = set(close_df.columns) if isinstance(close_df, pd.DataFrame) else set()
+        missing_tickers = set(tickers_list) - available_tickers
+        
+        # 🚀 修复1: 抛弃 BLACKLIST 全局变量污染。
+        # 由于 missing_tickers 已经被自然剔除出 available_tickers，它们绝对不会进入后续缓存。
+        # 此处我们只需打印日志即可，纯无状态流转！
+        if missing_tickers:
+            logger.info(f"🛡️ 数据自净: 发现 {len(missing_tickers)} 只失效/退市标的，已将其从本次计算与缓存中永久抹除。")
+            
+        if len(available_tickers) > 200:
+            try:
+                with open(Config.CACHE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(list(available_tickers), f)
+            except Exception as e:
+                logger.debug(f"写入缓存失败: {e}")
+
         closes = close_df.dropna(axis=1, how='all').ffill().iloc[-1]
         volumes = volume_df.dropna(axis=1, how='all').mean()
-        
         turnovers = (closes * volumes).dropna()
-        valid_turnovers = turnovers[(closes > 10.0) & (volumes > 1000000)]
         
+        valid_turnovers = turnovers[(closes > 10.0) & (turnovers > 30_000_000)]
         top_tickers = valid_turnovers.sort_values(ascending=False).head(max_stocks).index.tolist()
         if top_tickers:
-            logger.info(f"✅ 漏斗过滤完成！精选出全市场最活跃的 {len(top_tickers)} 只进入深度扫描。")
+            logger.info(f"✅ 漏斗完成！锁定极高流动性标的: {len(top_tickers)} 只。")
             return top_tickers
         return Config.CORE_WATCHLIST[:max_stocks]
     except Exception as e:
@@ -201,7 +278,7 @@ def load_strategy_performance_tag() -> str:
                 stats_data = json.load(f)
                 t3 = stats_data.get("overall", {}).get("T+3") if "overall" in stats_data else stats_data.get("T+3")
                 if t3 and t3.get('total_trades', 0) > 0:
-                    return f"📈 **策略表现 (T+3):** 胜率 {t3['win_rate']:.1%} | 均收益 {t3['avg_ret']:+.2%}  "
+                    return f"**📈 策略表现 (T+3):** 胜率 {t3['win_rate']:.1%} | 均收益 {t3['avg_ret']:+.2%} "
     except Exception: pass
     return ""
 
@@ -214,7 +291,7 @@ def send_alert(title: str, content: str) -> None:
             "msgtype": "markdown", 
             "markdown": {
                 "title": f"【{Config.DINGTALK_KEYWORD}】{title}", 
-                "text": f"### 🤖 【{Config.DINGTALK_KEYWORD}】{title}\n\n{content}\n\n---\n*⏱️ {formatted_time}*"
+                "text": f"## 🤖 【{Config.DINGTALK_KEYWORD}】{title}\n\n{content}\n\n---\n*⏱️ {formatted_time}*"
             }
         }
         for url in [u.strip() for u in Config.WEBHOOK_URL.split(',') if u.strip()]:
@@ -225,8 +302,10 @@ def send_alert(title: str, content: str) -> None:
         html_title = title.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         html_content = content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         
-        # 🚀 跨平台排版核心：将 Markdown 的双星号语法安全转换为 Telegram 支持的 <b> 标签
+        html_content = re.sub(r'### (.*?)\n', r'<b>\1</b>\n', html_content)
         html_content = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', html_content)
+        html_content = re.sub(r'`(.*?)`', r'<code>\1</code>', html_content)
+        html_content = html_content.replace('\n---', '\n━━━━━━━━━━━━━━━━━━')
         
         tg_text = f"🤖 <b>【量化监控】{html_title}</b>\n\n{html_content}\n\n⏱️ <i>{formatted_time}</i>"
         try:
@@ -254,23 +333,38 @@ def get_vix_level(qqq_df_for_shadow: pd.DataFrame = None) -> Tuple[float, str]:
             is_simulated = True
             
     prefix = "影子VIX" if is_simulated else "VIX"
-    if vix > 30: return vix, f"🚨 极其恐慌 ({prefix}: {vix:.2f} > 30)"
-    if vix > 25: return vix, f"⚠️ 市场恐慌 ({prefix}: {vix:.2f} > 25)"
-    if vix < 15: return vix, f"✅ 市场平静 ({prefix}: {vix:.2f} < 15)"
+    if vix > 30: return vix, f"🚨 极其恐慌 ({prefix}: {vix:.2f})"
+    if vix > 25: return vix, f"⚠️ 市场恐慌 ({prefix}: {vix:.2f})"
+    if vix < 15: return vix, f"✅ 市场平静 ({prefix}: {vix:.2f})"
     return vix, f"⚖️ 正常波动 ({prefix}: {vix:.2f})"
 
 def get_market_regime() -> Tuple[str, str, pd.DataFrame]:
     df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", auto_adjust=False, fast_mode=True)
     if len(df) < 200: return "range", "数据不足，默认震荡", df
-    c_close, ma200 = df['Close'].ffill().iloc[-1], df['Close'].rolling(200).mean().iloc[-1]
+    
+    c_close = df['Close'].ffill().iloc[-1]
+    ma200 = df['Close'].rolling(200).mean().iloc[-1]
+    ma50_curr = df['Close'].rolling(50).mean().iloc[-1]
+    ma50_prev = df['Close'].rolling(50).mean().iloc[-20]
+    
     trend_20d = (c_close - df['Close'].iloc[-20]) / df['Close'].iloc[-20]
     
-    if c_close > ma200 and trend_20d > 0.02: return "bull", "🐂 牛市主升阶段", df
-    if c_close < ma200 and trend_20d < -0.02: return "bear", "🐻 熊市回调阶段", df
-    return "range", "⚖️ 震荡整理阶段", df
+    if c_close > ma200:
+        if trend_20d > 0.02: return "bull", "🐂 牛市主升阶段", df
+        else: return "range", "⚖️ 牛市高位震荡", df
+    else:
+        if c_close > ma50_curr and ma50_curr > ma50_prev and trend_20d > 0.04:
+            return "rebound", "🦅 熊市超跌反弹 (V反)", df
+        elif trend_20d < -0.02: 
+            return "bear", "🐻 熊市回调阶段", df
+        else: 
+            return "range", "⚖️ 熊市底部震荡", df
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.sort_index()
+    
     df['Close'], df['Volume'] = df['Close'].ffill(), df['Volume'].ffill()
+    df['Open'] = df['Open'].ffill()
     df['SMA_50'] = df['Close'].rolling(window=50).mean()
     df['SMA_150'] = df['Close'].rolling(window=150).mean()
     df['SMA_200'] = df['Close'].rolling(window=200).mean()
@@ -279,9 +373,12 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['OBV'] = (np.sign(df['Close'].diff()).fillna(0) * df['Volume']).cumsum()
     
     delta = df['Close'].diff()
-    rs = delta.where(delta > 0, 0).ewm(alpha=1/14, min_periods=14).mean() / (-delta.where(delta < 0, 0).ewm(alpha=1/14, min_periods=14).mean() + 1e-10)
+    up = delta.where(delta > 0, 0).ewm(span=14, adjust=False).mean()
+    down = -delta.where(delta < 0, 0).ewm(span=14, adjust=False).mean()
+    rs = up / (down + 1e-10)
     df['RSI'] = 100 - (100 / (1 + rs))
-    df['RSI_P20'] = df['RSI'].rolling(window=120, min_periods=60).quantile(0.20) if len(df) >= 60 else 30.0
+    
+    df['RSI_P20'] = df['RSI'].shift(1).rolling(window=120, min_periods=60).quantile(0.20).fillna(30.0)
 
     df['MACD'] = df['Close'].ewm(span=12, adjust=False).mean() - df['Close'].ewm(span=26, adjust=False).mean()
     df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
@@ -292,9 +389,15 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['ATR'] = df['TR'].rolling(window=14).mean()
     
     hl2, atr10 = (df['High'] + df['Low']) / 2, df['TR'].rolling(window=10).mean()
-    ub, lb, in_up = (hl2 + 3 * atr10).values, (hl2 - 3 * atr10).values, np.ones(len(df), dtype=bool)
+    ub, lb = (hl2 + 3 * atr10).values, (hl2 - 3 * atr10).values
+    
+    in_up = np.zeros(len(df), dtype=bool)
+    in_up[0] = True 
+    
     for i in range(1, len(df)):
-        if pd.isna(ub[i-1]) or pd.isna(lb[i-1]): continue
+        if pd.isna(ub[i-1]) or pd.isna(lb[i-1]): 
+            in_up[i] = in_up[i-1]
+            continue
         in_up[i] = True if df['Close'].values[i] > ub[i-1] else (False if df['Close'].values[i] < lb[i-1] else in_up[i-1])
         if in_up[i] and in_up[i-1]: lb[i] = max(lb[i], lb[i-1])
         if not in_up[i] and not in_up[i-1]: ub[i] = min(ub[i], ub[i-1])
@@ -312,15 +415,21 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['Above_Cloud'] = (df['Close'] > df[['SenkouA', 'SenkouB']].max(axis=1)).astype(int)
     df['Cloud_Twist'] = (df['SenkouA'] > df['SenkouB']).astype(int)
 
-    if len(df) >= 60:
-        hist_vol = df['Volume'].iloc[-60:-10].quantile(0.8)
-        risk_score = 0.6 if (df['Volume'].iloc[-10:].mean() / (hist_vol + 1e-10)) > 2.5 else 0.0
-        if (df['Close'].pct_change().iloc[-5:].abs() > 0.08).any(): risk_score += 0.4
-        df['Event_Risk'] = min(1.0, risk_score)
-        hl_diff = (df['High'] - df['Low']).replace(0, 1e-10)
-        df['CMF'] = (((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / hl_diff * df['Volume']).rolling(20).sum() / df['Volume'].rolling(20).sum()
-    else:
-        df['Event_Risk'], df['CMF'] = 0.0, 0.0
+    hl_diff = (df['High'] - df['Low']).replace(0, 1e-10)
+    dollar_vol = df['Close'] * df['Volume']
+    vol_sum20 = dollar_vol.rolling(20).sum() + 1e-10
+    df['CMF'] = (((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / hl_diff * dollar_vol).rolling(20).sum() / vol_sum20
+    df['CMF'] = df['CMF'].clip(lower=-1.0, upper=1.0).fillna(0.0)
+
+    hist_vol_rolling = df['Volume'].shift(10).rolling(window=50, min_periods=10).quantile(0.8)
+    vol_10d_mean = df['Volume'].rolling(window=10, min_periods=1).mean()
+    vol_spike = (vol_10d_mean / (hist_vol_rolling + 1e-10)) > 2.5
+    price_spike = df['Close'].pct_change().abs().rolling(window=5, min_periods=1).max() > 0.08
+    
+    df['Event_Risk'] = 0.0
+    df.loc[vol_spike, 'Event_Risk'] += 0.6
+    df.loc[price_spike, 'Event_Risk'] += 0.4
+    df['Event_Risk'] = df['Event_Risk'].clip(upper=1.0)
 
     return df
 
@@ -334,56 +443,48 @@ def run_volatility_sentinel() -> None:
         try:
             df_h = safe_get_history(sym, period="2d", interval="1h", fast_mode=True)
             if len(df_h) < 2: continue
-            
-            curr_price = df_h['Close'].ffill().iloc[-1]
-            open_price = df_h['Open'].iloc[-1]
-            hr_chg = (curr_price - open_price) / open_price * 100 if open_price != 0 else 0
+            curr_px = df_h['Close'].ffill().iloc[-1]
+            hr_chg = (curr_px - df_h['Open'].iloc[-1]) / df_h['Open'].iloc[-1] * 100
             
             is_alert = False
-            alert_type = ""
-            
+            alert_reason = ""
             if abs(hr_chg) > 3.5: 
                 is_alert = True
-                alert_type = f"  • ⚡ 1h脉冲: {hr_chg:+.2f}%  "
+                alert_reason = f"- ⚡ 1h脉冲: **{hr_chg:+.2f}%**"
 
             df_d = safe_get_history(sym, period="1mo", interval="1d", fast_mode=True)
-            atr_stop_str = ""
-            
+            trade_plan = ""
             if len(df_d) >= 15:
                 df_d['TR'] = pd.concat([df_d['High']-df_d['Low'], (df_d['High']-df_d['Close'].shift()).abs(), (df_d['Low']-df_d['Close'].shift()).abs()], axis=1).max(axis=1)
                 atr = df_d['TR'].rolling(14).mean().iloc[-1]
+                tp, sl = curr_px + 3.0 * atr, curr_px - 1.5 * atr
                 
-                atr_stop = curr_price - 1.5 * atr
-                atr_target = curr_price + 3.0 * atr 
-                # 🚀 Sentinel 结构化排版
-                atr_stop_str = (
-                    f"  \n\n💰 **交易计划:** \n"
-                    f"  • 💵 现价: ${curr_price:.2f}  \n"
-                    f"  • 🎯 止盈: ${atr_target:.2f}  \n"
-                    f"  • 🛡️ 止损: ${atr_stop:.2f}  "
+                trade_plan = (
+                    f"**💰 交易计划:**\n"
+                    f"- 💵 现价: `{curr_px:.2f}`\n"
+                    f"- 🎯 止盈: **${tp:.2f}**\n"
+                    f"- 🛡️ 止损: **${sl:.2f}**"
                 )
-                
                 gap = (df_d['Open'].iloc[-1] - df_d['Close'].iloc[-2]) / df_d['Close'].iloc[-2] * 100
                 if abs(gap) > 4:
                     is_alert = True
-                    gap_str = f"  • 💥 跳空缺口: {gap:+.2f}%  "
-                    alert_type = f"{alert_type}\n{gap_str}" if alert_type else gap_str
+                    reason = f"- 💥 跳空缺口: **{gap:+.2f}%**"
+                    alert_reason = f"{alert_reason}\n{reason}" if alert_reason else reason
             
             if is_alert:
                 news = get_latest_news(sym)
-                news_str = f"  \n\n📰 **最新资讯:** \n  • {news}  " if news else ""
-                alert_msg = (
-                    f"🚨 **{sym}** |  盘中异动 {'🚀' if hr_chg>0 else '🩸'}  \n\n"
-                    f"💡 **异动捕捉:** \n"
-                    f"{alert_type}"
-                    f"{atr_stop_str}{news_str}"
-                )
-                alerts.append(alert_msg.strip())
+                news_block = f"\n\n**📰 最新资讯:**\n- {news}" if news else ""
                 
+                msg = (
+                    f"### 🚨 {sym} | 盘中异动 {'🚀' if hr_chg>0 else '🩸'}\n"
+                    f"**💡 异动捕捉:**\n{alert_reason}\n\n"
+                    f"{trade_plan}{news_block}"
+                )
+                alerts.append(msg)
         except Exception: pass
         
     if alerts: 
-        send_alert("盘中高频哨兵预警", "\n\n━━━━━━━━━━━━━━━━━━\n\n" + "\n\n━━━━━━━━━━━━━━━━━━\n\n".join(alerts))
+        send_alert("高频哨兵预警", "\n\n---\n\n".join(alerts))
 
 def run_tech_matrix() -> None:
     regime, regime_desc, qqq_df = get_market_regime()
@@ -393,9 +494,28 @@ def run_tech_matrix() -> None:
                   for etf in Config.SECTOR_MAP.keys() 
                   if not (sdf := safe_get_history(etf, "2mo", "1d", fast_mode=True)).empty and len(sdf) >= 20}
                   
-    health_score = -0.9 if vix > 30 else (-0.6 if vix > 25 else (0.9 if vix < 15 and regime == 'bull' else (0.6 if regime == 'bull' else (-0.7 if regime == 'bear' else max(-0.2, min(0.2, np.mean(list(sector_data.values())) if sector_data else 0.0)) * 2))))
+    health_score = -0.9 if vix > 30 else (-0.6 if vix > 25 else (0.9 if vix < 15 and regime == 'bull' else (0.6 if regime == 'bull' else (0.3 if regime == 'rebound' else (-0.7 if regime == 'bear' else 0.0)))))
     w_mul, min_score = 1.0 + health_score * 0.8, max(Config.MIN_SCORE_THRESHOLD, 8 + round(health_score * -6))
     
+    factor_weights = {}
+    try:
+        if os.path.exists(Config.STATS_FILE):
+            with open(Config.STATS_FILE, "r", encoding="utf-8") as f:
+                f_stats = json.load(f).get("factors", {})
+                for tag, data in f_stats.items():
+                    wr = data.get("win_rate", 0.5)
+                    avg_ret = data.get("avg_ret", 0.0)
+                    cnt = data.get("count", 0)
+                    
+                    if cnt >= 3:  
+                        w = 1.0 + (wr - 0.5) * 2.0 + (avg_ret * 20) 
+                        factor_weights[tag] = max(0.2, min(2.0, w)) 
+    except Exception as e:
+        logger.warning(f"动态权重解析跳过: {e}")
+
+    def get_fw(tag_name: str) -> float:
+        return factor_weights.get(f"[{tag_name}]", 1.0)
+
     reports = []
     for sym in get_filtered_watchlist():
         try:
@@ -405,203 +525,248 @@ def run_tech_matrix() -> None:
             curr, prev = df.iloc[-1], df.iloc[-2]
             if curr['Event_Risk'] > 0.85 or (curr['ATR'] / curr['Close'] > 0.10): continue
             
-            sig, score, st_cnt = [], 0, 0
-            is_vol = (curr['Volume'] / curr['Vol_MA20']) > 1.5
+            sig, factors, score, st_cnt = [], [], 0, 0
+            
+            is_vol = (curr['Volume'] / curr['Vol_MA20'] > 1.5) and (curr['Close'] > curr['Open'])
             is_st = curr['SuperTrend_Up'] == 1
 
-            if pd.notna(curr['SMA_200']) and curr['Close'] > curr['SMA_50'] > curr['SMA_150'] > curr['SMA_200'] and curr['SMA_200'] > df['SMA_200'].iloc[-20]:
-                sig.append("🏆 [米奈尔维尼] 主升浪形态"); score += int(8 * w_mul); st_cnt += 1
-            
+            if pd.notna(curr['SMA_200']) and curr['Close'] > curr['SMA_50'] > curr['SMA_150'] > curr['SMA_200']:
+                fw = get_fw("米奈尔维尼")
+                sig.append(f"🏆 [米奈尔维尼] 主升形态 (权:{fw:.1f}x)"); factors.append("米奈尔维尼"); score += int(8 * w_mul * fw); st_cnt += 1
+                
             if len(df) >= 40 and df['Close'].iloc[-20:].min() < df['Close'].iloc[-40:-20].min() and df['OBV'].iloc[-20:].min() > df['OBV'].iloc[-40:-20].min():
-                sig.append("🌊 [OBV底背离] 主力暗中建仓"); score += int(7 * w_mul); st_cnt += 1
-
+                fw = get_fw("OBV底背离")
+                sig.append(f"🌊 [OBV底背离] 资金潜伏 (权:{fw:.1f}x)"); factors.append("OBV底背离"); score += int(7 * w_mul * fw); st_cnt += 1
+                
             if not qqq_df.empty:
                 m_df = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, how='inner')
                 if len(m_df) >= 20:
-                    rs_20 = (1 + (m_df['Close_x'].iloc[-1] / m_df['Close_x'].iloc[-20] - 1)) / max(1 + (m_df['Close_y'].iloc[-1] / m_df['Close_y'].iloc[-20] - 1), 0.5)
-                    if rs_20 > 1.08:
-                        sig.append(f"⚡ [强相对强度] 跑赢大盘 {rs_20-1:+.1%}"); score += 7 if is_vol else 4
-                    elif rs_20 < 0.92:
-                        sig.append(f"🐢 [相对弱势] 跑输大盘 {1-rs_20:.1%}"); score -= 3
-
-            dyn_rsi = curr['RSI_P20'] if pd.notna(curr['RSI_P20']) else 30.0
-            if curr['RSI'] < dyn_rsi and prev['RSI'] >= dyn_rsi:
-                if curr['Close'] > curr['EMA_50'] and is_st:
-                    sig.append(f"🟢 [强势回踩] (RSI:{curr['RSI']:.1f})"); score += int((13 if regime=='bear' else 8) * w_mul); st_cnt += 1
-
+                    rs_20 = (m_df['Close_x'].iloc[-1]/m_df['Close_x'].iloc[-20]) / max(m_df['Close_y'].iloc[-1]/m_df['Close_y'].iloc[-20], 0.5)
+                    if rs_20 > 1.08: 
+                        fw = get_fw("强相对强度")
+                        sig.append(f"⚡ [强相对强度] 跑赢大盘 (权:{fw:.1f}x)"); factors.append("强相对强度"); score += int((7 if is_vol else 4) * w_mul * fw)
+                        
+            dyn_rsi = curr['RSI_P20']
+            if curr['RSI'] < dyn_rsi and prev['RSI'] >= dyn_rsi and is_st:
+                fw = get_fw("强势回踩")
+                sig.append(f"🟢 [强势回踩] RSI:{curr['RSI']:.1f} (权:{fw:.1f}x)"); factors.append("强势回踩"); score += int(10 * w_mul * fw); st_cnt += 1
+                
             if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
-                sig.append("🔥 [MACD金叉]"); score += int(10 * w_mul); st_cnt += 1
-
+                fw = get_fw("MACD金叉")
+                sig.append(f"🔥 [MACD金叉] (权:{fw:.1f}x)"); factors.append("MACD金叉"); score += int(10 * w_mul * fw); st_cnt += 1
+                
             is_sqz = (curr['BB_Upper'] - curr['BB_Lower']) < (curr['KC_Upper'] - curr['KC_Lower'])
-            was_sqz = ((df['BB_Upper'].iloc[-6:-1] < df['KC_Upper'].iloc[-6:-1]) & (df['BB_Lower'].iloc[-6:-1] > df['KC_Lower'].iloc[-6:-1])).any() if len(df)>=6 else False
-            if is_sqz:
-                sig.append("📦 [TTM Squeeze ON]"); score += int((12 if regime=='range' else 6) * w_mul)
-            elif was_sqz and not is_sqz and curr['MACD_Hist'] > 0 and curr['MACD_Hist'] > prev['MACD_Hist']:
-                sig.append("🚀 [TTM Squeeze FIRE ↑]"); score += int((18 if regime=='bull' else 10) * w_mul); st_cnt += 1
-
+            if is_sqz: 
+                fw = get_fw("TTM Squeeze ON")
+                sig.append(f"📦 [TTM Squeeze ON] (权:{fw:.1f}x)"); factors.append("TTM Squeeze ON"); score += int(6 * w_mul * fw)
+                
             cmf = curr['CMF']
-            if cmf > 0.20: sig.append(f"🏦 [机构高控盘] (CMF:{cmf:.2f})"); score += int(5 * w_mul); st_cnt += 1
-            elif cmf < -0.15: sig.append(f"⚠️ [资金派发] (CMF:{cmf:.2f})"); score -= 4
-
-            if curr['Above_Cloud'] == 0:
-                score = int(score * 0.4); sig.append("☁️ [云层压制]")
+            if cmf > 0.20: 
+                fw = get_fw("机构控盘")
+                sig.append(f"🏦 [机构控盘] CMF:{cmf:.2f} (权:{fw:.1f}x)"); factors.append("机构控盘"); score += int(5 * w_mul * fw); st_cnt += 1
+                
+            if curr['Above_Cloud'] == 0: 
+                score = int(score * 0.4); sig.append("☁️ [云下压制]")
             elif curr['Tenkan'] > curr['Kijun'] and curr['Cloud_Twist'] == 1:
-                sig.append("🌥️ [一目强多头]"); score += int(6 * w_mul); st_cnt += 1
+                fw = get_fw("一目多头")
+                sig.append(f"🌥️ [一目多头] (权:{fw:.1f}x)"); factors.append("一目多头"); score += int(6 * w_mul * fw); st_cnt += 1
                 
             gap_pct = (curr['Open'] - prev['Close']) / prev['Close']
-            if 0.015 < gap_pct < 0.06 and is_vol and curr['Close'] > curr['Open']:
-                sig.append(f"💥 [突破缺口] 强势放量跳空 (+{gap_pct*100:.1f}%)"); score += int(6 * w_mul); st_cnt += 1
-
+            if 0.015 < gap_pct < 0.06 and is_vol:
+                fw = get_fw("突破缺口")
+                sig.append(f"💥 [突破缺口] +{gap_pct*100:.1f}% (权:{fw:.1f}x)"); factors.append("突破缺口"); score += int(6 * w_mul * fw); st_cnt += 1
+            
             if score > 0 and st_cnt < 1 and not is_vol: score = int(score * 0.3)
-            if is_vol and score >= 5: sig.append("🌊 [量价共振]"); score += 3
-            if st_cnt >= 2: sig.append("🎯 [严密共振]"); score += 5
+            if st_cnt >= 2: score += 5
 
             if sig and score >= min_score:
-                news = get_latest_news(sym)
-                if news: sig.append(news)
-                
-                atr_stop = curr['Close'] - 1.5 * curr['ATR']
-                atr_target = curr['Close'] + 3.0 * curr['ATR']
-                
-                reports.append({
-                    "symbol": sym, "score": score, "signals": sig[:8], 
-                    "curr_close": curr['Close'], "atr_stop": atr_stop, "atr_target": atr_target,
-                    "sector": Config.get_sector_etf(sym), "raw_score": score
-                })
+                if check_earnings_risk(sym):
+                    sig.append("💣 [财报雷区] 近5日发财报,风险极高")
+                    score = int(score * 0.5)
+
+                if score >= min_score:
+                    news = get_latest_news(sym)
+                    reports.append({
+                        "symbol": sym, "score": score, "signals": sig[:8], "factors": factors,
+                        "curr_close": curr['Close'], "tp": curr['Close'] + 3.0 * curr['ATR'], 
+                        "sl": curr['Close'] - 1.5 * curr['ATR'], "news": news,
+                        "sector": Config.get_sector_etf(sym), "raw_score": score
+                    })
         except Exception: pass
 
     if reports:
         from collections import defaultdict
         groups = defaultdict(list)
         for r in reports: groups[r["sector"]].append(r)
-            
         for sec, stks in groups.items():
             if sec not in Config.CROWDING_EXCLUDE_SECTORS and len(stks) >= Config.CROWDING_MIN_STOCKS:
                 stks.sort(key=lambda x: x["score"], reverse=True)
-                pen = max(0.6, min(0.9, Config.CROWDING_PENALTY * (1.0 + health_score * 0.3)))
-                for s in stks[1:]: s["score"] = int(s["raw_score"] * pen)
+                sec_mom = sector_data.get(sec, 0.0)
+                
+                if sec_mom > 0.04:
+                    for s in stks[1:]: 
+                        if "🚀 [板块主升豁免] 让利润奔跑" not in s["signals"]:
+                            s["signals"].append("🚀 [板块主升豁免] 让利润奔跑")
+                else:
+                    base_pen = max(0.6, min(0.9, Config.CROWDING_PENALTY * (1.0 + health_score * 0.3)))
+                    top_score = stks[0]["raw_score"]
+                    for s in stks[1:]:
+                        if top_score - s["raw_score"] <= 5:
+                            s["score"] = int(s["raw_score"] * min(0.95, base_pen + 0.15))
+                        else:
+                            s["score"] = int(s["raw_score"] * base_pen)
 
         reports.sort(key=lambda x: x["score"], reverse=True)
-        
-        # 🚀 UI 排版重构：标的凸显在前，指标随后，交易计划托底
         medals = ['🥇', '🥈', '🥉']
         txts = []
         for idx, r in enumerate(reports[:15]):
             icon = medals[idx] if idx < 3 else '🔸'
+            sigs_fmt = "\n".join([f"- {s}" for s in r["signals"]])
+            news_fmt = f"\n- 📰 {r['news']}" if r['news'] else ""
             
-            # 使用列表结构，并在每一行末尾加入安全空格 '  '，保证多端平台不塌陷
-            sigs_formatted = "\n".join([f"  • {s}  " for s in r["signals"]])
-            
-            txt = (
-                f"{icon} **{r['symbol']}** |  🌟 评分: {r['score']}  \n\n"
-                f"💡 **触发共振:** \n"
-                f"{sigs_formatted}  \n\n"
-                f"💰 **交易计划:** \n"
-                f"  • 💵 现价: ${r['curr_close']:.2f}  \n"
-                f"  • 🎯 止盈: ${r['atr_target']:.2f}  \n"
-                f"  • 🛡️ 止损: ${r['atr_stop']:.2f}  "
+            card = (
+                f"### {icon} **{r['symbol']}** | 🌟 评分: {r['score']}\n"
+                f"**💡 触发共振:**\n{sigs_fmt}{news_fmt}\n\n"
+                f"**💰 交易计划:**\n"
+                f"- 💵 现价: `{r['curr_close']:.2f}`\n"
+                f"- 🎯 建议止盈: **${r['tp']:.2f}**\n"
+                f"- 🛡️ 初始止损: **${r['sl']:.2f}**\n"
+                f"- 📈 移动防守: **新高后按 Max(最高价 - 3*ATR) 追踪**\n"
+                f"- ⚠️ 缺口策略: **若次日跳空 > 3%, 建议缩减半仓或等30分钟回踩**"
             )
-            txts.append(txt)
+            txts.append(card)
 
-        perf_text = load_strategy_performance_tag()
-        header = f"📊 **大盘环境感知:** \n  • {vix_desc}  \n  • {regime_desc}  "
-        if perf_text: header = f"{perf_text}\n\n{header}"
+        perf = load_strategy_performance_tag()
+        header = f"**📊 环境感知:**\n- {vix_desc}\n- {regime_desc}"
         
-        # 使用明显的分隔线，保证卡片独立
-        final_content = header + "\n\n━━━━━━━━━━━━━━━━━━\n\n" + "\n\n━━━━━━━━━━━━━━━━━━\n\n".join(txts) + f"\n\n*(入选门槛: {min_score}分 | 降权防诱多机制已开启)*"
+        final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
+                        "\n\n---\n\n".join(txts) + \
+                        f"\n\n*(门槛: {min_score}分 | EV自适应权重惩罚已激活)*"
         
-        send_alert("多因子优选异动 (矩阵共振版)", final_content)
+        send_alert("多因子优选 (矩阵版)", final_content)
         
-        with open(Config.LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"]} for r in reports[:15]]}, ensure_ascii=False) + "\n")
+        with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", [])} for r in reports[:15]]}, ensure_ascii=False) + "\n")
 
 def run_backtest_engine() -> None:
-    if not os.path.exists(Config.LOG_FILE): return
+    # 🚀 修复2: 兼容扫描过去所有月份产生的分片日志文件
+    log_files = [f for f in os.listdir('.') if f.startswith('backtest_log') and f.endswith('.jsonl')]
+    if not log_files: 
+        logger.warning("未找到任何历史日志，回测取消。")
+        return
+        
     trades = []
-    with open(Config.LOG_FILE, 'r') as f:
-        for line in f:
-            try:
-                log = json.loads(line.strip())
-                trades.extend([{'date': log['date'], 'symbol': p['symbol'], 'signals': p.get('signals', [])} for p in log.get('top_picks', [])])
-            except: pass
+    for lf in log_files:
+        try:
+            with open(lf, 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        log = json.loads(line.strip())
+                        trades.extend([{'date': log['date'], 'symbol': p['symbol'], 'signals': p.get('signals', []), 'factors': p.get('factors', [])} for p in log.get('top_picks', [])])
+                    except: pass
+        except Exception as e:
+            logger.debug(f"读取日志分片 {lf} 失败: {e}")
+            
     if not trades: return
     syms = list(set([t['symbol'] for t in trades]))
+    
     try:
-        df_c = yf.download(syms, period="2mo", progress=False, threads=2)['Close']
-        if len(syms) == 1: df_c = pd.DataFrame(df_c, columns=syms)
+        df_all = yf.download(syms, period="2mo", progress=False, threads=2)
+        if isinstance(df_all.columns, pd.MultiIndex):
+            df_c = df_all['Close']
+            df_o = df_all['Open']
+        else:
+            df_c = df_all[['Close']].rename(columns={'Close': syms[0]})
+            df_o = df_all[['Open']].rename(columns={'Open': syms[0]})
+            
         df_c.index = df_c.index.strftime('%Y-%m-%d')
-    except Exception: return
+        df_o.index = df_o.index.strftime('%Y-%m-%d')
+    except Exception as e:
+        logger.error(f"回测拉取数据失败: {e}")
+        return
+    
+    SLIPPAGE = 0.003    
+    COMMISSION = 0.0005 
     
     stats, factor_rets = {'T+1': [], 'T+3': [], 'T+5': []}, {}
     for t in trades:
         sym, r_dt = t['symbol'], t['date']
-        if sym not in df_c.columns: continue
+        if sym not in df_c.columns or sym not in df_o.columns: continue
         valid = df_c.index[df_c.index >= r_dt]
         if len(valid) == 0: continue
+        
         e_idx = df_c.index.get_loc(valid[0])
-        e_px = df_c.at[valid[0], sym]
-        for d in [1, 3, 5]:
-            if e_idx + d < len(df_c):
-                x_px = df_c.iloc[e_idx + d][sym]
-                if not np.isnan(x_px):
-                    ret = (x_px - e_px) / e_px
-                    stats[f'T+{d}'].append(ret)
-                    if d == 3:
-                        for sig_txt in t.get('signals', []):
-                            m = re.search(r'\[(.*?)\]', sig_txt)
-                            if m:
-                                tag = f"[{m.group(1)}]"
-                                factor_rets.setdefault(tag, []).append(ret)
-    
-    res = {p: {'win_rate': sum(1 for x in r if x > 0)/len(r), 'avg_ret': sum(r)/len(r), 'total_trades': len(r)} for p, r in stats.items() if r}
-    f_res = {t: {'win_rate': sum(1 for x in r if x > 0)/len(r), 'avg_ret': sum(r)/len(r), 'count': len(r)} for t, r in factor_rets.items() if len(r) >= 2}
-    with open(Config.STATS_FILE, 'w') as f: json.dump({"overall": res, "factors": f_res}, f)
-    
-    report_lines = [
-        "# 📈 自动化量化监控战报 (Auto-Backtest Report)",
-        f"**最后更新时间:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
-        "",
-        "## 1. 周期胜率总览",
-        "| 持仓周期 | 胜率 (Win Rate) | 平均收益 (Avg Return) | 样本交易笔数 |",
-        "| :---: | :---: | :---: | :---: |"
-    ]
-    for p in ['T+1', 'T+3', 'T+5']:
-        if p in res:
-            d = res[p]
-            report_lines.append(f"| **{p}** | {d['win_rate']*100:.1f}% | {d['avg_ret']*100:+.2f}% | {d['total_trades']} |")
+        if e_idx + 1 >= len(df_c): continue
+        
+        e_px_raw = df_o.iloc[e_idx + 1][sym] 
+        prev_c_px = df_c.iloc[e_idx][sym]
+        
+        if pd.isna(e_px_raw) or e_px_raw <= 0: continue
+        
+        gap_up = (e_px_raw - prev_c_px) / prev_c_px
+        if gap_up > 0.03:
+            entry_cost = e_px_raw * (1 + SLIPPAGE * 3 + COMMISSION) 
         else:
-            report_lines.append(f"| **{p}** | N/A | N/A | 0 |")
-
-    sorted_factors = []
-    if f_res:
-        report_lines.extend([
-            "",
-            "## 2. 🧬 核心因子有效性排行 (T+3 波段)",
-            "| **因子标签** | **胜率** | **均收益** | **触发次数** |",
-            "| :--- | :---: | :---: | :---: |"
-        ])
-        sorted_factors = sorted(f_res.items(), key=lambda x: x[1]['win_rate'], reverse=True)
-        for tag, d in sorted_factors:
-            report_lines.append(f"| {tag} | {d['win_rate']*100:.1f}% | {d['avg_ret']*100:+.2f}% | {d['count']} |")
-
-    report_lines.extend(["", "> *注：本报告每周五自动生成。收益率不包含滑点与佣金摩擦。*"])
-    try:
-        with open(Config.REPORT_FILE, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(report_lines))
-    except Exception as e:
-        logger.error(f"写入 Markdown 失败: {e}")
+            entry_cost = e_px_raw * (1 + SLIPPAGE + COMMISSION)
         
-    # 🚀 回测战报也升级为结构化列表
-    alert_lines = ["📊 **周期胜率总览** "]
-    for p, d in res.items():
-        alert_lines.append(f"  • {p}: 胜率 {d['win_rate']*100:.1f}% | 均收益 {d['avg_ret']*100:+.2f}%  ")
-        
+        for d in [1, 3, 5]:
+            exit_idx = e_idx + d
+            if exit_idx < len(df_c):
+                x_px_raw = df_c.iloc[exit_idx][sym] 
+                if not np.isnan(x_px_raw):
+                    
+                    prev_x_px = df_c.iloc[exit_idx-1][sym] if exit_idx > 0 else e_px_raw
+                    daily_volatility = abs((x_px_raw - prev_x_px) / prev_x_px)
+                    curr_exit_slippage = SLIPPAGE * 5 if daily_volatility > 0.15 else SLIPPAGE
+                    
+                    exit_revenue = x_px_raw * (1 - curr_exit_slippage - COMMISSION)
+                    ret = (exit_revenue - entry_cost) / entry_cost
+                    stats[f'T+{d}'].append(ret)
+                    
+                    if d == 3:
+                        factor_list = t.get('factors', [])
+                        if not factor_list:
+                            for sig_txt in t.get('signals', []):
+                                m = re.search(r'\[(.*?)\]', sig_txt)
+                                if m: factor_list.append(m.group(1).split(" ")[0])
+                                
+                        for f_name in factor_list:
+                            factor_rets.setdefault(f"[{f_name}]", []).append(ret)
+    
+    res = {}
+    for p, r in stats.items():
+        if not r: continue
+        ret_arr = np.array(r)
+        wr = len(ret_arr[ret_arr > 0]) / len(ret_arr)
+        avg_r = np.mean(ret_arr)
+        std_r = np.std(ret_arr) if len(ret_arr) > 1 else 1e-6
+        sharpe = avg_r / (std_r + 1e-10)
+        worst = np.min(ret_arr)
+        res[p] = {'win_rate': wr, 'avg_ret': avg_r, 'sharpe': sharpe, 'worst_trade': worst, 'total_trades': len(r)}
+
+    f_res = {t: {'win_rate': sum(1 for x in r if x > 0)/len(r), 'avg_ret': sum(r)/len(r), 'count': len(r)} for t, r in factor_rets.items() if len(r) >= 2}
+    with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: json.dump({"overall": res, "factors": f_res}, f, indent=4)
+    
+    report_md = [f"# 📈 自动量化战报\n**更新:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n| 周期 | 胜率 | 均收益 | Sharpe | 单笔极亏 | 笔数 |\n|:---:|:---:|:---:|:---:|:---:|:---:|"]
+    for p in ['T+1', 'T+3', 'T+5']:
+        d = res.get(p, {'win_rate':0,'avg_ret':0,'sharpe':0,'worst_trade':0,'total_trades':0})
+        report_md.append(f"| {p} | {d['win_rate']*100:.1f}% | {d['avg_ret']*100:+.2f}% | {d['sharpe']:.2f} | {d['worst_trade']*100:.1f}% | {d['total_trades']} |")
+    
     if f_res:
-        alert_lines.extend(["  ", "━━━━━━━━━━━━━━━━━━", "  ", "🧬 **核心因子排行 (T+3 波段)** "])
-        medals = ['1️⃣', '2️⃣', '3️⃣']
-        for idx, (tag, d) in enumerate(sorted_factors[:3]):
-            icon = medals[idx] if idx < 3 else '🔸'
-            alert_lines.append(f"  {icon} {tag}  \n      胜率 {d['win_rate']*100:.1f}% | 触发 {d['count']}次  ")
+        report_md.append("\n## 🧬 因子排行 (T+3)\n| 因子 | 胜率 | 次数 |\n|:---|:---:|:---:|")
+        sorted_f = sorted(f_res.items(), key=lambda x: x[1]['win_rate'], reverse=True)
+        for tag, d in sorted_f: report_md.append(f"| {tag} | {d['win_rate']*100:.1f}% | {d['count']} |")
+    
+    with open(Config.REPORT_FILE, 'w', encoding='utf-8') as f: f.write('\n'.join(report_md))
+
+    alert_lines = ["### 📊 **周期胜率总览 (含严格摩擦与踩踏滑点)**"]
+    for p, d in res.items(): alert_lines.append(f"- **{p}:** 胜率 {d['win_rate']*100:.1f}% | 均收益 {d['avg_ret']*100:+.2%} | Sharpe {d['sharpe']:.2f} | 极回撤 {d['worst_trade']*100:.1f}%")
+    
+    if f_res:
+        alert_lines.extend(["", "---", "", "### 🧬 **核心因子排行 (T+3)**"])
+        for idx, (tag, d) in enumerate(sorted_f[:3]):
+            icon = ['1️⃣','2️⃣','3️⃣'][idx]
+            alert_lines.append(f"- {icon} **{tag}**: 胜率 {d['win_rate']*100:.1f}%")
             
     send_alert("策略终极回测战报", "\n".join(alert_lines))
 
@@ -611,4 +776,4 @@ if __name__ == "__main__":
     if m == "sentinel": run_volatility_sentinel()
     elif m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("✅ 连通性测试", "系统环境正常，全新的结构化层级卡片排版已上线！")
+    elif m == "test": send_alert("连通性测试", "系统已拔除全局变量污染！按月切片日志与解析引擎加固完毕。")
