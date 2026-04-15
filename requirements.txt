@@ -8,6 +8,10 @@ numpy==1.26.0
 requests==2.31.0
 lxml==4.9.3
 
-#DevOps 质检工具
+#🚀 算力解锁：引入机器学习生态进行逻辑回归与概率推演
+
+scikit-learn>=1.3.0
+
+DevOps 质检工具
 
 flake8==6.1.0
