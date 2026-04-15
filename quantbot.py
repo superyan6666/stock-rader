@@ -12,6 +12,7 @@ import json
 import warnings
 from typing import List, Tuple
 from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 
 # 忽略第三方库引发的各种杂音警告，保持 GitHub Actions 日志清爽
 warnings.filterwarnings('ignore')
@@ -71,7 +72,6 @@ class Config:
     CROWDING_MIN_STOCKS: int = 2
     CROWDING_EXCLUDE_SECTORS: List[str] = ["QQQ"]
     
-    # 🚀 修复2: 日志按月分片轮转，防止滚雪球式 I/O 拥堵
     LOG_PREFIX: str = "backtest_log_"
     STATS_FILE: str = "strategy_stats.json"
     REPORT_FILE: str = "backtest_report.md"
@@ -79,7 +79,6 @@ class Config:
 
     @classmethod
     def get_current_log_file(cls) -> str:
-        """动态获取当月日志文件名，例如 backtest_log_2026_04.jsonl"""
         return f"{cls.LOG_PREFIX}{datetime.now(timezone.utc).strftime('%Y_%m')}.jsonl"
 
     @staticmethod
@@ -206,7 +205,6 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
         for w_url in wiki_urls:
             w_resp = requests.get(w_url, headers=_GLOBAL_HEADERS, timeout=10)
             if w_resp.status_code == 200:
-                # 🚀 修复3: 强制采用 flavor='lxml' 严苛模式，防止 html.parser 带来的脆弱性崩溃
                 for table in pd.read_html(StringIO(w_resp.text), flavor='lxml'):
                     col = next((c for c in ['Symbol', 'Ticker symbol', 'Ticker'] if c in table.columns), None)
                     if col:
@@ -244,9 +242,6 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
         available_tickers = set(close_df.columns) if isinstance(close_df, pd.DataFrame) else set()
         missing_tickers = set(tickers_list) - available_tickers
         
-        # 🚀 修复1: 抛弃 BLACKLIST 全局变量污染。
-        # 由于 missing_tickers 已经被自然剔除出 available_tickers，它们绝对不会进入后续缓存。
-        # 此处我们只需打印日志即可，纯无状态流转！
         if missing_tickers:
             logger.info(f"🛡️ 数据自净: 发现 {len(missing_tickers)} 只失效/退市标的，已将其从本次计算与缓存中永久抹除。")
             
@@ -439,7 +434,12 @@ def run_volatility_sentinel() -> None:
     active_pool = get_filtered_watchlist(max_stocks=40)
     alerts = []
     
+    # 🚀 新增：引入波动率自适应乘数 (VIX Scalar)
+    vix, _ = get_vix_level()
+    vix_scalar = max(0.6, min(1.4, 18.0 / max(vix, 1.0)))
+    
     for sym in active_pool:
+        if sym in Config.BLACKLIST: continue
         try:
             df_h = safe_get_history(sym, period="2d", interval="1h", fast_mode=True)
             if len(df_h) < 2: continue
@@ -449,15 +449,26 @@ def run_volatility_sentinel() -> None:
             is_alert = False
             alert_reason = ""
             if abs(hr_chg) > 3.5: 
-                is_alert = True
-                alert_reason = f"- ⚡ 1h脉冲: **{hr_chg:+.2f}%**"
+                # 🚀 新增：成交量有效性二次校验 (Volume Validation)，防无量虚假脉冲
+                is_valid_vol = True
+                if len(df_h) >= 5:
+                    vol_last_hour = df_h['Volume'].iloc[-1]
+                    vol_ma_5h = df_h['Volume'].rolling(5).mean().iloc[-1]
+                    if vol_last_hour < vol_ma_5h * 1.2:
+                        is_valid_vol = False  # 缩量脉冲，判定为流动性噪音
+                
+                if is_valid_vol:
+                    is_alert = True
+                    alert_reason = f"- ⚡ 1h脉冲: **{hr_chg:+.2f}%** (放量确认)"
 
             df_d = safe_get_history(sym, period="1mo", interval="1d", fast_mode=True)
             trade_plan = ""
             if len(df_d) >= 15:
                 df_d['TR'] = pd.concat([df_d['High']-df_d['Low'], (df_d['High']-df_d['Close'].shift()).abs(), (df_d['Low']-df_d['Close'].shift()).abs()], axis=1).max(axis=1)
                 atr = df_d['TR'].rolling(14).mean().iloc[-1]
-                tp, sl = curr_px + 3.0 * atr, curr_px - 1.5 * atr
+                
+                # 🚀 应用自适应乘数：高波收紧，低波放宽
+                tp, sl = curr_px + 3.0 * vix_scalar * atr, curr_px - 1.5 * vix_scalar * atr
                 
                 trade_plan = (
                     f"**💰 交易计划:**\n"
@@ -490,6 +501,9 @@ def run_tech_matrix() -> None:
     regime, regime_desc, qqq_df = get_market_regime()
     vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
     
+    # 🚀 新增：引入波动率自适应乘数 (VIX Scalar)
+    vix_scalar = max(0.6, min(1.4, 18.0 / max(vix, 1.0)))
+    
     sector_data = {etf: (sdf['Close'].ffill().iloc[-1] / sdf['Close'].iloc[-20]) - 1 
                   for etf in Config.SECTOR_MAP.keys() 
                   if not (sdf := safe_get_history(etf, "2mo", "1d", fast_mode=True)).empty and len(sdf) >= 20}
@@ -507,9 +521,19 @@ def run_tech_matrix() -> None:
                     avg_ret = data.get("avg_ret", 0.0)
                     cnt = data.get("count", 0)
                     
-                    if cnt >= 3:  
-                        w = 1.0 + (wr - 0.5) * 2.0 + (avg_ret * 20) 
-                        factor_weights[tag] = max(0.2, min(2.0, w)) 
+                    # 🚀 修复: 引入连续型贝叶斯收缩 (Bayesian Shrinkage)，根治冷启动与小样本极值陷阱
+                    MIN_SAMPLES = 5.0        # 达到 5 次样本才具备 100% 置信度
+                    PRIOR_WIN_RATE = 0.52    # 机构先验胜率微弱优势基准
+                    PRIOR_AVG_RET = 0.0      # 先验均收益基准
+                    
+                    # 样本越少，alpha 越小，最终权重越向先验分布(保守预期)收缩
+                    alpha = min(1.0, cnt / MIN_SAMPLES)
+                    shrunk_wr = alpha * wr + (1.0 - alpha) * PRIOR_WIN_RATE
+                    shrunk_avg_ret = alpha * avg_ret + (1.0 - alpha) * PRIOR_AVG_RET
+                    
+                    # 期望值公式基于收缩后的稳健统计量进行计算
+                    w = 1.0 + (shrunk_wr - 0.5) * 2.0 + (shrunk_avg_ret * 20) 
+                    factor_weights[tag] = max(0.2, min(2.0, w)) 
     except Exception as e:
         logger.warning(f"动态权重解析跳过: {e}")
 
@@ -518,6 +542,7 @@ def run_tech_matrix() -> None:
 
     reports = []
     for sym in get_filtered_watchlist():
+        if sym in Config.BLACKLIST: continue
         try:
             df = safe_get_history(sym, "1y", "1d", fast_mode=True)
             if len(df) < 150: continue
@@ -525,18 +550,26 @@ def run_tech_matrix() -> None:
             curr, prev = df.iloc[-1], df.iloc[-2]
             if curr['Event_Risk'] > 0.85 or (curr['ATR'] / curr['Close'] > 0.10): continue
             
-            sig, factors, score, st_cnt = [], [], 0, 0
+            # 🚀 新增: 硬性趋势前置过滤。屏蔽 50日均线死叉200日均线，且价格被200日均线压制的长期熊股，拒绝“死猫跳”
+            if pd.notna(curr['SMA_200']) and curr['Close'] < curr['SMA_200'] and curr['SMA_50'] < curr['SMA_200']: 
+                continue
+            
+            sig, factors, st_cnt = [], [], 0
             
             is_vol = (curr['Volume'] / curr['Vol_MA20'] > 1.5) and (curr['Close'] > curr['Open'])
             is_st = curr['SuperTrend_Up'] == 1
+            
+            # 🚀 引入同类因子拥挤度分组 (Orthogonal Groups - 精细化正交)
+            triggered = []
+            cloud_penalty = False
 
             if pd.notna(curr['SMA_200']) and curr['Close'] > curr['SMA_50'] > curr['SMA_150'] > curr['SMA_200']:
                 fw = get_fw("米奈尔维尼")
-                sig.append(f"🏆 [米奈尔维尼] 主升形态 (权:{fw:.1f}x)"); factors.append("米奈尔维尼"); score += int(8 * w_mul * fw); st_cnt += 1
+                triggered.append(("trend_align", "米奈尔维尼", f"🏆 [米奈尔维尼] 主升形态 (权:{fw:.1f}x)", 8 * w_mul * fw, True))
                 
             if len(df) >= 40 and df['Close'].iloc[-20:].min() < df['Close'].iloc[-40:-20].min() and df['OBV'].iloc[-20:].min() > df['OBV'].iloc[-40:-20].min():
                 fw = get_fw("OBV底背离")
-                sig.append(f"🌊 [OBV底背离] 资金潜伏 (权:{fw:.1f}x)"); factors.append("OBV底背离"); score += int(7 * w_mul * fw); st_cnt += 1
+                triggered.append(("flow", "OBV底背离", f"🌊 [OBV底背离] 资金潜伏 (权:{fw:.1f}x)", 7 * w_mul * fw, True))
                 
             if not qqq_df.empty:
                 m_df = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, how='inner')
@@ -544,53 +577,89 @@ def run_tech_matrix() -> None:
                     rs_20 = (m_df['Close_x'].iloc[-1]/m_df['Close_x'].iloc[-20]) / max(m_df['Close_y'].iloc[-1]/m_df['Close_y'].iloc[-20], 0.5)
                     if rs_20 > 1.08: 
                         fw = get_fw("强相对强度")
-                        sig.append(f"⚡ [强相对强度] 跑赢大盘 (权:{fw:.1f}x)"); factors.append("强相对强度"); score += int((7 if is_vol else 4) * w_mul * fw)
+                        triggered.append(("flow", "强相对强度", f"⚡ [强相对强度] 跑赢大盘 (权:{fw:.1f}x)", (7 if is_vol else 4) * w_mul * fw, False))
                         
             dyn_rsi = curr['RSI_P20']
             if curr['RSI'] < dyn_rsi and prev['RSI'] >= dyn_rsi and is_st:
                 fw = get_fw("强势回踩")
-                sig.append(f"🟢 [强势回踩] RSI:{curr['RSI']:.1f} (权:{fw:.1f}x)"); factors.append("强势回踩"); score += int(10 * w_mul * fw); st_cnt += 1
+                triggered.append(("reversal", "强势回踩", f"🟢 [强势回踩] RSI:{curr['RSI']:.1f} (权:{fw:.1f}x)", 10 * w_mul * fw, True))
                 
             if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
                 fw = get_fw("MACD金叉")
-                sig.append(f"🔥 [MACD金叉] (权:{fw:.1f}x)"); factors.append("MACD金叉"); score += int(10 * w_mul * fw); st_cnt += 1
+                triggered.append(("trend_confirm", "MACD金叉", f"🔥 [MACD金叉] (权:{fw:.1f}x)", 10 * w_mul * fw, True))
                 
             is_sqz = (curr['BB_Upper'] - curr['BB_Lower']) < (curr['KC_Upper'] - curr['KC_Lower'])
             if is_sqz: 
                 fw = get_fw("TTM Squeeze ON")
-                sig.append(f"📦 [TTM Squeeze ON] (权:{fw:.1f}x)"); factors.append("TTM Squeeze ON"); score += int(6 * w_mul * fw)
+                # 独立分组，不参与组内边际递减折扣
+                triggered.append(("squeeze", "TTM Squeeze ON", f"📦 [TTM Squeeze ON] (权:{fw:.1f}x)", 6 * w_mul * fw, False))
                 
             cmf = curr['CMF']
             if cmf > 0.20: 
                 fw = get_fw("机构控盘")
-                sig.append(f"🏦 [机构控盘] CMF:{cmf:.2f} (权:{fw:.1f}x)"); factors.append("机构控盘"); score += int(5 * w_mul * fw); st_cnt += 1
+                triggered.append(("flow", "机构控盘", f"🏦 [机构控盘] CMF:{cmf:.2f} (权:{fw:.1f}x)", 5 * w_mul * fw, True))
                 
             if curr['Above_Cloud'] == 0: 
-                score = int(score * 0.4); sig.append("☁️ [云下压制]")
+                cloud_penalty = True
             elif curr['Tenkan'] > curr['Kijun'] and curr['Cloud_Twist'] == 1:
                 fw = get_fw("一目多头")
-                sig.append(f"🌥️ [一目多头] (权:{fw:.1f}x)"); factors.append("一目多头"); score += int(6 * w_mul * fw); st_cnt += 1
+                triggered.append(("trend_confirm", "一目多头", f"🌥️ [一目多头] (权:{fw:.1f}x)", 6 * w_mul * fw, True))
                 
             gap_pct = (curr['Open'] - prev['Close']) / prev['Close']
             if 0.015 < gap_pct < 0.06 and is_vol:
                 fw = get_fw("突破缺口")
-                sig.append(f"💥 [突破缺口] +{gap_pct*100:.1f}% (权:{fw:.1f}x)"); factors.append("突破缺口"); score += int(6 * w_mul * fw); st_cnt += 1
+                triggered.append(("reversal", "突破缺口", f"💥 [突破缺口] +{gap_pct*100:.1f}% (权:{fw:.1f}x)", 6 * w_mul * fw, True))
             
+            # 🚀 核心算法：因子拥挤度非线性边际惩罚 (仅同组内生效，跨组奖励保留)
+            cat_scores = defaultdict(float)
+            cat_counts = defaultdict(int)
+            
+            for cat, tag, text, pts, is_s in triggered:
+                cat_scores[cat] += pts
+                cat_counts[cat] += 1
+                sig.append(text)
+                factors.append(tag)
+                if is_s: st_cnt += 1
+                
+            raw_score = 0.0
+            for cat, pts in cat_scores.items():
+                k = cat_counts[cat]
+                # 🚀 修复: 引入保底折扣率(Floor)与温和衰减，防止主升浪中多指标共振被过度惩罚而导致踏空
+                discount = max(0.65, 1.0 / (1 + 0.2 * (k - 1))) if k >= 2 else 1.0
+                raw_score += pts * discount
+                
+            if cloud_penalty:
+                raw_score *= 0.4
+                sig.append("☁️ [云下压制]")
+                
+            score = int(raw_score)
+
             if score > 0 and st_cnt < 1 and not is_vol: score = int(score * 0.3)
             if st_cnt >= 2: score += 5
+
+            # 🚀 新增：跳空缺口的半仓惩罚与动态仓位建议
+            position_advice = "✅ 标准仓位"
+            if gap_pct > 0.03:
+                score = int(score * 0.7)
+                position_advice = "⚠️ 半仓观察 (今日跳空偏高，提防回落)"
 
             if sig and score >= min_score:
                 if check_earnings_risk(sym):
                     sig.append("💣 [财报雷区] 近5日发财报,风险极高")
                     score = int(score * 0.5)
+                    position_advice = "⚠️ 极小仓位 (财报赌博风险)"
 
                 if score >= min_score:
                     news = get_latest_news(sym)
                     reports.append({
                         "symbol": sym, "score": score, "signals": sig[:8], "factors": factors,
-                        "curr_close": curr['Close'], "tp": curr['Close'] + 3.0 * curr['ATR'], 
-                        "sl": curr['Close'] - 1.5 * curr['ATR'], "news": news,
-                        "sector": Config.get_sector_etf(sym), "raw_score": score
+                        "curr_close": curr['Close'], 
+                        # 🚀 应用自适应乘数计算止盈止损点位
+                        "tp": curr['Close'] + 3.0 * vix_scalar * curr['ATR'], 
+                        "sl": curr['Close'] - 1.5 * vix_scalar * curr['ATR'], 
+                        "news": news,
+                        "sector": Config.get_sector_etf(sym), "raw_score": score,
+                        "pos_advice": position_advice
                     })
         except Exception: pass
 
@@ -629,9 +698,10 @@ def run_tech_matrix() -> None:
                 f"**💡 触发共振:**\n{sigs_fmt}{news_fmt}\n\n"
                 f"**💰 交易计划:**\n"
                 f"- 💵 现价: `{r['curr_close']:.2f}`\n"
+                f"- ⚖️ 建议仓位: **{r.get('pos_advice', '✅ 标准仓位')}**\n"
                 f"- 🎯 建议止盈: **${r['tp']:.2f}**\n"
                 f"- 🛡️ 初始止损: **${r['sl']:.2f}**\n"
-                f"- 📈 移动防守: **新高后按 Max(最高价 - 3*ATR) 追踪**\n"
+                f"- 📈 移动防守: **新高后按 Max(最高价 - {1.5 * vix_scalar:.1f}*ATR) 追踪**\n"
                 f"- ⚠️ 缺口策略: **若次日跳空 > 3%, 建议缩减半仓或等30分钟回踩**"
             )
             txts.append(card)
@@ -641,7 +711,7 @@ def run_tech_matrix() -> None:
         
         final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
                         "\n\n---\n\n".join(txts) + \
-                        f"\n\n*(门槛: {min_score}分 | EV自适应权重惩罚已激活)*"
+                        f"\n\n*(门槛: {min_score}分 | 正交降权与 EV风控已激活)*"
         
         send_alert("多因子优选 (矩阵版)", final_content)
         
@@ -649,7 +719,6 @@ def run_tech_matrix() -> None:
             f.write(json.dumps({"date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", [])} for r in reports[:15]]}, ensure_ascii=False) + "\n")
 
 def run_backtest_engine() -> None:
-    # 🚀 修复2: 兼容扫描过去所有月份产生的分片日志文件
     log_files = [f for f in os.listdir('.') if f.startswith('backtest_log') and f.endswith('.jsonl')]
     if not log_files: 
         logger.warning("未找到任何历史日志，回测取消。")
@@ -704,7 +773,9 @@ def run_backtest_engine() -> None:
         if pd.isna(e_px_raw) or e_px_raw <= 0: continue
         
         gap_up = (e_px_raw - prev_c_px) / prev_c_px
-        if gap_up > 0.03:
+        is_half_pos = gap_up > 0.03
+        
+        if is_half_pos:
             entry_cost = e_px_raw * (1 + SLIPPAGE * 3 + COMMISSION) 
         else:
             entry_cost = e_px_raw * (1 + SLIPPAGE + COMMISSION)
@@ -721,6 +792,11 @@ def run_backtest_engine() -> None:
                     
                     exit_revenue = x_px_raw * (1 - curr_exit_slippage - COMMISSION)
                     ret = (exit_revenue - entry_cost) / entry_cost
+                    
+                    # 🚀 引入半仓收益折算，真实反映资金利用效率
+                    if is_half_pos:
+                        ret = ret * 0.5
+                        
                     stats[f'T+{d}'].append(ret)
                     
                     if d == 3:
@@ -776,4 +852,4 @@ if __name__ == "__main__":
     if m == "sentinel": run_volatility_sentinel()
     elif m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "系统已拔除全局变量污染！按月切片日志与解析引擎加固完毕。")
+    elif m == "test": send_alert("连通性测试", "系统已完成终极底层优化！正交拥挤度折扣 (Orthogonal Discount) 已上线。")
