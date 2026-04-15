@@ -14,7 +14,6 @@ from typing import List, Tuple
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
-# 忽略第三方库引发的各种杂音警告，保持 GitHub Actions 日志清爽
 warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
@@ -36,7 +35,6 @@ class Config:
     WEBHOOK_URL: str = os.environ.get('WEBHOOK_URL', '')
     TELEGRAM_BOT_TOKEN: str = os.environ.get('TELEGRAM_BOT_TOKEN', '')
     TELEGRAM_CHAT_ID: str = os.environ.get('TELEGRAM_CHAT_ID', '')
-    
     DINGTALK_KEYWORD: str = "AI"
     
     CORE_WATCHLIST: List[str] = [
@@ -77,6 +75,10 @@ class Config:
     REPORT_FILE: str = "backtest_report.md"
     CACHE_FILE: str = "tickers_cache.json"
     ALERT_CACHE_FILE: str = "alert_history.json"
+    MODEL_FILE: str = "scoring_model.pkl" # AI 模型存放路径
+    
+    # 机器学习特征列序
+    ALL_FACTORS = ["米奈尔维尼", "OBV底背离", "强相对强度", "强势回踩", "MACD金叉", "TTM Squeeze ON", "机构控盘", "一目多头", "突破缺口"]
 
     @classmethod
     def get_current_log_file(cls) -> str:
@@ -247,14 +249,13 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
         missing_tickers = set(tickers_list) - available_tickers
         
         if missing_tickers:
-            logger.info(f"🛡️ 数据自净: 发现 {len(missing_tickers)} 只失效/退市标的，已将其从本次计算与缓存中永久抹除。")
+            logger.info(f"🛡️ 数据自净: 发现 {len(missing_tickers)} 只失效/退市标的，已抹除。")
             
         if len(available_tickers) > 200:
             try:
                 with open(Config.CACHE_FILE, "w", encoding="utf-8") as f:
                     json.dump(list(available_tickers), f)
-            except Exception as e:
-                logger.debug(f"写入缓存失败: {e}")
+            except Exception: pass
 
         closes = close_df.dropna(axis=1, how='all').ffill().iloc[-1]
         volumes = volume_df.dropna(axis=1, how='all').mean()
@@ -263,7 +264,6 @@ def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
         valid_turnovers = turnovers[(closes > 10.0) & (turnovers > 30_000_000)]
         top_tickers = valid_turnovers.sort_values(ascending=False).head(max_stocks).index.tolist()
         if top_tickers:
-            logger.info(f"✅ 漏斗完成！锁定极高流动性标的: {len(top_tickers)} 只。")
             return top_tickers
         return Config.CORE_WATCHLIST[:max_stocks]
     except Exception as e:
@@ -337,7 +337,7 @@ def get_vix_level(qqq_df_for_shadow: pd.DataFrame = None) -> Tuple[float, str]:
     if vix < 15: return vix, f"✅ 市场平静 ({prefix}: {vix:.2f})"
     return vix, f"⚖️ 正常波动 ({prefix}: {vix:.2f})"
 
-def get_market_regime() -> Tuple[str, str, pd.DataFrame]:
+def get_market_regime(active_pool: List[str] = None) -> Tuple[str, str, pd.DataFrame]:
     df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", auto_adjust=False, fast_mode=True)
     if len(df) < 200: return "range", "数据不足，默认震荡", df
     
@@ -345,19 +345,40 @@ def get_market_regime() -> Tuple[str, str, pd.DataFrame]:
     ma200 = df['Close'].rolling(200).mean().iloc[-1]
     ma50_curr = df['Close'].rolling(50).mean().iloc[-1]
     ma50_prev = df['Close'].rolling(50).mean().iloc[-20]
-    
     trend_20d = (c_close - df['Close'].iloc[-20]) / df['Close'].iloc[-20]
     
+    # 🚀 算力红利释放：计算真正的市场全景宽度 (Market Breadth)
+    breadth_desc = ""
+    if active_pool and len(active_pool) >= 30:
+        try:
+            # 抽样前 60 只最具流动性标的测算大盘水温
+            sample = active_pool[:60]
+            pool_df = yf.download(sample, period="3mo", progress=False)['Close']
+            if isinstance(pool_df, pd.DataFrame):
+                sma50 = pool_df.rolling(50).mean()
+                above_50 = (pool_df.iloc[-1] > sma50.iloc[-1]).sum()
+                breadth = above_50 / len(sample)
+                breadth_desc = f" | 市场宽度: {breadth:.0%} 站上50日均线"
+                
+                # 顶背离风控：指数在牛市，但个股普跌（赚了指数不赚钱）
+                if c_close > ma200 and breadth < 0.4:
+                    return "hidden_bear", f"⚠️ 指数虚高但宽度严重背离{breadth_desc}", df
+                # 底背离机会：指数在熊市，但超 60% 个股已筑底
+                elif c_close < ma200 and breadth > 0.6:
+                    return "hidden_bull", f"🔥 指数弱势但暗流涌动{breadth_desc}", df
+        except Exception as e: 
+            logger.debug(f"市场宽度探测失败: {e}")
+
     if c_close > ma200:
-        if trend_20d > 0.02: return "bull", "🐂 牛市主升阶段", df
-        else: return "range", "⚖️ 牛市高位震荡", df
+        if trend_20d > 0.02: return "bull", f"🐂 牛市主升阶段{breadth_desc}", df
+        else: return "range", f"⚖️ 牛市高位震荡{breadth_desc}", df
     else:
         if c_close > ma50_curr and ma50_curr > ma50_prev and trend_20d > 0.04:
-            return "rebound", "🦅 熊市超跌反弹 (V反)", df
+            return "rebound", f"🦅 熊市超跌反弹 (V反){breadth_desc}", df
         elif trend_20d < -0.02: 
-            return "bear", "🐻 熊市回调阶段", df
+            return "bear", f"🐻 熊市回调阶段{breadth_desc}", df
         else: 
-            return "range", "⚖️ 熊市底部震荡", df
+            return "range", f"⚖️ 熊市底部震荡{breadth_desc}", df
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_index()
@@ -434,9 +455,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 # ================= 4. 执行引擎 =================
 
-# 🚀 核心更新：读写分离的冷却机制，实现 [前置拦截过滤]
 def get_alert_cache() -> dict:
-    """读取当日缓存池"""
     today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     cache_data = {"date": today_str, "sentinel": [], "matrix": []}
     try:
@@ -449,11 +468,9 @@ def get_alert_cache() -> dict:
     return cache_data
 
 def is_alerted(sym: str, mode: str) -> bool:
-    """前置检查：是否已在当日推送过该标的"""
     return sym in get_alert_cache().get(mode, [])
 
 def set_alerted(sym: str, mode: str) -> None:
-    """后置写入：记录并落盘已推送标的"""
     cache = get_alert_cache()
     if sym not in cache.get(mode, []):
         cache.setdefault(mode, []).append(sym)
@@ -475,8 +492,6 @@ def run_volatility_sentinel() -> None:
     vix_scalar = max(0.6, min(1.4, 18.0 / max(vix, 1.0)))
     
     for sym in active_pool:
-        if sym in Config.BLACKLIST: continue
-        # 🚀 前置拦截：今天报过警的直接跳过，节省了大量安全获取 1h 数据的耗时与 API 限制
         if is_alerted(sym, "sentinel"): continue 
         try:
             df_h = safe_get_history(sym, period="2d", interval="1h", fast_mode=True)
@@ -519,7 +534,7 @@ def run_volatility_sentinel() -> None:
                     alert_reason = f"{alert_reason}\n{reason}" if alert_reason else reason
             
             if is_alert:
-                set_alerted(sym, "sentinel") # 🚀 确认推送后，正式将其打入冷却池
+                set_alerted(sym, "sentinel") 
                 news = get_latest_news(sym)
                 news_block = f"\n\n**📰 最新资讯:**\n- {news}" if news else ""
                 
@@ -537,13 +552,13 @@ def run_volatility_sentinel() -> None:
         logger.info("📭 本次扫描未发现符合脉冲与放量条件的标的，或异动标的已在冷却中，保持静默。")
 
 def run_tech_matrix() -> None:
-    # 🚀 时间锁降级：Matrix 依赖日线数据收盘确立，仅在美股尾盘与盘后执行 (UTC 18:00 - 22:00)
     curr_hour = datetime.now(timezone.utc).hour
     if not (18 <= curr_hour <= 22): 
         logger.info("💤 矩阵模式依赖日线数据，为防止日内未收盘毛刺与节省资源，仅在美股尾盘与盘后 (UTC 18-22) 运行。")
         return
 
-    regime, regime_desc, qqq_df = get_market_regime()
+    active_pool = get_filtered_watchlist(max_stocks=120)
+    regime, regime_desc, qqq_df = get_market_regime(active_pool)
     vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
     
     vix_scalar = max(0.6, min(1.4, 18.0 / max(vix, 1.0)))
@@ -552,7 +567,7 @@ def run_tech_matrix() -> None:
                   for etf in Config.SECTOR_MAP.keys() 
                   if not (sdf := safe_get_history(etf, "2mo", "1d", fast_mode=True)).empty and len(sdf) >= 20}
                   
-    health_score = -0.9 if vix > 30 else (-0.6 if vix > 25 else (0.9 if vix < 15 and regime == 'bull' else (0.6 if regime == 'bull' else (0.3 if regime == 'rebound' else (-0.7 if regime == 'bear' else 0.0)))))
+    health_score = -0.9 if vix > 30 else (-0.6 if vix > 25 else (0.9 if vix < 15 and 'bull' in regime else (0.6 if 'bull' in regime else (0.3 if 'rebound' in regime else (-0.7 if 'bear' in regime else 0.0)))))
     w_mul, min_score = 1.0 + health_score * 0.8, max(Config.MIN_SCORE_THRESHOLD, 8 + round(health_score * -6))
     
     factor_weights = {}
@@ -580,13 +595,29 @@ def run_tech_matrix() -> None:
 
     def get_fw(tag_name: str) -> float:
         return factor_weights.get(f"[{tag_name}]", 1.0)
+        
+    # 🚀 AI算力解禁：尝试加载 Logistic Regression 机器学习概率引擎
+    clf_model = None
+    if os.path.exists(Config.MODEL_FILE):
+        try:
+            import pickle
+            with open(Config.MODEL_FILE, 'rb') as f:
+                clf_model = pickle.load(f)
+                logger.info("🧠 AI 概率打分模型已成功上线。")
+        except Exception as e:
+            logger.debug(f"模型加载失败: {e}")
 
     reports = []
-    for sym in get_filtered_watchlist():
-        if sym in Config.BLACKLIST: continue
-        # 🚀 前置拦截：剔除了昨天之前推送的干扰，同时拦截了今天内已经上过榜的股票。极速跨越循环。
+    for sym in active_pool:
         if is_alerted(sym, "matrix"): continue
         try:
+            # 🚀 算力红利释放：引入周线(1wk)跨级别强过滤。日线再好，如果在周线级别的长期大熊市里，直接一票否决
+            df_w = safe_get_history(sym, "2y", "1wk", fast_mode=True)
+            if len(df_w) >= 40:
+                sma40_w = df_w['Close'].rolling(40).mean().iloc[-1]
+                if df_w['Close'].iloc[-1] < sma40_w:
+                    continue  # 周线长空，无视任何日线反弹骗局
+                    
             df = safe_get_history(sym, "1y", "1d", fast_mode=True)
             if len(df) < 150: continue
             df = calculate_indicators(df)
@@ -674,6 +705,16 @@ def run_tech_matrix() -> None:
 
             if score > 0 and st_cnt < 1 and not is_vol: score = int(score * 0.3)
             if st_cnt >= 2: score += 5
+            
+            # 🚀 AI 混合定序: 60% 专家逻辑打分 + 40% 逻辑回归概率惩罚补偿
+            if clf_model and factors:
+                try:
+                    x_row = [1 if f in factors else 0 for f in Config.ALL_FACTORS]
+                    prob = clf_model.predict_proba([x_row])[0][1]
+                    ml_score = int(prob * 100)
+                    score = int(score * 0.6 + ml_score * 0.4)
+                    sig.append(f"🤖 [AI逻辑回归] T+3盈利概率: {prob:.1%}")
+                except: pass
 
             position_advice = "✅ 标准仓位"
             if gap_pct > 0.03:
@@ -687,7 +728,7 @@ def run_tech_matrix() -> None:
                     position_advice = "⚠️ 极小仓位 (财报赌博风险)"
 
                 if score >= min_score:
-                    set_alerted(sym, "matrix") # 🚀 推送确定，安全落盘进缓存池
+                    set_alerted(sym, "matrix") 
                     news = get_latest_news(sym)
                     reports.append({
                         "symbol": sym, "score": score, "signals": sig[:8], "factors": factors,
@@ -701,7 +742,6 @@ def run_tech_matrix() -> None:
         except Exception: pass
 
     if reports:
-        from collections import defaultdict
         groups = defaultdict(list)
         for r in reports: groups[r["sector"]].append(r)
         for sec, stks in groups.items():
@@ -748,7 +788,7 @@ def run_tech_matrix() -> None:
         
         final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
                         "\n\n---\n\n".join(txts) + \
-                        f"\n\n*(门槛: {min_score}分 | 正交降权与 EV风控已激活)*"
+                        f"\n\n*(门槛: {min_score}分 | AI概率融合机制已激活)*"
         
         send_alert("多因子优选 (矩阵版)", final_content)
         
@@ -797,6 +837,11 @@ def run_backtest_engine() -> None:
     COMMISSION = 0.0005 
     
     stats, factor_rets = {'T+1': [], 'T+3': [], 'T+5': []}, {}
+    
+    # 🚀 AI模型样本训练集
+    X_train = []
+    y_train = []
+    
     for t in trades:
         sym, r_dt = t['symbol'], t['date']
         if sym not in df_c.columns or sym not in df_o.columns: continue
@@ -846,7 +891,29 @@ def run_backtest_engine() -> None:
                                 
                         for f_name in factor_list:
                             factor_rets.setdefault(f"[{f_name}]", []).append(ret)
+                            
+                        # 为 Logistic Regression 喂送特征工程和标签数据
+                        # 标签：T+3 核心胜率能否带来超过 1.5% 的真实收益 (滤除摩擦成本后)
+                        x_row = [1 if f in factor_list else 0 for f in Config.ALL_FACTORS]
+                        X_train.append(x_row)
+                        y_train.append(1 if ret > 0.015 else 0)
     
+    # 🚀 AI算力解禁：全自动提取因子关系并持久化 Logistic Regression 模型
+    if len(X_train) >= 30:
+        try:
+            from sklearn.linear_model import LogisticRegression
+            import pickle
+            # 采用 class_weight='balanced' 抗击类别不平衡，正则化阻绝过拟合
+            clf = LogisticRegression(class_weight='balanced', C=0.1, max_iter=500)
+            clf.fit(X_train, y_train)
+            with open(Config.MODEL_FILE, 'wb') as f:
+                pickle.dump(clf, f)
+            logger.info("🧠 机器学习打分模型 (Logistic Regression) 已基于最新实盘数据完成重训并落盘。")
+        except ImportError:
+            logger.warning("未检测到 scikit-learn 环境，已跳过 ML 模型训练。")
+        except Exception as e:
+            logger.error(f"ML 模型训练失败: {e}")
+            
     res = {}
     for p, r in stats.items():
         if not r: continue
@@ -890,4 +957,4 @@ if __name__ == "__main__":
     if m == "sentinel": run_volatility_sentinel()
     elif m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "系统已完成终极底层优化！当日去重冷却机制 (Daily Cooldown) 已经成功实装。")
+    elif m == "test": send_alert("连通性测试", "系统算力全开升级完成！市场宽度测算、周线跨级防御、AI 逻辑回归模型全部上线。")
