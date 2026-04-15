@@ -100,5 +100,6 @@ jobs:
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "📝 自动同步量化数据记录"
-          file_pattern: "backtest_log.jsonl strategy_stats.json backtest_report.md"
+          # 🚀 修复2: 使用 wildcard (通配符) 匹配动态分片的日志，并加入最新缓存文件
+          file_pattern: "backtest_log*.jsonl strategy_stats.json backtest_report.md tickers_cache.json"
           disable_globbing: false
