@@ -1,17 +1,7 @@
-#Tickeron Pro AI Bot 核心环境依赖
-
-#yfinance 必须解除锁定！以便随时获取社区最新的雅虎反爬虫修复补丁
-
 yfinance>=0.2.40
 pandas==2.1.0
 numpy==1.26.0
 requests==2.31.0
 lxml==4.9.3
-
-#🚀 算力解锁：引入机器学习生态进行逻辑回归与概率推演
-
 scikit-learn>=1.3.0
-
-DevOps 质检工具
-
 flake8==6.1.0
