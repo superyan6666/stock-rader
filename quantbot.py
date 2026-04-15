@@ -439,7 +439,6 @@ def run_volatility_sentinel() -> None:
     vix_scalar = max(0.6, min(1.4, 18.0 / max(vix, 1.0)))
     
     for sym in active_pool:
-        if sym in Config.BLACKLIST: continue
         try:
             df_h = safe_get_history(sym, period="2d", interval="1h", fast_mode=True)
             if len(df_h) < 2: continue
@@ -542,7 +541,6 @@ def run_tech_matrix() -> None:
 
     reports = []
     for sym in get_filtered_watchlist():
-        if sym in Config.BLACKLIST: continue
         try:
             df = safe_get_history(sym, "1y", "1d", fast_mode=True)
             if len(df) < 150: continue
