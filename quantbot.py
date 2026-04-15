@@ -76,6 +76,7 @@ class Config:
     STATS_FILE: str = "strategy_stats.json"
     REPORT_FILE: str = "backtest_report.md"
     CACHE_FILE: str = "tickers_cache.json"
+    ALERT_CACHE_FILE: str = "alert_history.json"
 
     @classmethod
     def get_current_log_file(cls) -> str:
@@ -97,6 +98,9 @@ def validate_config():
     if not os.path.exists(Config.REPORT_FILE): open(Config.REPORT_FILE, 'a').close()
     if not os.path.exists(Config.STATS_FILE):
         with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: f.write("{}")
+    if not os.path.exists(Config.ALERT_CACHE_FILE):
+        with open(Config.ALERT_CACHE_FILE, 'w', encoding='utf-8') as f: 
+            json.dump({"date": "", "sentinel": [], "matrix": []}, f)
             
     logger.info("✅ 环境与占位文件校验通过")
 
@@ -429,6 +433,35 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ================= 4. 执行引擎 =================
+
+# 🚀 核心更新：读写分离的冷却机制，实现 [前置拦截过滤]
+def get_alert_cache() -> dict:
+    """读取当日缓存池"""
+    today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    cache_data = {"date": today_str, "sentinel": [], "matrix": []}
+    try:
+        if os.path.exists(Config.ALERT_CACHE_FILE):
+            with open(Config.ALERT_CACHE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if data.get("date") == today_str:
+                    cache_data = data
+    except Exception: pass
+    return cache_data
+
+def is_alerted(sym: str, mode: str) -> bool:
+    """前置检查：是否已在当日推送过该标的"""
+    return sym in get_alert_cache().get(mode, [])
+
+def set_alerted(sym: str, mode: str) -> None:
+    """后置写入：记录并落盘已推送标的"""
+    cache = get_alert_cache()
+    if sym not in cache.get(mode, []):
+        cache.setdefault(mode, []).append(sym)
+        try:
+            with open(Config.ALERT_CACHE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(cache, f)
+        except Exception: pass
+
 def run_volatility_sentinel() -> None:
     curr_hour = datetime.now(timezone.utc).hour
     if not (13 <= curr_hour <= 21): 
@@ -442,6 +475,9 @@ def run_volatility_sentinel() -> None:
     vix_scalar = max(0.6, min(1.4, 18.0 / max(vix, 1.0)))
     
     for sym in active_pool:
+        if sym in Config.BLACKLIST: continue
+        # 🚀 前置拦截：今天报过警的直接跳过，节省了大量安全获取 1h 数据的耗时与 API 限制
+        if is_alerted(sym, "sentinel"): continue 
         try:
             df_h = safe_get_history(sym, period="2d", interval="1h", fast_mode=True)
             if len(df_h) < 2: continue
@@ -483,6 +519,7 @@ def run_volatility_sentinel() -> None:
                     alert_reason = f"{alert_reason}\n{reason}" if alert_reason else reason
             
             if is_alert:
+                set_alerted(sym, "sentinel") # 🚀 确认推送后，正式将其打入冷却池
                 news = get_latest_news(sym)
                 news_block = f"\n\n**📰 最新资讯:**\n- {news}" if news else ""
                 
@@ -497,9 +534,15 @@ def run_volatility_sentinel() -> None:
     if alerts: 
         send_alert("高频哨兵预警", "\n\n---\n\n".join(alerts))
     else:
-        logger.info("📭 本次扫描未发现符合脉冲与放量条件的标的，保持静默。")
+        logger.info("📭 本次扫描未发现符合脉冲与放量条件的标的，或异动标的已在冷却中，保持静默。")
 
 def run_tech_matrix() -> None:
+    # 🚀 时间锁降级：Matrix 依赖日线数据收盘确立，仅在美股尾盘与盘后执行 (UTC 18:00 - 22:00)
+    curr_hour = datetime.now(timezone.utc).hour
+    if not (18 <= curr_hour <= 22): 
+        logger.info("💤 矩阵模式依赖日线数据，为防止日内未收盘毛刺与节省资源，仅在美股尾盘与盘后 (UTC 18-22) 运行。")
+        return
+
     regime, regime_desc, qqq_df = get_market_regime()
     vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
     
@@ -540,6 +583,9 @@ def run_tech_matrix() -> None:
 
     reports = []
     for sym in get_filtered_watchlist():
+        if sym in Config.BLACKLIST: continue
+        # 🚀 前置拦截：剔除了昨天之前推送的干扰，同时拦截了今天内已经上过榜的股票。极速跨越循环。
+        if is_alerted(sym, "matrix"): continue
         try:
             df = safe_get_history(sym, "1y", "1d", fast_mode=True)
             if len(df) < 150: continue
@@ -641,6 +687,7 @@ def run_tech_matrix() -> None:
                     position_advice = "⚠️ 极小仓位 (财报赌博风险)"
 
                 if score >= min_score:
+                    set_alerted(sym, "matrix") # 🚀 推送确定，安全落盘进缓存池
                     news = get_latest_news(sym)
                     reports.append({
                         "symbol": sym, "score": score, "signals": sig[:8], "factors": factors,
@@ -708,7 +755,7 @@ def run_tech_matrix() -> None:
         with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
             f.write(json.dumps({"date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", [])} for r in reports[:15]]}, ensure_ascii=False) + "\n")
     else:
-        logger.info("📭 本次矩阵扫描未发现符合硬性门槛的强共振标的，不发送推送。")
+        logger.info("📭 本次矩阵扫描未发现符合硬性门槛的新鲜强共振标的，不发送推送。")
 
 def run_backtest_engine() -> None:
     log_files = [f for f in os.listdir('.') if f.startswith('backtest_log') and f.endswith('.jsonl')]
@@ -785,7 +832,7 @@ def run_backtest_engine() -> None:
                     exit_revenue = x_px_raw * (1 - curr_exit_slippage - COMMISSION)
                     ret = (exit_revenue - entry_cost) / entry_cost
                     
-                    if is_half_pos:
+                    if gap_up > 0.03:
                         ret = ret * 0.5
                         
                     stats[f'T+{d}'].append(ret)
@@ -843,4 +890,4 @@ if __name__ == "__main__":
     if m == "sentinel": run_volatility_sentinel()
     elif m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "系统已完成终极底层优化！正交拥挤度折扣 (Orthogonal Discount) 已上线。")
+    elif m == "test": send_alert("连通性测试", "系统已完成终极底层优化！当日去重冷却机制 (Daily Cooldown) 已经成功实装。")
