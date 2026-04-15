@@ -485,7 +485,7 @@ def run_volatility_sentinel() -> None:
         logger.info("💤 当前非美股交易核心时段 (UTC 13-21)，哨兵按风控逻辑保持休眠。")
         return
         
-    active_pool = get_filtered_watchlist(max_stocks=40)
+    active_pool = get_filtered_watchlist(max_stocks=60) # 频率下降，单次扫描池子适度扩大
     alerts = []
     
     vix, _ = get_vix_level()
@@ -494,52 +494,58 @@ def run_volatility_sentinel() -> None:
     for sym in active_pool:
         if is_alerted(sym, "sentinel"): continue 
         try:
-            df_h = safe_get_history(sym, period="2d", interval="1h", fast_mode=True)
-            if len(df_h) < 2: continue
-            curr_px = df_h['Close'].ffill().iloc[-1]
-            hr_chg = (curr_px - df_h['Open'].iloc[-1]) / df_h['Open'].iloc[-1] * 100
+            # 🚀 优先拉取日线：获取个股真实波动性格 (ATR) 基因，用于归一化判定
+            df_d = safe_get_history(sym, period="1mo", interval="1d", fast_mode=True)
+            if len(df_d) < 15: continue
+            
+            df_d['TR'] = pd.concat([df_d['High']-df_d['Low'], (df_d['High']-df_d['Close'].shift()).abs(), (df_d['Low']-df_d['Close'].shift()).abs()], axis=1).max(axis=1)
+            atr = df_d['TR'].rolling(14).mean().iloc[-1]
+            curr_px_d = df_d['Close'].iloc[-1]
+            daily_vol_pct = (atr / curr_px_d) * 100 # 日均波动率百分比
             
             is_alert = False
             alert_reason = ""
-            if abs(hr_chg) > 3.5: 
-                is_valid_vol = True
-                if len(df_h) >= 5:
+            
+            # 缺口检测 (放宽缺口底线，但必须是真缺口)
+            gap = (df_d['Open'].iloc[-1] - df_d['Close'].iloc[-2]) / df_d['Close'].iloc[-2] * 100
+            if abs(gap) > 4.0:
+                is_alert = True
+                alert_reason = f"- 💥 动能缺口: **{gap:+.2f}%**"
+            
+            # 🚀 小时线深度探测：引入 ATR 归一化脉冲判定
+            df_h = safe_get_history(sym, period="5d", interval="1h", fast_mode=True)
+            if len(df_h) >= 5:
+                curr_px = df_h['Close'].ffill().iloc[-1]
+                hr_chg = (curr_px - df_h['Open'].iloc[-1]) / df_h['Open'].iloc[-1] * 100
+                
+                # 专业判定：脉冲至少 > 3.0%，并且 1h 振幅达到了其日均波幅(ATR)的 60% 以上！
+                pulse_threshold = max(3.0, daily_vol_pct * 0.6)
+                
+                if abs(hr_chg) > pulse_threshold: 
                     vol_last_hour = df_h['Volume'].iloc[-1]
                     vol_ma_5h = df_h['Volume'].rolling(5).mean().iloc[-1]
-                    if vol_last_hour < vol_ma_5h * 1.2:
-                        is_valid_vol = False  
+                    # 严苛放量：不仅要异动，成交量必须是过去5小时均量的 1.5 倍以上
+                    if vol_last_hour > vol_ma_5h * 1.5:
+                        is_alert = True
+                        reason = f"- ⚡ 极端脉冲: **{hr_chg:+.2f}%** (1h耗尽日均波幅的 {abs(hr_chg)/daily_vol_pct*100:.0f}% | 放量 {vol_last_hour/vol_ma_5h:.1f}x)"
+                        alert_reason = f"{alert_reason}\n{reason}" if alert_reason else reason
+                        
+            if is_alert:
+                set_alerted(sym, "sentinel") 
                 
-                if is_valid_vol:
-                    is_alert = True
-                    alert_reason = f"- ⚡ 1h脉冲: **{hr_chg:+.2f}%** (放量确认)"
-
-            df_d = safe_get_history(sym, period="1mo", interval="1d", fast_mode=True)
-            trade_plan = ""
-            if len(df_d) >= 15:
-                df_d['TR'] = pd.concat([df_d['High']-df_d['Low'], (df_d['High']-df_d['Close'].shift()).abs(), (df_d['Low']-df_d['Close'].shift()).abs()], axis=1).max(axis=1)
-                atr = df_d['TR'].rolling(14).mean().iloc[-1]
-                
-                tp, sl = curr_px + 3.0 * vix_scalar * atr, curr_px - 1.5 * vix_scalar * atr
-                
+                tp, sl = curr_px_d + 3.0 * vix_scalar * atr, curr_px_d - 1.5 * vix_scalar * atr
                 trade_plan = (
                     f"**💰 交易计划:**\n"
-                    f"- 💵 现价: `{curr_px:.2f}`\n"
+                    f"- 💵 现价: `{curr_px_d:.2f}`\n"
                     f"- 🎯 止盈: **${tp:.2f}**\n"
                     f"- 🛡️ 止损: **${sl:.2f}**"
                 )
-                gap = (df_d['Open'].iloc[-1] - df_d['Close'].iloc[-2]) / df_d['Close'].iloc[-2] * 100
-                if abs(gap) > 4:
-                    is_alert = True
-                    reason = f"- 💥 跳空缺口: **{gap:+.2f}%**"
-                    alert_reason = f"{alert_reason}\n{reason}" if alert_reason else reason
-            
-            if is_alert:
-                set_alerted(sym, "sentinel") 
+                
                 news = get_latest_news(sym)
                 news_block = f"\n\n**📰 最新资讯:**\n- {news}" if news else ""
                 
                 msg = (
-                    f"### 🚨 {sym} | 盘中异动 {'🚀' if hr_chg>0 else '🩸'}\n"
+                    f"### 🚨 {sym} | 盘中异动 {'🚀' if gap>0 or (len(df_h)>=5 and hr_chg>0) else '🩸'}\n"
                     f"**💡 异动捕捉:**\n{alert_reason}\n\n"
                     f"{trade_plan}{news_block}"
                 )
@@ -547,9 +553,9 @@ def run_volatility_sentinel() -> None:
         except Exception: pass
         
     if alerts: 
-        send_alert("高频哨兵预警", "\n\n---\n\n".join(alerts))
+        send_alert("高频哨兵专业版预警", "\n\n---\n\n".join(alerts))
     else:
-        logger.info("📭 本次扫描未发现符合脉冲与放量条件的标的，或异动标的已在冷却中，保持静默。")
+        logger.info("📭 本次扫描未发现符合严苛 ATR 归一化脉冲条件的标的，保持静默。")
 
 def run_tech_matrix() -> None:
     curr_hour = datetime.now(timezone.utc).hour
