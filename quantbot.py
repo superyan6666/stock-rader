@@ -338,7 +338,6 @@ def get_vix_level(qqq_df_for_shadow: pd.DataFrame = None) -> Tuple[float, str]:
     return vix, f"⚖️ 正常波动 ({prefix}: {vix:.2f})"
 
 def get_market_regime(active_pool: List[str] = None) -> Tuple[str, str, pd.DataFrame, bool]:
-    # 返回: regime, desc, df, is_credit_risk_high
     df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", auto_adjust=False, fast_mode=True)
     if len(df) < 200: return "range", "数据不足，默认震荡", df, False
     
@@ -348,7 +347,6 @@ def get_market_regime(active_pool: List[str] = None) -> Tuple[str, str, pd.DataF
     ma50_prev = df['Close'].rolling(50).mean().iloc[-20]
     trend_20d = (c_close - df['Close'].iloc[-20]) / df['Close'].iloc[-20]
     
-    # 🚀 宏观维度：探测高收益垃圾债(HYG) vs 避险国债(IEF) 的系统性信用利差 (Credit Spread)
     credit_risk_alert = False
     credit_desc = ""
     try:
@@ -357,10 +355,9 @@ def get_market_regime(active_pool: List[str] = None) -> Tuple[str, str, pd.DataF
         if not hyg.empty and not ief.empty:
             ratio = hyg['Close'] / ief['Close']
             ratio_ma20 = ratio.rolling(20).mean().iloc[-1]
-            # 如果垃圾债表现远弱于国债，且处于明显下降通道，说明聪明资金(Smart Money)正在抽离股市避险
             if ratio.iloc[-1] < ratio_ma20 and ratio.iloc[-1] < ratio.iloc[-10]:
                 credit_risk_alert = True
-                credit_desc = "\n- 🚨 **宏观信用风控触发**: 高收益债资金正在疯狂流出避险，市场随时面临流动性枯竭重挫！"
+                credit_desc = "\n- 🚨 **宏观信用风控**: 高收益债流出避险，市场警报！"
     except Exception: pass
     
     breadth_desc = ""
@@ -414,10 +411,8 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     rs = up / (down + 1e-10)
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # 🚀 引入 RSI 高点追踪，用于后续顶背离(Bearish Divergence)判定
     df['RSI_High_20'] = df['RSI'].rolling(20).max()
     df['Price_High_20'] = df['High'].rolling(20).max()
-    
     df['RSI_P20'] = df['RSI'].shift(1).rolling(window=120, min_periods=60).quantile(0.20).fillna(30.0)
 
     df['MACD'] = df['Close'].ewm(span=12, adjust=False).mean() - df['Close'].ewm(span=26, adjust=False).mean()
@@ -428,7 +423,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['TR'] = pd.concat([df['High']-df['Low'], (df['High']-df['Close'].shift()).abs(), (df['Low']-df['Close'].shift()).abs()], axis=1).max(axis=1)
     df['ATR'] = df['TR'].rolling(window=14).mean()
     
-    # 🚀 吊灯止损体系 (Chandelier Exit)：寻找22天最高价作为挂点
+    # 🚀 吊灯止损体系 (Chandelier Exit) - 22日基准
     df['Highest_22'] = df['High'].rolling(window=22).max()
     df['ATR_22'] = df['TR'].rolling(window=22).mean()
     df['Chandelier_Exit'] = df['Highest_22'] - 2.5 * df['ATR_22']
@@ -525,9 +520,9 @@ def run_volatility_sentinel() -> None:
         try:
             df_d = safe_get_history(sym, period="1mo", interval="1d", fast_mode=True)
             if len(df_d) < 15: continue
+            df_d = calculate_indicators(df_d)
             
-            df_d['TR'] = pd.concat([df_d['High']-df_d['Low'], (df_d['High']-df_d['Close'].shift()).abs(), (df_d['Low']-df_d['Close'].shift()).abs()], axis=1).max(axis=1)
-            atr = df_d['TR'].rolling(14).mean().iloc[-1]
+            atr = df_d['ATR'].iloc[-1]
             curr_px_d = df_d['Close'].iloc[-1]
             daily_vol_pct = (atr / curr_px_d) * 100 
             
@@ -557,12 +552,14 @@ def run_volatility_sentinel() -> None:
             if is_alert:
                 set_alerted(sym, "sentinel") 
                 
-                tp, sl = curr_px_d + 3.0 * vix_scalar * atr, curr_px_d - 1.5 * vix_scalar * atr
+                tp = curr_px_d + 3.0 * vix_scalar * atr
+                sl = max(df_d['Chandelier_Exit'].iloc[-1], curr_px_d - 1.5 * vix_scalar * atr)
+                
                 trade_plan = (
                     f"**💰 交易计划:**\n"
                     f"- 💵 现价: `{curr_px_d:.2f}`\n"
                     f"- 🎯 止盈: **${tp:.2f}**\n"
-                    f"- 🛡️ 止损: **${sl:.2f}**"
+                    f"- 🛡️ 吊灯止损: **${sl:.2f}**"
                 )
                 
                 news = get_latest_news(sym)
@@ -593,6 +590,7 @@ def run_tech_matrix() -> None:
     
     vix_scalar = max(0.6, min(1.4, 18.0 / max(vix, 1.0)))
     
+    # 🚀 板块真实动量，提前算出供后续使用
     valid_sector_data = {}
     for etf in Config.SECTOR_MAP.keys():
         sdf = safe_get_history(etf, "2mo", "1d", fast_mode=True)
@@ -605,7 +603,6 @@ def run_tech_matrix() -> None:
                   
     health_score = -0.9 if vix > 30 else (-0.6 if vix > 25 else (0.9 if vix < 15 and 'bull' in regime else (0.6 if 'bull' in regime else (0.3 if 'rebound' in regime else (-0.7 if 'bear' in regime else 0.0)))))
     
-    # 🚀 宏观一票否决：一旦发现垃圾债资金出逃（信用危机），全面压制全市场得分，并强制削减买入仓位
     if is_credit_risk_high:
         health_score -= 0.5
         
@@ -697,11 +694,12 @@ def run_tech_matrix() -> None:
                         fw = get_fw("强相对强度")
                         triggered.append(("flow", "LT", "强相对强度", f"⚡ [强相对强度] 跑赢大盘 (权:{fw:.1f}x)", (7 if is_vol else 4) * w_mul * fw, False))
             
+            # 🚀 VWAP 放量突破主力成本线
             if curr['Close'] > curr['VWAP_20'] and prev['Close'] <= prev['VWAP_20']:
                 fw = get_fw("VWAP突破")
                 triggered.append(("flow", "ST", "VWAP突破", f"🌊 [VWAP突破] 放量逾越机构均价 (权:{fw:.1f}x)", 8 * w_mul * fw, True))
                 
-            # 🚀 探测尾盘抢筹资金
+            # 🚀 探测聪明钱尾盘吸筹 (Smart Money Flow)
             if curr['Smart_Money_Flow'] > 0.5 and curr['Close'] > curr['EMA_20']:
                 fw = get_fw("聪明钱抢筹")
                 triggered.append(("flow", "ST", "聪明钱抢筹", f"🕵️ [聪明资金] 连续10日尾盘吸筹 (权:{fw:.1f}x)", 6 * w_mul * fw, True))
@@ -761,11 +759,10 @@ def run_tech_matrix() -> None:
                 st_score_raw *= 0.4
                 sig.append("☁️ [云下压制] 长短线全面降权")
 
-            # 🚀 顶背离(Bearish Divergence) 绝对死刑：股价新高，RSI 却未能新高，主力衰竭
             is_bearish_div = False
             if curr['Close'] >= curr['Price_High_20'] * 0.98 and curr['RSI'] < curr['RSI_High_20'] * 0.90:
                 is_bearish_div = True
-                st_score_raw = 0.0 # 短线分直接爆扣归零
+                st_score_raw = 0.0 
                 sig.append(f"🩸 [顶背离危局] 价格近高但动能显著衰竭，严禁追高")
 
             if curr['RSI'] > 85.0:
@@ -778,6 +775,7 @@ def run_tech_matrix() -> None:
                 st_score_raw = max(0, st_score_raw - penalty)
                 sig.append(f"⚠️ [短线高估] 偏离20日均线 +{bias_20*100:.1f}% (防追高扣减)")
 
+            sym_sec = Config.get_sector_etf(sym)
             if sym_sec in leading_sectors:
                 lt_score_raw *= 1.15
                 st_score_raw *= 1.15
@@ -824,7 +822,6 @@ def run_tech_matrix() -> None:
             else:
                 safe_kelly = min(0.20, kelly_fraction / 2.0)
                 pos_percentage = safe_kelly
-                # 宏观信用风险叠加惩罚
                 if is_credit_risk_high:
                     pos_percentage *= 0.6
                 
@@ -844,23 +841,26 @@ def run_tech_matrix() -> None:
                     sig.append("💣 [财报雷区] 近5日发财报,风险极高")
                     lt_score = int(lt_score * 0.5)
                     st_score = int(st_score * 0.5)
-                    set_alerted(sym, "matrix") 
-                    news = get_latest_news(sym)
-                    
-                    # 🚀 交易计划革新：采用更为专业的吊灯止损 (Chandelier Exit) 替代简单的固定 ATR
-                    tp_val = curr['Close'] + 3.0 * vix_scalar * curr['ATR']
-                    sl_val = max(curr['Chandelier_Exit'], curr['Close'] - 1.5 * vix_scalar * curr['ATR'])
-                    
-                    reports.append({
-                        "symbol": sym, "lt_score": lt_score, "st_score": st_score, "score": total_score, 
-                        "signals": sig[:8], "factors": factors,
-                        "curr_close": curr['Close'], 
-                        "tp": tp_val, 
-                        "sl": sl_val, 
-                        "news": news,
-                        "sector": Config.get_sector_etf(sym),
-                        "pos_advice": position_advice
-                    })
+                    total_score = lt_score + st_score
+                    pos_percentage *= 0.2
+                    position_advice = f"⚠️ 建议仓位 {pos_percentage:.1%} (财报赌博风险)"
+
+                news = get_latest_news(sym)
+                
+                # 🚀 将吊灯止损写入回测池，这比普通的固定 ATR 要聪明得多
+                tp_val = curr['Close'] + 3.0 * vix_scalar * curr['ATR']
+                sl_val = max(curr['Chandelier_Exit'], curr['Close'] - 1.5 * vix_scalar * curr['ATR'])
+                
+                reports.append({
+                    "symbol": sym, "lt_score": lt_score, "st_score": st_score, "score": total_score, 
+                    "signals": sig[:8], "factors": factors,
+                    "curr_close": curr['Close'], 
+                    "tp": tp_val, 
+                    "sl": sl_val, 
+                    "news": news,
+                    "sector": sym_sec,
+                    "pos_advice": position_advice
+                })
         except Exception: pass
 
     if reports and all_raw_scores:
@@ -869,9 +869,10 @@ def run_tech_matrix() -> None:
         
         groups = defaultdict(list)
         for r in reports: groups[r["sector"]].append(r)
+        
         for sec, stks in groups.items():
             if sec not in Config.CROWDING_EXCLUDE_SECTORS and len(stks) >= Config.CROWDING_MIN_STOCKS:
-                sec_mom = sector_data.get(sec, 0.0)
+                sec_mom = valid_sector_data.get(sec, 0.0)
                 if sec_mom > 0.04:
                     for s in stks[1:]: 
                         if "🚀 [板块主升豁免] 让利润奔跑" not in s["signals"]:
@@ -903,8 +904,8 @@ def run_tech_matrix() -> None:
                 f"- 💵 现价: `{r['curr_close']:.2f}`\n"
                 f"- ⚖️ {r.get('pos_advice', '✅ 标准仓位')}\n"
                 f"- 🎯 建议止盈: **${r['tp']:.2f}**\n"
-                f"- 🛡️ 吊灯止损: **${r['sl']:.2f} (自适应前高追踪)**\n"
-                f"- 📉 离场规则: **日均线跌破止损位强制清仓，不抱幻想**"
+                f"- 🛡️ 吊灯止损: **${r['sl']:.2f} (最高价回落保护)**\n"
+                f"- 📈 离场纪律: **跌破止损防线请无条件市价清仓！**"
             )
             txts.append(card)
 
@@ -913,7 +914,7 @@ def run_tech_matrix() -> None:
         
         final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
                         "\n\n---\n\n".join(txts) + \
-                        f"\n\n*(本策略已接入 Kelly 公式仓位管理与截面相对动量模型)*"
+                        f"\n\n*(本策略已接入 Kelly 公式仓位管理与吊灯追踪止损模型)*"
         
         send_alert("多因子优选 (截面强化版)", final_content)
         
@@ -992,7 +993,6 @@ def run_backtest_engine() -> None:
         
         entry_cost = e_px_raw * (1 + SLIPPAGE * 3 + COMMISSION) if is_half_pos else e_px_raw * (1 + SLIPPAGE + COMMISSION)
         
-        # 计算该笔交易设定的止损容忍距离（即多少美元），用于移动止损计算
         trail_distance = e_px_raw - initial_sl if initial_sl > 0 else e_px_raw * 0.05
         
         for d in [1, 3, 5]:
@@ -1000,7 +1000,6 @@ def run_backtest_engine() -> None:
             if exit_idx < len(df_c):
                 exit_revenue = None
                 
-                # 🚀 极致真实：动态移动止损 (Trailing Stop) 与 跳空穿透模拟
                 highest_seen_px = e_px_raw
                 dynamic_sl = initial_sl
                 
@@ -1013,26 +1012,21 @@ def run_backtest_engine() -> None:
                     
                     if pd.isna(day_open) or pd.isna(day_low) or pd.isna(day_high): continue
                     
-                    # 1. 每日开盘跳空地狱测试 (Gap-Down Hell Test)
                     if dynamic_sl > 0 and day_open < dynamic_sl:
                         exit_revenue = day_open * (1 - SLIPPAGE * 5 - COMMISSION)
                         break
                         
-                    # 2. 日内跌破移动止损防线 (Hit Trailing Stop)
                     if dynamic_sl > 0 and day_low <= dynamic_sl:
                         exit_revenue = dynamic_sl * (1 - SLIPPAGE * 3 - COMMISSION)
                         break
                     
-                    # 3. 触碰硬止盈线 (Take Profit)
                     if tp_price > 0 and day_high >= tp_price:
                         exit_revenue = tp_price * (1 - SLIPPAGE - COMMISSION)
                         break
                         
-                    # 4. 更新移动止损线：如果今日创了持仓期新高，止损防线同步上移！
                     highest_seen_px = max(highest_seen_px, day_high)
                     dynamic_sl = max(dynamic_sl, highest_seen_px - trail_distance)
                     
-                    # 5. 期满平仓
                     if i == d:
                         prev_x_px = df_c.iloc[check_idx-1][sym] if check_idx > e_idx else e_px_raw
                         daily_volatility = abs((day_close - prev_x_px) / prev_x_px)
@@ -1154,4 +1148,4 @@ if __name__ == "__main__":
     if m == "sentinel": run_volatility_sentinel()
     elif m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "终极进化达成！宏观信用利差、顶背离防御与动态追踪止损 (Trailing Stop) 全面介入！")
+    elif m == "test": send_alert("连通性测试", "终极进化达成！宏观信用利差、聪明钱抓取与吊灯追踪止损 (Chandelier) 全面激活！")
