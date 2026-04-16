@@ -77,12 +77,11 @@ class Config:
     ALERT_CACHE_FILE: str = "alert_history.json"
     MODEL_FILE: str = "scoring_model.pkl"
     
-    # 🚀 生命力进化：植入 VSA 巨量滞涨 (暗池吸收)
+    # 🚀 剔除滞后散户包袱，提纯为 12 大顶级机构行为因子
     ALL_FACTORS = [
-        "米奈尔维尼", "OBV底背离", "强相对强度", "强势回踩", "MACD金叉", 
-        "TTM Squeeze ON", "机构控盘", "一目多头", "突破缺口", "VWAP突破", 
-        "聪明钱抢筹", "放量长阳", "口袋支点", "VCP收缩", "筹码峰突破",
-        "SMC失衡区", "AVWAP突破", "流动性扫盘", "巨量滞涨"
+        "米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "SMC失衡区", 
+        "流动性扫盘", "聪明钱抢筹", "巨量滞涨", "放量长阳", "口袋支点", 
+        "VCP收缩", "筹码峰突破"
     ]
 
     @classmethod
@@ -395,6 +394,7 @@ def get_market_regime(active_pool: List[str] = None) -> Tuple[str, str, pd.DataF
         else: 
             return "range", f"⚖️ 熊市底部震荡{breadth_desc}{credit_desc}", df, credit_risk_alert
 
+# 🚀 指标核算极简提纯：去除了 SuperTrend, Ichimoku, Bollinger/KC, MACD 等冗余包袱
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_index()
     
@@ -420,27 +420,16 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['Max_Down_Vol_10'] = down_vol.shift(1).rolling(10).max()
     
     df['Swing_Low_20'] = df['Low'].shift(1).rolling(20).min()
-    
     df['Range_60'] = df['High'].rolling(60).max() - df['Low'].rolling(60).min()
     df['Range_20'] = df['High'].rolling(20).max() - df['Low'].rolling(20).min()
-    
-    df['High_52W'] = df['High'].rolling(window=252, min_periods=120).max()
-    df['Low_52W'] = df['Low'].rolling(window=252, min_periods=120).min()
-    df['OBV'] = (np.sign(df['Close'].diff()).fillna(0) * df['Volume']).cumsum()
     
     delta = df['Close'].diff()
     up = delta.where(delta > 0, 0).ewm(span=14, adjust=False).mean()
     down = -delta.where(delta < 0, 0).ewm(span=14, adjust=False).mean()
     rs = up / (down + 1e-10)
     df['RSI'] = 100 - (100 / (1 + rs))
-    
     df['RSI_High_20'] = df['RSI'].rolling(20).max()
     df['Price_High_20'] = df['High'].rolling(20).max()
-    df['RSI_P20'] = df['RSI'].shift(1).rolling(window=120, min_periods=60).quantile(0.20).fillna(30.0)
-
-    df['MACD'] = df['Close'].ewm(span=12, adjust=False).mean() - df['Close'].ewm(span=26, adjust=False).mean()
-    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
     
     df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
     df['TR'] = pd.concat([df['High']-df['Low'], (df['High']-df['Close'].shift()).abs(), (df['Low']-df['Close'].shift()).abs()], axis=1).max(axis=1)
@@ -452,49 +441,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     
     clv = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / (df['High'] - df['Low'] + 1e-10)
     df['Smart_Money_Flow'] = clv.rolling(window=10).mean()
-    
-    hl2, atr10 = (df['High'] + df['Low']) / 2, df['TR'].rolling(window=10).mean()
-    ub, lb = (hl2 + 3 * atr10).values, (hl2 - 3 * atr10).values
-    
-    in_up = np.zeros(len(df), dtype=bool)
-    in_up[0] = True 
-    
-    for i in range(1, len(df)):
-        if pd.isna(ub[i-1]) or pd.isna(lb[i-1]): 
-            in_up[i] = in_up[i-1]
-            continue
-        in_up[i] = True if df['Close'].values[i] > ub[i-1] else (False if df['Close'].values[i] < lb[i-1] else in_up[i-1])
-        if in_up[i] and in_up[i-1]: lb[i] = max(lb[i], lb[i-1])
-        if not in_up[i] and not in_up[i-1]: ub[i] = min(ub[i], ub[i-1])
-    df['SuperTrend_Up'] = in_up.astype(int)
-
-    atr20 = df['TR'].rolling(window=20).mean()
-    df['KC_Upper'], df['KC_Lower'] = df['EMA_20'] + 1.5 * atr20, df['EMA_20'] - 1.5 * atr20
-    bb_ma, bb_std = df['Close'].rolling(20).mean(), df['Close'].rolling(20).std()
-    df['BB_Upper'], df['BB_Lower'] = bb_ma + 2 * bb_std, bb_ma - 2 * bb_std
-
-    df['Tenkan'] = (df['High'].rolling(9).max() + df['Low'].rolling(9).min()) / 2
-    df['Kijun'] = (df['High'].rolling(26).max() + df['Low'].rolling(26).min()) / 2
-    df['SenkouA'] = ((df['Tenkan'] + df['Kijun']) / 2).shift(26)
-    df['SenkouB'] = ((df['High'].rolling(52).max() + df['Low'].rolling(52).min()) / 2).shift(26)
-    df['Above_Cloud'] = (df['Close'] > df[['SenkouA', 'SenkouB']].max(axis=1)).astype(int)
-    df['Cloud_Twist'] = (df['SenkouA'] > df['SenkouB']).astype(int)
-
-    hl_diff = (df['High'] - df['Low']).replace(0, 1e-10)
-    dollar_vol = df['Close'] * df['Volume']
-    vol_sum20 = dollar_vol.rolling(20).sum() + 1e-10
-    df['CMF'] = (((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / hl_diff * dollar_vol).rolling(20).sum() / vol_sum20
-    df['CMF'] = df['CMF'].clip(lower=-1.0, upper=1.0).fillna(0.0)
-
-    hist_vol_rolling = df['Volume'].shift(10).rolling(window=50, min_periods=10).quantile(0.8)
-    vol_10d_mean = df['Volume'].rolling(window=10, min_periods=1).mean()
-    vol_spike = (vol_10d_mean / (hist_vol_rolling + 1e-10)) > 2.5
-    price_spike = df['Close'].pct_change().abs().rolling(window=5, min_periods=1).max() > 0.08
-    
-    df['Event_Risk'] = 0.0
-    df.loc[vol_spike, 'Event_Risk'] += 0.6
-    df.loc[price_spike, 'Event_Risk'] += 0.4
-    df['Event_Risk'] = df['Event_Risk'].clip(upper=1.0)
 
     return df
 
@@ -525,9 +471,7 @@ def set_alerted(sym: str) -> None:
         except Exception: pass
 
 def run_tech_matrix() -> None:
-    # 🚀 生命力进化一：痛觉神经反馈系统 (Meta-Risk Self-Correction)
-    # 系统在运行前主动审视过去的创伤。如果连续亏损或盈亏比稀烂，自动收缩胆量。
-    PORTFOLIO_MAX_RISK_PER_TRADE = 0.015 # 默认允许单笔剥夺总资金 1.5% 的生命值
+    PORTFOLIO_MAX_RISK_PER_TRADE = 0.015 
     pain_warning = ""
     try:
         if os.path.exists(Config.STATS_FILE):
@@ -536,7 +480,7 @@ def run_tech_matrix() -> None:
                 if 'overall' in stats_data and 'T+3' in stats_data['overall']:
                     t3 = stats_data['overall']['T+3']
                     if t3.get('max_cons_loss', 0) >= 4 or t3.get('profit_factor', 1.0) < 1.2:
-                        PORTFOLIO_MAX_RISK_PER_TRADE = 0.0075  # 感到恐惧，强制斩半风险限额
+                        PORTFOLIO_MAX_RISK_PER_TRADE = 0.0075  
                         pain_warning = "\n- 🩸 **痛觉神经激活**: 近期回测遭重挫，引擎已主动执行**防守降杠杆**协议！"
                         logger.info("🩸 系统痛觉神经被激活：检测到近期连亏，已将全局最大单笔风险压降至 0.75%！")
     except Exception: pass
@@ -601,21 +545,27 @@ def run_tech_matrix() -> None:
 
     reports = []
     all_raw_scores = []
-    price_history_dict = {} # 用于马科维茨相关性剔除
+    price_history_dict = {} 
     
     for sym in active_pool:
         if is_alerted(sym): continue
         try:
+            df_w = safe_get_history(sym, "2y", "1wk", fast_mode=True)
+            if len(df_w) >= 40:
+                sma40_w = df_w['Close'].rolling(40).mean().iloc[-1]
+                if df_w['Close'].iloc[-1] < sma40_w:
+                    continue 
+                    
             df = safe_get_history(sym, "8mo", "1d", fast_mode=True) 
             if len(df) < 130: continue
             df = calculate_indicators(df)
             
-            # 留存收盘价切片用于后续反脆弱相关性分析
             price_history_dict[sym] = df['Close'].iloc[-60:]
             
             curr, prev = df.iloc[-1], df.iloc[-2]
-            if curr['Event_Risk'] > 0.85 or (curr['ATR'] / curr['Close'] > 0.10): continue
             
+            # 简化过滤条件，仅保留绝对红线
+            if curr['ATR'] / curr['Close'] > 0.15: continue
             if pd.notna(curr['SMA_200']) and curr['Close'] < curr['SMA_200'] and curr['SMA_50'] < curr['SMA_200']: 
                 continue
             
@@ -633,20 +583,14 @@ def run_tech_matrix() -> None:
                 poc_price = (bins[max_bin_idx] + bins[max_bin_idx+1]) / 2.0
             
             sig, factors, st_cnt = [], [], 0
-            
             is_vol = (curr['Volume'] / curr['Vol_MA20'] > 1.5) and (curr['Close'] > curr['Open'])
-            is_st = curr['SuperTrend_Up'] == 1
             
             triggered = []
-            cloud_penalty = False
 
+            # 🚀 纯血 12 大因子触发逻辑
             if pd.notna(curr['SMA_200']) and curr['Close'] > curr['SMA_50'] > curr['SMA_150'] > curr['SMA_200']:
                 fw = get_fw("米奈尔维尼")
                 triggered.append(("trend_align", "LT", "米奈尔维尼", f"🏆 [米奈尔维尼] 主升形态 (权:{fw:.1f}x)", 8 * w_mul * fw, True))
-                
-            if len(df) >= 40 and df['Close'].iloc[-20:].min() < df['Close'].iloc[-40:-20].min() and df['OBV'].iloc[-20:].min() > df['OBV'].iloc[-40:-20].min():
-                fw = get_fw("OBV底背离")
-                triggered.append(("flow", "LT", "OBV底背离", f"🌊 [OBV底背离] 资金潜伏 (权:{fw:.1f}x)", 7 * w_mul * fw, True))
                 
             if not qqq_df.empty:
                 m_df = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, how='inner')
@@ -676,8 +620,6 @@ def run_tech_matrix() -> None:
                 fw = get_fw("聪明钱抢筹")
                 triggered.append(("flow", "ST", "聪明钱抢筹", f"🕵️ [聪明资金] 连续10日尾盘吸筹 (权:{fw:.1f}x)", 6 * w_mul * fw, True))
                 
-            # 🚀 生命力进化三：VSA 巨量滞涨 (暗池冰山订单过滤)
-            # 成交量大于 2 倍均量，但实体振幅极小（不到 ATR 的 50%），说明主力在不计成本地吃进抛盘而压制价格
             if curr['Volume'] > curr['Vol_MA20'] * 2.0 and abs(curr['Close'] - curr['Open']) < curr['ATR'] * 0.5:
                 fw = get_fw("巨量滞涨")
                 triggered.append(("flow", "ST", "巨量滞涨", f"🛑 [巨量滞涨] 触发暗池 Iceberg 吸筹异象 (权:{fw:.1f}x)", 12 * w_mul * fw, True))
@@ -701,36 +643,6 @@ def run_tech_matrix() -> None:
             if poc_price > 0 and prev['Close'] <= poc_price and curr['Close'] > poc_price and is_vol:
                 fw = get_fw("筹码峰突破")
                 triggered.append(("flow", "ST", "筹码峰突破", f"🏔️ [筹码峰突破] 强势跨越 60日核心成本区 (权:{fw:.1f}x)", 12 * w_mul * fw, True))
-                
-            dyn_rsi = curr['RSI_P20']
-            if curr['RSI'] < dyn_rsi and prev['RSI'] >= dyn_rsi and is_st:
-                fw = get_fw("强势回踩")
-                triggered.append(("reversal", "ST", "强势回踩", f"🟢 [强势回踩] RSI:{curr['RSI']:.1f} (权:{fw:.1f}x)", 10 * w_mul * fw, True))
-                
-            if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
-                fw = get_fw("MACD金叉")
-                triggered.append(("trend_confirm", "ST", "MACD金叉", f"🔥 [MACD金叉] (权:{fw:.1f}x)", 10 * w_mul * fw, True))
-                
-            is_sqz = (curr['BB_Upper'] - curr['BB_Lower']) < (curr['KC_Upper'] - curr['KC_Lower'])
-            if is_sqz: 
-                fw = get_fw("TTM Squeeze ON")
-                triggered.append(("squeeze", "ST", "TTM Squeeze ON", f"📦 [TTM Squeeze ON] (权:{fw:.1f}x)", 6 * w_mul * fw, False))
-                
-            cmf = curr['CMF']
-            if cmf > 0.20: 
-                fw = get_fw("机构控盘")
-                triggered.append(("flow", "LT", "机构控盘", f"🏦 [机构控盘] CMF:{cmf:.2f} (权:{fw:.1f}x)", 5 * w_mul * fw, True))
-                
-            if curr['Above_Cloud'] == 0: 
-                cloud_penalty = True
-            elif curr['Tenkan'] > curr['Kijun'] and curr['Cloud_Twist'] == 1:
-                fw = get_fw("一目多头")
-                triggered.append(("trend_confirm", "LT", "一目多头", f"🌥️ [一目多头] (权:{fw:.1f}x)", 6 * w_mul * fw, True))
-                
-            gap_pct = (curr['Open'] - prev['Close']) / prev['Close']
-            if gap_pct * 100 > max(1.5, atr_pct * 0.3) and gap_pct < 0.06 and is_vol:
-                fw = get_fw("突破缺口")
-                triggered.append(("reversal", "ST", "突破缺口", f"💥 [突破缺口] +{gap_pct*100:.1f}% (权:{fw:.1f}x)", 6 * w_mul * fw, True))
             
             cat_counts = defaultdict(int)
             lt_pts_dict = defaultdict(float)
@@ -761,11 +673,6 @@ def run_tech_matrix() -> None:
                 discount = max(0.65, 1.0 / (1 + 0.2 * (k - 1))) if k >= 2 else 1.0
                 lt_score_raw += lt_pts_dict[cat] * discount
                 st_score_raw += st_pts_dict[cat] * discount
-                
-            if cloud_penalty:
-                lt_score_raw *= 0.4
-                st_score_raw *= 0.4
-                sig.append("☁️ [云下压制] 长短线全面降权")
 
             is_bearish_div = False
             if curr['Close'] >= curr['Price_High_20'] * 0.98 and curr['RSI'] < curr['RSI_High_20'] * 0.90:
@@ -836,7 +743,6 @@ def run_tech_matrix() -> None:
                 position_advice = "❌ 放弃建仓 (AI盈亏比劣势 或 顶背离确认)"
                 pos_percentage = 0.0
             else:
-                # 使用读取了系统“痛觉神经”的动态风险上限
                 risk_parity_pos = PORTFOLIO_MAX_RISK_PER_TRADE / sl_pct_distance
                 safe_kelly = min(0.20, kelly_fraction / 2.0)
                 pos_percentage = min(safe_kelly, risk_parity_pos)
@@ -844,6 +750,7 @@ def run_tech_matrix() -> None:
                 if is_credit_risk_high:
                     pos_percentage *= 0.6
                 
+                gap_pct = (curr['Open'] - prev['Close']) / prev['Close']
                 if gap_pct > 0.03:
                     st_score = int(st_score * 0.5)
                     total_score = lt_score + st_score
@@ -882,32 +789,45 @@ def run_tech_matrix() -> None:
         dynamic_min_score = max(Config.MIN_SCORE_THRESHOLD, np.percentile(all_raw_scores, 85))
         reports = [r for r in reports if r['score'] >= dynamic_min_score]
         
-        # 🚀 生命力进化二：马科维茨反脆弱阵型 (Markowitz Decorrelation)
-        # 将候选池扩大至前 25 名，为“踢掉同质化标的”留下冗余空间
+        groups = defaultdict(list)
+        for r in reports: groups[r["sector"]].append(r)
+        
+        for sec, stks in groups.items():
+            if sec not in Config.CROWDING_EXCLUDE_SECTORS and len(stks) >= Config.CROWDING_MIN_STOCKS:
+                sec_mom = valid_sector_data.get(sec, 0.0)
+                if sec_mom > 0.04:
+                    for s in stks[1:]: 
+                        if "🚀 [板块主升豁免] 让利润奔跑" not in s["signals"]:
+                            s["signals"].append("🚀 [板块主升豁免] 让利润奔跑")
+                else:
+                    base_pen = max(0.6, min(0.9, Config.CROWDING_PENALTY * (1.0 + health_score * 0.3)))
+                    for s in stks[1:]:
+                        s["lt_score"] = int(s["lt_score"] * base_pen)
+                        s["st_score"] = int(s["st_score"] * base_pen)
+                        s["score"] = s["lt_score"] + s["st_score"]
+
         reports.sort(key=lambda x: (x["lt_score"], x["st_score"]), reverse=True)
         candidate_pool = reports[:25]
         
         final_reports = []
         if candidate_pool:
             try:
-                # 将所有候选标的的 60 天收盘价提取出来构建 DataFrame
                 corr_df_data = {r['symbol']: price_history_dict[r['symbol']] for r in candidate_pool if r['symbol'] in price_history_dict}
                 if corr_df_data:
                     corr_df = pd.DataFrame(corr_df_data).fillna(method='ffill').pct_change().corr()
                     
                     for candidate in candidate_pool:
-                        if len(final_reports) >= 15: break # 阵型已满
+                        if len(final_reports) >= 15: break
                         
                         sym = candidate['symbol']
                         is_redundant = False
                         
-                        # 检查这个候选者是否与 [已经入选斯巴达方阵] 的某个大佬高度同质化
                         for accepted in final_reports:
                             acc_sym = accepted['symbol']
                             if sym in corr_df.columns and acc_sym in corr_df.columns:
                                 if corr_df.loc[sym, acc_sym] > 0.80:
                                     is_redundant = True
-                                    logger.info(f"🛡️ 反脆弱机制：踢除 {sym}，因为它与已选高分股 {acc_sym} 相关性高达 {corr_df.loc[sym, acc_sym]:.2f}，拒绝鸡蛋放在同一个篮子。")
+                                    logger.info(f"🛡️ 反脆弱机制：踢除 {sym}，因为它与已选高分股 {acc_sym} 相关性高达 {corr_df.loc[sym, acc_sym]:.2f}，拒绝同质化风险。")
                                     break
                         
                         if not is_redundant:
@@ -915,7 +835,7 @@ def run_tech_matrix() -> None:
                 else:
                     final_reports = candidate_pool[:15]
             except Exception as e:
-                logger.warning(f"反脆弱协方差矩阵构建失败，退化为原始强排: {e}")
+                logger.warning(f"反脆弱协方差矩阵构建失败: {e}")
                 final_reports = candidate_pool[:15]
         
         for r in final_reports:
@@ -945,9 +865,9 @@ def run_tech_matrix() -> None:
         
         final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
                         "\n\n---\n\n".join(txts) + \
-                        f"\n\n*(引擎重构: 痛觉神经反馈、VSA暗池识别与马科维茨反脆弱阵型已永久烙印入 DNA)*"
+                        f"\n\n*(引擎重构: 剥离散户指标群，提纯12大机构极简因子。反脆弱列阵守护您的每一次冲锋)*"
         
-        send_alert("量化诸神之战 (Apex Predator版)", final_content)
+        send_alert("量化诸神之战 (极简纯血版)", final_content)
         
         with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
             f.write(json.dumps({"date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", []), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports]}, ensure_ascii=False) + "\n")
@@ -1101,6 +1021,7 @@ def run_backtest_engine() -> None:
                         for f_name in factor_list:
                             factor_rets.setdefault(f"[{f_name}]", []).append(ret)
                             
+                        # 确保回测训练维度与最新的极简 12 因子强一致
                         x_row = [1 if f in factor_list else 0 for f in Config.ALL_FACTORS]
                         X_train.append(x_row)
                         y_train.append(1 if ret > 0.015 else 0)
@@ -1123,7 +1044,7 @@ def run_backtest_engine() -> None:
             clf.fit(X_train, y_train)
             with open(Config.MODEL_FILE, 'wb') as f:
                 pickle.dump(clf, f)
-            logger.info("🧠 非线性机器学习打分模型 (Random Forest) 已基于最新实盘数据完成重训并落盘。")
+            logger.info("🧠 非线性机器学习打分模型 (Random Forest) 已基于纯血因子完成重训并落盘。")
             
             if hasattr(clf, 'feature_importances_'):
                 importances = clf.feature_importances_
@@ -1208,7 +1129,7 @@ def run_backtest_engine() -> None:
             report_md.append(f"| {tag} | {imp*100:.1f}% |")
 
     if f_res:
-        report_md.append("\n## 🧬 核心因子胜率剥离 (T+3)\n| 因子 | 胜率 | 盈亏比 | 触发次数 |\n|:---|:---:|:---:|:---:|")
+        report_md.append("\n## 🧬 纯血十二大因子验证 (T+3)\n| 因子 | 胜率 | 盈亏比 | 触发次数 |\n|:---|:---:|:---:|:---:|")
         sorted_f = sorted(f_res.items(), key=lambda x: x[1]['win_rate'], reverse=True)
         for tag, d in sorted_f: report_md.append(f"| {tag} | {d['win_rate']*100:.1f}% | {d['profit_factor']:.2f} | {d['count']} |")
     
@@ -1226,11 +1147,11 @@ def run_backtest_engine() -> None:
             icon = ['🔥','🔥','🔥'][idx]
             alert_lines.append(f"- {icon} **{tag}**: 贡献度 {imp*100:.1f}%")
             
-    send_alert("策略终极回测战报 (XAI版)", "\n".join(alert_lines))
+    send_alert("策略终极回测战报 (纯血XAI版)", "\n".join(alert_lines))
 
 if __name__ == "__main__":
     validate_config()
     m = sys.argv[1] if len(sys.argv) > 1 else "matrix"
     if m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "灵魂觉醒完毕！痛觉神经系统、VSA巨量滞涨暗池探测与马科维茨反脆弱阵型全面接管现实。")
+    elif m == "test": send_alert("连通性测试", "Alpha洗礼完成！散户滞后指标已尽数剥离，提纯为最纯粹的十二大机构级量价/筹码行为因子。")
