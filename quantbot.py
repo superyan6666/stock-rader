@@ -76,12 +76,12 @@ class Config:
     ALERT_CACHE_FILE: str = "alert_history.json"
     MODEL_FILE: str = "scoring_model.pkl"
     
-    # 🚀 时空拓展：完成 16 维终极量价基因链，注入 [威科夫弹簧(Spring)]
+    # 🚀 时空拓展：完成 17 维终极量价基因链，注入 [维特鲁威分形(Fractal)]
     ALL_FACTORS = [
         "米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "SMC失衡区", 
         "流动性扫盘", "聪明钱抢筹", "巨量滞涨", "放量长阳", "口袋支点", 
         "VCP收缩", "筹码峰突破", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘",
-        "威科夫弹簧(Spring)"
+        "威科夫弹簧(Spring)", "维特鲁威分形"
     ]
 
     @classmethod
@@ -501,16 +501,14 @@ def run_tech_matrix() -> None:
     vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
     vix_scalar = max(0.6, min(1.4, 18.0 / max(vix, 1.0)))
     
-    # 🚀 遐想三：跨界资金黑洞探测 (Sector Liquidity Black Hole)
     valid_sector_data = {}
     black_hole_sectors = []
     for etf in Config.SECTOR_MAP.keys():
         sdf = safe_get_history(etf, "2mo", "1d", fast_mode=True)
         if not sdf.empty and len(sdf) >= 20:
             valid_sector_data[etf] = (sdf['Close'].ffill().iloc[-1] / sdf['Close'].iloc[-20]) - 1
-            # 计算该 ETF 今天的成交量异动倍数
             vol_surge = sdf['Volume'].iloc[-1] / (sdf['Volume'].iloc[-20:].mean() + 1e-10)
-            if vol_surge > 1.6:  # 资金疯狂涌入该板块
+            if vol_surge > 1.6:  
                 black_hole_sectors.append(etf)
                 
     sorted_sectors = sorted(valid_sector_data.items(), key=lambda x: x[1], reverse=True)
@@ -551,10 +549,17 @@ def run_tech_matrix() -> None:
     for sym in active_pool:
         if is_alerted(sym): continue
         try:
+            # 🚀 遐想一：多维度时空视界 (Weekly Timeframe Extraction)
             df_w = safe_get_history(sym, "2y", "1wk", fast_mode=True)
+            weekly_bullish = False
             if len(df_w) >= 40:
                 sma40_w = df_w['Close'].rolling(40).mean().iloc[-1]
                 if df_w['Close'].iloc[-1] < sma40_w: continue 
+                
+                df_w['EMA_10'] = df_w['Close'].ewm(span=10, adjust=False).mean()
+                df_w['EMA_30'] = df_w['Close'].ewm(span=30, adjust=False).mean()
+                # 识别周线级别的史诗级向上拐点
+                weekly_bullish = (df_w['Close'].iloc[-1] > df_w['EMA_10'].iloc[-1]) and (df_w['EMA_10'].iloc[-1] > df_w['EMA_30'].iloc[-1])
                     
             df = safe_get_history(sym, "8mo", "1d", fast_mode=True) 
             if len(df) < 130: continue
@@ -652,19 +657,23 @@ def run_tech_matrix() -> None:
                 fw = get_fw("AMD操盘")
                 triggered.append(("AMD操盘", f"🎭 [AMD操盘] 开盘深度诱空下杀，随后全天拉升派发 (权:{fw:.2f}x)", 12 * w_mul * fw))
                 
-            # 🚀 遐想二：威科夫弹簧测试 (Wyckoff Spring)
-            # 股价跌破了过去20天的最低点，但成交量极度萎缩（抛压耗尽），且收盘价强行收回日内中轴之上
             if pd.notna(curr['Swing_Low_20']) and curr['Low'] < curr['Swing_Low_20']:
                 if curr['Volume'] < curr['Vol_MA20'] * 0.8 and curr['Close'] > (curr['Low'] + tr_val * 0.5):
                     fw = get_fw("威科夫弹簧(Spring)")
                     triggered.append(("威科夫弹簧(Spring)", f"🏹 [威科夫弹簧] 跌破前低但抛压枯竭，深蹲起爆 (权:{fw:.2f}x)", 18 * w_mul * fw))
             
+            # 🚀 降维杰作：维特鲁威分形 (Vitruvian Fractal Resonance)
+            # 当周线级别的宏观大势刚处于起爆多头，同时日线级别满足任意放量或均线结构，达成时空共振！
+            if weekly_bullish and is_vol and (curr['Close'] > curr['Highest_22'] * 0.95):
+                fw = get_fw("维特鲁威分形")
+                triggered.append(("维特鲁威分形", f"🌌 [维特鲁威分形] 跨越周线与日线双重时空的完美共振螺旋 (权:{fw:.2f}x)", 20 * w_mul * fw))
+
             score_raw = 0.0
             for tag, text, pts in triggered:
                 adj_pts = pts
-                if regime in ["bear", "range", "hidden_bear"] and tag in ["米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "筹码峰突破"]:
+                if regime in ["bear", "range", "hidden_bear"] and tag in ["米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "筹码峰突破", "维特鲁威分形"]:
                     adj_pts *= 0.5  
-                elif regime in ["bull", "rebound"] and tag in ["米奈尔维尼"]:
+                elif regime in ["bull", "rebound"] and tag in ["米奈尔维尼", "维特鲁威分形"]:
                     adj_pts *= 1.2  
                 elif regime in ["bear", "range", "hidden_bear"] and tag in ["SMC失衡区", "流动性扫盘", "口袋支点", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘", "威科夫弹簧(Spring)"]:
                     adj_pts *= 1.5
@@ -691,8 +700,6 @@ def run_tech_matrix() -> None:
                 sig.append(f"⚠️ [短线高估] 偏离20日均线 +{bias_20*100:.1f}% (防追高扣减)")
 
             sym_sec = Config.get_sector_etf(sym)
-            
-            # 🚀 黑洞引力加持：如果个股所处板块正好是当天的“资金黑洞”，分数获得史诗级爆增！
             if sym_sec in black_hole_sectors:
                 total_score = int(total_score * 1.30)
                 sig.append(f"🕳️ [流动性黑洞] 所属板块 {sym_sec} 正疯狂吸血全市场资金 (+30%)")
@@ -837,9 +844,9 @@ def run_tech_matrix() -> None:
         
         final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
                         "\n\n---\n\n".join(txts) + \
-                        f"\n\n*(奇点降临: AI遗忘曲线、板块黑洞引力与威科夫弹簧探测已全线激活)*"
+                        f"\n\n*(奇点降临: 维特鲁威分形时空共振、AI遗忘曲线、板块黑洞引力已全线激活)*"
         
-        send_alert("量化诸神之战 (破壁奇点版)", final_content)
+        send_alert("量化诸神之战 (文艺复兴版)", final_content)
         
         with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
             f.write(json.dumps({"date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", []), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports]}, ensure_ascii=False) + "\n")
@@ -1013,7 +1020,6 @@ def run_backtest_engine() -> None:
             import pickle
             
             # 🚀 遐想一：AI 记忆遗忘曲线 (Time-Decay Memory Weighting)
-            # 让 AI 聚焦于最新的市场特征，对过于古老的数据进行指数级权重衰减
             sample_weights = np.exp(np.linspace(-2.5, 0, len(y_train)))
             
             clf = RandomForestClassifier(n_estimators=100, max_depth=5, class_weight='balanced', random_state=42)
@@ -1105,7 +1111,7 @@ def run_backtest_engine() -> None:
             report_md.append(f"| {tag} | {imp*100:.1f}% |")
 
     if f_res:
-        report_md.append("\n## 🧬 终极16大破壁因子验证 (T+3)\n| 因子 | 胜率 | 盈亏比 | 触发次数 |\n|:---|:---:|:---:|:---:|")
+        report_md.append("\n## 🧬 终极17大时空破壁因子 (T+3)\n| 因子 | 胜率 | 盈亏比 | 触发次数 |\n|:---|:---:|:---:|:---:|")
         sorted_f = sorted(f_res.items(), key=lambda x: x[1]['win_rate'], reverse=True)
         for tag, d in sorted_f: report_md.append(f"| {tag} | {d['win_rate']*100:.1f}% | {d['profit_factor']:.2f} | {d['count']} |")
     
@@ -1123,11 +1129,11 @@ def run_backtest_engine() -> None:
             icon = ['🔥','🔥','🔥'][idx]
             alert_lines.append(f"- {icon} **{tag}**: 贡献度 {imp*100:.1f}%")
             
-    send_alert("策略终极回测战报 (16因子奇点版)", "\n".join(alert_lines))
+    send_alert("策略终极回测战报 (17因子时空破壁版)", "\n".join(alert_lines))
 
 if __name__ == "__main__":
     validate_config()
     m = sys.argv[1] if len(sys.argv) > 1 else "matrix"
     if m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "The Singularity 奇点更新！遗忘曲线(记忆衰减)、黑洞引力与威科夫弹簧已突破量化边界。")
+    elif m == "test": send_alert("连通性测试", "文艺复兴时刻降临！维特鲁威分形共振、AI遗忘曲线、板块黑洞探测与威科夫弹簧已全部苏醒。")
