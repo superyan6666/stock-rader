@@ -77,7 +77,13 @@ class Config:
     ALERT_CACHE_FILE: str = "alert_history.json"
     MODEL_FILE: str = "scoring_model.pkl"
     
-    ALL_FACTORS = ["米奈尔维尼", "OBV底背离", "强相对强度", "强势回踩", "MACD金叉", "TTM Squeeze ON", "机构控盘", "一目多头", "突破缺口", "VWAP突破", "聪明钱抢筹"]
+    # 🚀 生命力进化：植入 VSA 巨量滞涨 (暗池吸收)
+    ALL_FACTORS = [
+        "米奈尔维尼", "OBV底背离", "强相对强度", "强势回踩", "MACD金叉", 
+        "TTM Squeeze ON", "机构控盘", "一目多头", "突破缺口", "VWAP突破", 
+        "聪明钱抢筹", "放量长阳", "口袋支点", "VCP收缩", "筹码峰突破",
+        "SMC失衡区", "AVWAP突破", "流动性扫盘", "巨量滞涨"
+    ]
 
     @classmethod
     def get_current_log_file(cls) -> str:
@@ -101,7 +107,7 @@ def validate_config():
         with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: f.write("{}")
     if not os.path.exists(Config.ALERT_CACHE_FILE):
         with open(Config.ALERT_CACHE_FILE, 'w', encoding='utf-8') as f: 
-            json.dump({"date": "", "sentinel": [], "matrix": []}, f)
+            json.dump({"date": "", "matrix": []}, f)
             
     logger.info("✅ 环境与占位文件校验通过")
 
@@ -277,7 +283,8 @@ def load_strategy_performance_tag() -> str:
                 t3 = stats_data.get("overall", {}).get("T+3") if "overall" in stats_data else stats_data.get("T+3")
                 if t3 and t3.get('total_trades', 0) > 0:
                     pf_str = f" | 盈亏比 {t3.get('profit_factor', 0.0):.2f}" if 'profit_factor' in t3 else ""
-                    return f"**📈 策略表现 (T+3):** 胜率 {t3['win_rate']:.1%}{pf_str} | 均收益 {t3['avg_ret']:+.2%} "
+                    ai_wr_str = f" | ⚡AI胜率 {t3['ai_win_rate']:.1%}" if 'ai_win_rate' in t3 else ""
+                    return f"**📈 T+3 策略基底:** 原始胜率 {t3['win_rate']:.1%}{ai_wr_str}{pf_str}"
     except Exception: pass
     return ""
 
@@ -397,9 +404,25 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['SMA_150'] = df['Close'].rolling(window=150).mean()
     df['SMA_200'] = df['Close'].rolling(window=200).mean()
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     
     df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
     df['VWAP_20'] = (df['Typical_Price'] * df['Volume']).rolling(window=20).sum() / (df['Volume'].rolling(window=20).sum() + 1e-10)
+    
+    df['AVWAP'] = np.nan
+    vol_last_120 = df['Volume'].iloc[-120:]
+    if not vol_last_120.empty:
+        anchor_idx = vol_last_120.idxmax()
+        post_anchor = df.loc[anchor_idx:].copy()
+        df.loc[anchor_idx:, 'AVWAP'] = (post_anchor['Typical_Price'] * post_anchor['Volume']).cumsum() / (post_anchor['Volume'].cumsum() + 1e-10)
+    
+    down_vol = df['Volume'].where(df['Close'] < df['Close'].shift(), 0)
+    df['Max_Down_Vol_10'] = down_vol.shift(1).rolling(10).max()
+    
+    df['Swing_Low_20'] = df['Low'].shift(1).rolling(20).min()
+    
+    df['Range_60'] = df['High'].rolling(60).max() - df['Low'].rolling(60).min()
+    df['Range_20'] = df['High'].rolling(20).max() - df['Low'].rolling(20).min()
     
     df['High_52W'] = df['High'].rolling(window=252, min_periods=120).max()
     df['Low_52W'] = df['Low'].rolling(window=252, min_periods=120).min()
@@ -418,17 +441,15 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['MACD'] = df['Close'].ewm(span=12, adjust=False).mean() - df['Close'].ewm(span=26, adjust=False).mean()
     df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
-    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    
     df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
     df['TR'] = pd.concat([df['High']-df['Low'], (df['High']-df['Close'].shift()).abs(), (df['Low']-df['Close'].shift()).abs()], axis=1).max(axis=1)
     df['ATR'] = df['TR'].rolling(window=14).mean()
     
-    # 🚀 吊灯止损体系 (Chandelier Exit) - 22日基准
     df['Highest_22'] = df['High'].rolling(window=22).max()
     df['ATR_22'] = df['TR'].rolling(window=22).mean()
     df['Chandelier_Exit'] = df['Highest_22'] - 2.5 * df['ATR_22']
     
-    # 🚀 聪明钱流动性指标 (Smart Money Flow / CLV)
     clv = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / (df['High'] - df['Low'] + 1e-10)
     df['Smart_Money_Flow'] = clv.rolling(window=10).mean()
     
@@ -481,7 +502,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 def get_alert_cache() -> dict:
     today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-    cache_data = {"date": today_str, "sentinel": [], "matrix": []}
+    cache_data = {"date": today_str, "matrix": []}
     try:
         if os.path.exists(Config.ALERT_CACHE_FILE):
             with open(Config.ALERT_CACHE_FILE, 'r', encoding='utf-8') as f:
@@ -491,91 +512,35 @@ def get_alert_cache() -> dict:
     except Exception: pass
     return cache_data
 
-def is_alerted(sym: str, mode: str) -> bool:
-    return sym in get_alert_cache().get(mode, [])
+def is_alerted(sym: str) -> bool:
+    return sym in get_alert_cache().get("matrix", [])
 
-def set_alerted(sym: str, mode: str) -> None:
+def set_alerted(sym: str) -> None:
     cache = get_alert_cache()
-    if sym not in cache.get(mode, []):
-        cache.setdefault(mode, []).append(sym)
+    if sym not in cache.get("matrix", []):
+        cache.setdefault("matrix", []).append(sym)
         try:
             with open(Config.ALERT_CACHE_FILE, 'w', encoding='utf-8') as f:
                 json.dump(cache, f)
         except Exception: pass
 
-def run_volatility_sentinel() -> None:
-    active_pool = get_filtered_watchlist(max_stocks=60)
-    alerts = []
-    
-    vix, _ = get_vix_level()
-    vix_scalar = max(0.6, min(1.4, 18.0 / max(vix, 1.0)))
-    
-    for sym in active_pool:
-        if is_alerted(sym, "sentinel"): continue 
-        try:
-            df_d = safe_get_history(sym, period="2mo", interval="1d", fast_mode=True)
-            if len(df_d) < 40: continue
-            df_d = calculate_indicators(df_d)
-            
-            atr = df_d['ATR'].iloc[-1]
-            curr_px_d = df_d['Close'].iloc[-1]
-            daily_vol_pct = (atr / curr_px_d) * 100 
-            
-            is_alert = False
-            alert_reason = ""
-            
-            gap = (df_d['Open'].iloc[-1] - df_d['Close'].iloc[-2]) / df_d['Close'].iloc[-2] * 100
-            if abs(gap) > 4.0:
-                is_alert = True
-                alert_reason = f"- 💥 动能缺口: **{gap:+.2f}%**"
-            
-            df_h = safe_get_history(sym, period="5d", interval="1h", fast_mode=True)
-            if len(df_h) >= 5:
-                curr_px = df_h['Close'].ffill().iloc[-1]
-                hr_chg = (curr_px - df_h['Open'].iloc[-1]) / df_h['Open'].iloc[-1] * 100
-                
-                pulse_threshold = max(3.0, daily_vol_pct * 0.6)
-                
-                if abs(hr_chg) > pulse_threshold: 
-                    vol_last_hour = df_h['Volume'].iloc[-1]
-                    vol_ma_5h = df_h['Volume'].rolling(5).mean().iloc[-1]
-                    if vol_last_hour > vol_ma_5h * 1.5:
-                        is_alert = True
-                        reason = f"- ⚡ 极端脉冲: **{hr_chg:+.2f}%** (1h耗尽日均波幅的 {abs(hr_chg)/daily_vol_pct*100:.0f}% | 放量 {vol_last_hour/vol_ma_5h:.1f}x)"
-                        alert_reason = f"{alert_reason}\n{reason}" if alert_reason else reason
-                        
-            if is_alert:
-                set_alerted(sym, "sentinel") 
-                
-                tp = curr_px_d + 3.0 * vix_scalar * atr
-                sl_chandelier = df_d['Chandelier_Exit'].iloc[-1]
-                if pd.isna(sl_chandelier): sl_chandelier = curr_px_d - 1.5 * vix_scalar * atr
-                sl = max(sl_chandelier, curr_px_d - 1.5 * vix_scalar * atr)
-                
-                trade_plan = (
-                    f"**💰 交易计划:**\n"
-                    f"- 💵 现价: `{curr_px_d:.2f}`\n"
-                    f"- 🎯 止盈: **${tp:.2f}**\n"
-                    f"- 🛡️ 吊灯止损: **${sl:.2f}**"
-                )
-                
-                news = get_latest_news(sym)
-                news_block = f"\n\n**📰 最新资讯:**\n- {news}" if news else ""
-                
-                msg = (
-                    f"### 🚨 {sym} | 盘中异动 {'🚀' if gap>0 or (len(df_h)>=5 and hr_chg>0) else '🩸'}\n"
-                    f"**💡 异动捕捉:**\n{alert_reason}\n\n"
-                    f"{trade_plan}{news_block}"
-                )
-                alerts.append(msg)
-        except Exception: pass
-        
-    if alerts: 
-        send_alert("高频哨兵专业版预警", "\n\n---\n\n".join(alerts))
-    else:
-        logger.info("📭 本次扫描未发现符合严苛 ATR 归一化脉冲条件的标的，保持静默。")
-
 def run_tech_matrix() -> None:
+    # 🚀 生命力进化一：痛觉神经反馈系统 (Meta-Risk Self-Correction)
+    # 系统在运行前主动审视过去的创伤。如果连续亏损或盈亏比稀烂，自动收缩胆量。
+    PORTFOLIO_MAX_RISK_PER_TRADE = 0.015 # 默认允许单笔剥夺总资金 1.5% 的生命值
+    pain_warning = ""
+    try:
+        if os.path.exists(Config.STATS_FILE):
+            with open(Config.STATS_FILE, "r", encoding="utf-8") as f:
+                stats_data = json.load(f)
+                if 'overall' in stats_data and 'T+3' in stats_data['overall']:
+                    t3 = stats_data['overall']['T+3']
+                    if t3.get('max_cons_loss', 0) >= 4 or t3.get('profit_factor', 1.0) < 1.2:
+                        PORTFOLIO_MAX_RISK_PER_TRADE = 0.0075  # 感到恐惧，强制斩半风险限额
+                        pain_warning = "\n- 🩸 **痛觉神经激活**: 近期回测遭重挫，引擎已主动执行**防守降杠杆**协议！"
+                        logger.info("🩸 系统痛觉神经被激活：检测到近期连亏，已将全局最大单笔风险压降至 0.75%！")
+    except Exception: pass
+
     active_pool = get_filtered_watchlist(max_stocks=120)
     regime, regime_desc, qqq_df, is_credit_risk_high = get_market_regime(active_pool)
     vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
@@ -619,13 +584,9 @@ def run_tech_matrix() -> None:
                     shrunk_avg_ret = alpha * avg_ret + (1.0 - alpha) * PRIOR_AVG_RET
                     
                     w = 1.0 + (shrunk_wr - 0.5) * 2.0 + (shrunk_avg_ret * 20) 
-                    
-                    if pf < 1.0 and cnt >= MIN_SAMPLES:
-                        w *= (pf ** 2) 
-                        
+                    if pf < 1.0 and cnt >= MIN_SAMPLES: w *= (pf ** 2) 
                     factor_weights[tag] = max(0.2, min(2.0, w)) 
-    except Exception as e:
-        logger.warning(f"动态权重解析跳过: {e}")
+    except Exception: pass
 
     def get_fw(tag_name: str) -> float:
         return factor_weights.get(f"[{tag_name}]", 1.0)
@@ -636,30 +597,40 @@ def run_tech_matrix() -> None:
             import pickle
             with open(Config.MODEL_FILE, 'rb') as f:
                 clf_model = pickle.load(f)
-                logger.info("🧠 AI 概率打分模型已成功上线。")
-        except Exception as e:
-            logger.debug(f"模型加载失败: {e}")
+        except Exception: pass
 
     reports = []
     all_raw_scores = []
+    price_history_dict = {} # 用于马科维茨相关性剔除
     
     for sym in active_pool:
-        if is_alerted(sym, "matrix"): continue
+        if is_alerted(sym): continue
         try:
-            df_w = safe_get_history(sym, "2y", "1wk", fast_mode=True)
-            if len(df_w) >= 40:
-                sma40_w = df_w['Close'].rolling(40).mean().iloc[-1]
-                if df_w['Close'].iloc[-1] < sma40_w:
-                    continue 
-                    
-            df = safe_get_history(sym, "1y", "1d", fast_mode=True)
-            if len(df) < 150: continue
+            df = safe_get_history(sym, "8mo", "1d", fast_mode=True) 
+            if len(df) < 130: continue
             df = calculate_indicators(df)
+            
+            # 留存收盘价切片用于后续反脆弱相关性分析
+            price_history_dict[sym] = df['Close'].iloc[-60:]
+            
             curr, prev = df.iloc[-1], df.iloc[-2]
             if curr['Event_Risk'] > 0.85 or (curr['ATR'] / curr['Close'] > 0.10): continue
             
             if pd.notna(curr['SMA_200']) and curr['Close'] < curr['SMA_200'] and curr['SMA_50'] < curr['SMA_200']: 
                 continue
+            
+            fvg_lower, fvg_upper = 0.0, 0.0
+            for i in range(len(df)-20, len(df)-1):
+                if df['Low'].iloc[i] > df['High'].iloc[i-2]:
+                    fvg_lower = df['High'].iloc[i-2]
+                    fvg_upper = df['Low'].iloc[i]
+            
+            df_60 = df.iloc[-60:]
+            poc_price = 0.0
+            if not df_60.empty:
+                counts, bins = np.histogram(df_60['Close'], bins=12, weights=df_60['Volume'])
+                max_bin_idx = np.argmax(counts)
+                poc_price = (bins[max_bin_idx] + bins[max_bin_idx+1]) / 2.0
             
             sig, factors, st_cnt = [], [], 0
             
@@ -689,9 +660,47 @@ def run_tech_matrix() -> None:
                 fw = get_fw("VWAP突破")
                 triggered.append(("flow", "ST", "VWAP突破", f"🌊 [VWAP突破] 放量逾越机构均价 (权:{fw:.1f}x)", 8 * w_mul * fw, True))
                 
+            if pd.notna(curr['AVWAP']) and curr['Close'] > curr['AVWAP'] and prev['Close'] <= prev['AVWAP']:
+                fw = get_fw("AVWAP突破")
+                triggered.append(("flow", "ST", "AVWAP突破", f"⚓ [AVWAP突破] 巨鲸建仓成本区夺回 (权:{fw:.1f}x)", 12 * w_mul * fw, True))
+                
+            if fvg_lower > 0 and curr['Low'] <= fvg_upper and curr['Close'] > fvg_lower and is_vol:
+                fw = get_fw("SMC失衡区")
+                triggered.append(("reversal", "ST", "SMC失衡区", f"🧲 [SMC失衡区] 精准回踩机构流动性缺口 (权:{fw:.1f}x)", 15 * w_mul * fw, True))
+            
+            if pd.notna(curr['Swing_Low_20']) and curr['Low'] < curr['Swing_Low_20'] and curr['Close'] > curr['Swing_Low_20'] and is_vol:
+                fw = get_fw("流动性扫盘")
+                triggered.append(("reversal", "ST", "流动性扫盘", f"🧹 [流动性扫盘] 刺穿前低完成 Stop-Hunt 诱空反转 (权:{fw:.1f}x)", 15 * w_mul * fw, True))
+                
             if curr['Smart_Money_Flow'] > 0.5 and curr['Close'] > curr['EMA_20']:
                 fw = get_fw("聪明钱抢筹")
                 triggered.append(("flow", "ST", "聪明钱抢筹", f"🕵️ [聪明资金] 连续10日尾盘吸筹 (权:{fw:.1f}x)", 6 * w_mul * fw, True))
+                
+            # 🚀 生命力进化三：VSA 巨量滞涨 (暗池冰山订单过滤)
+            # 成交量大于 2 倍均量，但实体振幅极小（不到 ATR 的 50%），说明主力在不计成本地吃进抛盘而压制价格
+            if curr['Volume'] > curr['Vol_MA20'] * 2.0 and abs(curr['Close'] - curr['Open']) < curr['ATR'] * 0.5:
+                fw = get_fw("巨量滞涨")
+                triggered.append(("flow", "ST", "巨量滞涨", f"🛑 [巨量滞涨] 触发暗池 Iceberg 吸筹异象 (权:{fw:.1f}x)", 12 * w_mul * fw, True))
+                
+            atr_pct = (curr['ATR'] / prev['Close']) * 100
+            pulse_threshold = max(3.0, atr_pct * 0.6)
+            day_chg = (curr['Close'] - curr['Open']) / curr['Open'] * 100
+            if day_chg > pulse_threshold and curr['Volume'] > curr['Vol_MA20'] * 1.5:
+                fw = get_fw("放量长阳")
+                triggered.append(("flow", "ST", "放量长阳", f"⚡ [放量长阳] 强劲日内脉冲 +{day_chg:.1f}% (权:{fw:.1f}x)", 8 * w_mul * fw, True))
+            
+            if curr['Close'] > prev['Close'] and curr['Volume'] > curr['Max_Down_Vol_10'] > 0 and curr['Close'] >= curr['EMA_50'] and prev['Close'] <= curr['EMA_50'] * 1.02:
+                fw = get_fw("口袋支点")
+                triggered.append(("reversal", "ST", "口袋支点", f"💎 [口袋支点] 巨量吞噬近10日最大阴量 (权:{fw:.1f}x)", 12 * w_mul * fw, True))
+                
+            if curr['Range_20'] > 0 and curr['Range_60'] > 0:
+                if curr['Range_20'] < curr['Range_60'] * 0.5 and curr['Close'] > curr['SMA_50'] and is_vol:
+                    fw = get_fw("VCP收缩")
+                    triggered.append(("squeeze", "ST", "VCP收缩", f"🌪️ [VCP收缩] 波动率极度压缩后起爆 (权:{fw:.1f}x)", 15 * w_mul * fw, True))
+                    
+            if poc_price > 0 and prev['Close'] <= poc_price and curr['Close'] > poc_price and is_vol:
+                fw = get_fw("筹码峰突破")
+                triggered.append(("flow", "ST", "筹码峰突破", f"🏔️ [筹码峰突破] 强势跨越 60日核心成本区 (权:{fw:.1f}x)", 12 * w_mul * fw, True))
                 
             dyn_rsi = curr['RSI_P20']
             if curr['RSI'] < dyn_rsi and prev['RSI'] >= dyn_rsi and is_st:
@@ -719,7 +728,7 @@ def run_tech_matrix() -> None:
                 triggered.append(("trend_confirm", "LT", "一目多头", f"🌥️ [一目多头] (权:{fw:.1f}x)", 6 * w_mul * fw, True))
                 
             gap_pct = (curr['Open'] - prev['Close']) / prev['Close']
-            if 0.015 < gap_pct < 0.06 and is_vol:
+            if gap_pct * 100 > max(1.5, atr_pct * 0.3) and gap_pct < 0.06 and is_vol:
                 fw = get_fw("突破缺口")
                 triggered.append(("reversal", "ST", "突破缺口", f"💥 [突破缺口] +{gap_pct*100:.1f}% (权:{fw:.1f}x)", 6 * w_mul * fw, True))
             
@@ -728,9 +737,19 @@ def run_tech_matrix() -> None:
             st_pts_dict = defaultdict(float)
             
             for cat, tf, tag, text, pts, is_s in triggered:
+                adj_pts = pts
+                if regime in ["bear", "range", "hidden_bear"]:
+                    if cat in ["trend_align", "trend_confirm", "squeeze"]:
+                        adj_pts *= 0.5  
+                    elif cat == "reversal":
+                        adj_pts *= 1.5  
+                elif regime in ["bull", "rebound"]:
+                    if cat == "trend_align":
+                        adj_pts *= 1.2  
+                
                 cat_counts[cat] += 1
-                if tf == "LT": lt_pts_dict[cat] += pts
-                else: st_pts_dict[cat] += pts
+                if tf == "LT": lt_pts_dict[cat] += adj_pts
+                else: st_pts_dict[cat] += adj_pts
                 sig.append(text)
                 factors.append(tag)
                 if is_s: st_cnt += 1
@@ -792,9 +811,8 @@ def run_tech_matrix() -> None:
                     ai_prob = clf_model.predict_proba([x_row])[0][class_idx]
                     ml_score = int(ai_prob * 100)
                     st_score = int(st_score * 0.6 + ml_score * 0.4)
-                    sig.append(f"🤖 [AI预测] T+3盈利概率: {ai_prob:.1%}")
-                except Exception as e:
-                    logger.debug(f"AI推理受阻: {e}")
+                    sig.append(f"🤖 [AI非线性预测] T+3盈利概率: {ai_prob:.1%}")
+                except Exception: pass
 
             total_score = lt_score + st_score
             if total_score > 0:
@@ -803,6 +821,14 @@ def run_tech_matrix() -> None:
             odds_b = 2.0
             kelly_fraction = ai_prob - (1.0 - ai_prob) / odds_b
             
+            tp_val = curr['Close'] + 3.0 * vix_scalar * curr['ATR']
+            sl_chandelier = curr['Chandelier_Exit']
+            if pd.isna(sl_chandelier): sl_chandelier = curr['Close'] - 1.5 * vix_scalar * curr['ATR']
+            sl_val = max(sl_chandelier, curr['Close'] - 1.5 * vix_scalar * curr['ATR'])
+            
+            sl_pct_distance = (curr['Close'] - sl_val) / curr['Close']
+            sl_pct_distance = max(0.01, sl_pct_distance) 
+            
             position_advice = "✅ 标准仓位"
             pos_percentage = 0.0
             
@@ -810,8 +836,11 @@ def run_tech_matrix() -> None:
                 position_advice = "❌ 放弃建仓 (AI盈亏比劣势 或 顶背离确认)"
                 pos_percentage = 0.0
             else:
+                # 使用读取了系统“痛觉神经”的动态风险上限
+                risk_parity_pos = PORTFOLIO_MAX_RISK_PER_TRADE / sl_pct_distance
                 safe_kelly = min(0.20, kelly_fraction / 2.0)
-                pos_percentage = safe_kelly
+                pos_percentage = min(safe_kelly, risk_parity_pos)
+                
                 if is_credit_risk_high:
                     pos_percentage *= 0.6
                 
@@ -819,12 +848,12 @@ def run_tech_matrix() -> None:
                     st_score = int(st_score * 0.5)
                     total_score = lt_score + st_score
                     pos_percentage *= 0.5 
-                    position_advice = f"⚠️ 建议仓位 {pos_percentage:.1%} (已计算跳空高开防守)"
+                    position_advice = f"⚠️ 建议仓位 {pos_percentage:.1%} (已防备跳空高开，单笔风险锁死)"
                 elif bias_20 > 0.12:
-                    pos_percentage = min(0.05, safe_kelly * 0.3)
-                    position_advice = f"⚠️ 建议仓位 {pos_percentage:.1%} (乖离率过大，防获利盘砸盘)"
+                    pos_percentage = min(0.05, pos_percentage * 0.3)
+                    position_advice = f"⚠️ 建议仓位 {pos_percentage:.1%} (乖离过大，极小仓摸奖)"
                 else:
-                    position_advice = f"✅ 建议仓位 {pos_percentage:.1%} (基于凯利公式风控)"
+                    position_advice = f"✅ 建议仓位 {pos_percentage:.1%} (波动率平价 & 凯利双校验)"
 
             if sig and total_score > 0 and pos_percentage > 0:
                 if check_earnings_risk(sym):
@@ -833,14 +862,9 @@ def run_tech_matrix() -> None:
                     st_score = int(st_score * 0.5)
                     total_score = lt_score + st_score
                     pos_percentage *= 0.2
-                    position_advice = f"⚠️ 建议仓位 {pos_percentage:.1%} (财报赌博风险)"
+                    position_advice = f"⚠️ 建议仓位 {pos_percentage:.1%} (财报赌博极限风控)"
 
                 news = get_latest_news(sym)
-                
-                tp_val = curr['Close'] + 3.0 * vix_scalar * curr['ATR']
-                sl_chandelier = curr['Chandelier_Exit']
-                if pd.isna(sl_chandelier): sl_chandelier = curr['Close'] - 1.5 * vix_scalar * curr['ATR']
-                sl_val = max(sl_chandelier, curr['Close'] - 1.5 * vix_scalar * curr['ATR'])
                 
                 reports.append({
                     "symbol": sym, "lt_score": lt_score, "st_score": st_score, "score": total_score, 
@@ -858,28 +882,44 @@ def run_tech_matrix() -> None:
         dynamic_min_score = max(Config.MIN_SCORE_THRESHOLD, np.percentile(all_raw_scores, 85))
         reports = [r for r in reports if r['score'] >= dynamic_min_score]
         
-        groups = defaultdict(list)
-        for r in reports: groups[r["sector"]].append(r)
-        
-        for sec, stks in groups.items():
-            if sec not in Config.CROWDING_EXCLUDE_SECTORS and len(stks) >= Config.CROWDING_MIN_STOCKS:
-                sec_mom = valid_sector_data.get(sec, 0.0)
-                if sec_mom > 0.04:
-                    for s in stks[1:]: 
-                        if "🚀 [板块主升豁免] 让利润奔跑" not in s["signals"]:
-                            s["signals"].append("🚀 [板块主升豁免] 让利润奔跑")
-                else:
-                    base_pen = max(0.6, min(0.9, Config.CROWDING_PENALTY * (1.0 + health_score * 0.3)))
-                    for s in stks[1:]:
-                        s["lt_score"] = int(s["lt_score"] * base_pen)
-                        s["st_score"] = int(s["st_score"] * base_pen)
-                        s["score"] = s["lt_score"] + s["st_score"]
-
+        # 🚀 生命力进化二：马科维茨反脆弱阵型 (Markowitz Decorrelation)
+        # 将候选池扩大至前 25 名，为“踢掉同质化标的”留下冗余空间
         reports.sort(key=lambda x: (x["lt_score"], x["st_score"]), reverse=True)
+        candidate_pool = reports[:25]
         
-        final_reports = reports[:15]
+        final_reports = []
+        if candidate_pool:
+            try:
+                # 将所有候选标的的 60 天收盘价提取出来构建 DataFrame
+                corr_df_data = {r['symbol']: price_history_dict[r['symbol']] for r in candidate_pool if r['symbol'] in price_history_dict}
+                if corr_df_data:
+                    corr_df = pd.DataFrame(corr_df_data).fillna(method='ffill').pct_change().corr()
+                    
+                    for candidate in candidate_pool:
+                        if len(final_reports) >= 15: break # 阵型已满
+                        
+                        sym = candidate['symbol']
+                        is_redundant = False
+                        
+                        # 检查这个候选者是否与 [已经入选斯巴达方阵] 的某个大佬高度同质化
+                        for accepted in final_reports:
+                            acc_sym = accepted['symbol']
+                            if sym in corr_df.columns and acc_sym in corr_df.columns:
+                                if corr_df.loc[sym, acc_sym] > 0.80:
+                                    is_redundant = True
+                                    logger.info(f"🛡️ 反脆弱机制：踢除 {sym}，因为它与已选高分股 {acc_sym} 相关性高达 {corr_df.loc[sym, acc_sym]:.2f}，拒绝鸡蛋放在同一个篮子。")
+                                    break
+                        
+                        if not is_redundant:
+                            final_reports.append(candidate)
+                else:
+                    final_reports = candidate_pool[:15]
+            except Exception as e:
+                logger.warning(f"反脆弱协方差矩阵构建失败，退化为原始强排: {e}")
+                final_reports = candidate_pool[:15]
+        
         for r in final_reports:
-            set_alerted(r["symbol"], "matrix")
+            set_alerted(r["symbol"])
             
         medals = ['🥇', '🥈', '🥉']
         txts = []
@@ -901,13 +941,13 @@ def run_tech_matrix() -> None:
             txts.append(card)
 
         perf = load_strategy_performance_tag()
-        header = f"**📊 环境感知:**\n- {vix_desc}\n- {regime_desc}\n- ⚔️ 今日截面淘汰线 (Top 15%): **{dynamic_min_score:.1f}分**"
+        header = f"**📊 市场环境与系统觉醒状态:**\n- {vix_desc}\n- {regime_desc}\n- ⚔️ 今日截面淘汰线 (Top 15%): **{dynamic_min_score:.1f}分**{pain_warning}"
         
         final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
                         "\n\n---\n\n".join(txts) + \
-                        f"\n\n*(本策略已接入 Kelly 公式仓位管理与吊灯追踪止损模型)*"
+                        f"\n\n*(引擎重构: 痛觉神经反馈、VSA暗池识别与马科维茨反脆弱阵型已永久烙印入 DNA)*"
         
-        send_alert("多因子优选 (截面强化版)", final_content)
+        send_alert("量化诸神之战 (Apex Predator版)", final_content)
         
         with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
             f.write(json.dumps({"date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", []), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports]}, ensure_ascii=False) + "\n")
@@ -962,6 +1002,17 @@ def run_backtest_engine() -> None:
     stats, factor_rets = {'T+1': [], 'T+3': [], 'T+5': []}, {}
     X_train, y_train = [], []
     
+    ai_filtered_wins, ai_filtered_total = 0, 0
+    mae_mfe_records = {'T+1': [], 'T+3': [], 'T+5': []}
+    
+    clf_model = None
+    if os.path.exists(Config.MODEL_FILE):
+        try:
+            import pickle
+            with open(Config.MODEL_FILE, 'rb') as f:
+                clf_model = pickle.load(f)
+        except Exception: pass
+    
     for t in trades:
         sym, r_dt = t['symbol'], t['date']
         initial_sl = t.get('sl', 0)
@@ -985,16 +1036,17 @@ def run_backtest_engine() -> None:
         is_half_pos = gap_up > 0.03
         
         entry_cost = e_px_raw * (1 + SLIPPAGE * 3 + COMMISSION) if is_half_pos else e_px_raw * (1 + SLIPPAGE + COMMISSION)
-        
         trail_distance = max(e_px_raw * 0.02, e_px_raw - initial_sl) if initial_sl > 0 else e_px_raw * 0.05
         
         for d in [1, 3, 5]:
             exit_idx = e_idx + d
             if exit_idx < len(df_c):
                 exit_revenue = None
-                
                 highest_seen_px = e_px_raw
                 dynamic_sl = initial_sl
+                
+                max_high_during_trade = e_px_raw
+                min_low_during_trade = e_px_raw
                 
                 for i in range(1, d + 1):
                     check_idx = e_idx + i
@@ -1004,6 +1056,9 @@ def run_backtest_engine() -> None:
                     day_close = df_c.iloc[check_idx][sym]
                     
                     if pd.isna(day_open) or pd.isna(day_low) or pd.isna(day_high): continue
+                    
+                    max_high_during_trade = max(max_high_during_trade, day_high)
+                    min_low_during_trade = min(min_low_during_trade, day_low)
                     
                     if dynamic_sl > 0 and day_open < dynamic_sl:
                         exit_revenue = day_open * (1 - SLIPPAGE * 5 - COMMISSION)
@@ -1029,6 +1084,10 @@ def run_backtest_engine() -> None:
                 if exit_revenue is not None:
                     ret = (exit_revenue - entry_cost) / entry_cost
                     if gap_up > 0.03: ret *= 0.5
+                    
+                    trade_mfe = (max_high_during_trade - entry_cost) / entry_cost
+                    trade_mae = (min_low_during_trade - entry_cost) / entry_cost
+                    mae_mfe_records[f'T+{d}'].append({'ret': ret, 'mfe': trade_mfe, 'mae': trade_mae})
                         
                     stats[f'T+{d}'].append(ret)
                     
@@ -1045,16 +1104,31 @@ def run_backtest_engine() -> None:
                         x_row = [1 if f in factor_list else 0 for f in Config.ALL_FACTORS]
                         X_train.append(x_row)
                         y_train.append(1 if ret > 0.015 else 0)
+                        
+                        if clf_model and hasattr(clf_model, 'classes_'):
+                            try:
+                                class_idx = np.where(clf_model.classes_ == 1)[0][0] if 1 in clf_model.classes_ else 0
+                                prob = clf_model.predict_proba([x_row])[0][class_idx]
+                                if prob >= 0.50:  
+                                    ai_filtered_total += 1
+                                    if ret > 0: ai_filtered_wins += 1
+                            except Exception: pass
     
+    feature_importances_dict = {}
     if len(X_train) >= 30 and len(set(y_train)) > 1:
         try:
-            from sklearn.linear_model import LogisticRegression
+            from sklearn.ensemble import RandomForestClassifier
             import pickle
-            clf = LogisticRegression(class_weight='balanced', C=0.1, max_iter=500)
+            clf = RandomForestClassifier(n_estimators=100, max_depth=5, class_weight='balanced', random_state=42)
             clf.fit(X_train, y_train)
             with open(Config.MODEL_FILE, 'wb') as f:
                 pickle.dump(clf, f)
-            logger.info("🧠 机器学习打分模型 (Logistic Regression) 已基于最新实盘数据完成重训并落盘。")
+            logger.info("🧠 非线性机器学习打分模型 (Random Forest) 已基于最新实盘数据完成重训并落盘。")
+            
+            if hasattr(clf, 'feature_importances_'):
+                importances = clf.feature_importances_
+                for factor, imp in zip(Config.ALL_FACTORS, importances):
+                    feature_importances_dict[factor] = float(imp)
         except ImportError:
             logger.warning("未检测到 scikit-learn 环境，已跳过 ML 模型训练。")
         except Exception as e:
@@ -1087,11 +1161,20 @@ def run_backtest_engine() -> None:
             else:
                 curr_cons_loss = 0
                 
-        res[p] = {
+        win_maes = [rec['mae'] for rec in mae_mfe_records[p] if rec['ret'] > 0]
+        avg_win_mae = np.mean(win_maes) if win_maes else 0.0
+                
+        res_data = {
             'win_rate': wr, 'avg_ret': avg_r, 'sharpe': sharpe, 
             'worst_trade': worst, 'total_trades': len(r),
-            'profit_factor': pf, 'max_cons_loss': max_cons_loss
+            'profit_factor': pf, 'max_cons_loss': max_cons_loss,
+            'avg_win_mae': avg_win_mae
         }
+        
+        if p == 'T+3' and ai_filtered_total > 0:
+            res_data['ai_win_rate'] = ai_filtered_wins / ai_filtered_total
+            
+        res[p] = res_data
 
     f_res = {}
     for t, r in factor_rets.items():
@@ -1110,35 +1193,44 @@ def run_backtest_engine() -> None:
                 'profit_factor': pf
             }
             
-    with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: json.dump({"overall": res, "factors": f_res}, f, indent=4)
+    with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: json.dump({"overall": res, "factors": f_res, "xai_importances": feature_importances_dict}, f, indent=4)
     
-    report_md = [f"# 📈 自动量化战报\n**更新:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n| 周期 | 胜率 | 均收益 | 盈亏比 | Sharpe | 极差/连亏 | 笔数 |\n|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"]
+    report_md = [f"# 📈 自动量化战报与 AI 透视\n**更新:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n## ⚔️ 核心表现评估\n| 周期 | 原始胜率 | ⚡AI过滤胜率 | 均收益 | 盈亏比 | Sharpe | 胜单平均抗压(MAE) | 笔数 |\n|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"]
     for p in ['T+1', 'T+3', 'T+5']:
-        d = res.get(p, {'win_rate':0,'avg_ret':0,'profit_factor':0,'sharpe':0,'worst_trade':0,'max_cons_loss':0,'total_trades':0})
-        report_md.append(f"| {p} | {d['win_rate']*100:.1f}% | {d['avg_ret']*100:+.2f}% | {d['profit_factor']:.2f} | {d['sharpe']:.2f} | {d['worst_trade']*100:.1f}% / {d['max_cons_loss']}连 | {d['total_trades']} |")
+        d = res.get(p, {'win_rate':0,'avg_ret':0,'profit_factor':0,'sharpe':0,'avg_win_mae':0,'max_cons_loss':0,'total_trades':0})
+        ai_str = f"**{d.get('ai_win_rate', 0.0)*100:.1f}%**" if 'ai_win_rate' in d else "-"
+        report_md.append(f"| {p} | {d['win_rate']*100:.1f}% | {ai_str} | {d['avg_ret']*100:+.2f}% | {d['profit_factor']:.2f} | {d['sharpe']:.2f} | {d['avg_win_mae']*100:.1f}% | {d['total_trades']} |")
     
+    if feature_importances_dict:
+        report_md.append("\n## 🧠 XAI (解释性人工智能) - 驱动当期市场的核心因子权重\n| 因子特征 | AI 分配重要性 (Feature Importance) |\n|:---|:---:|")
+        sorted_xai = sorted(feature_importances_dict.items(), key=lambda x: x[1], reverse=True)
+        for tag, imp in sorted_xai: 
+            report_md.append(f"| {tag} | {imp*100:.1f}% |")
+
     if f_res:
-        report_md.append("\n## 🧬 核心因子剥离表现 (T+3)\n| 因子 | 胜率 | 盈亏比 | 次数 |\n|:---|:---:|:---:|:---:|")
+        report_md.append("\n## 🧬 核心因子胜率剥离 (T+3)\n| 因子 | 胜率 | 盈亏比 | 触发次数 |\n|:---|:---:|:---:|:---:|")
         sorted_f = sorted(f_res.items(), key=lambda x: x[1]['win_rate'], reverse=True)
         for tag, d in sorted_f: report_md.append(f"| {tag} | {d['win_rate']*100:.1f}% | {d['profit_factor']:.2f} | {d['count']} |")
     
     with open(Config.REPORT_FILE, 'w', encoding='utf-8') as f: f.write('\n'.join(report_md))
 
-    alert_lines = ["### 📊 **机构级回测报表 (含Trailing Stop追踪止损模拟)**"]
-    for p, d in res.items(): alert_lines.append(f"- **{p}:** 胜率 {d['win_rate']*100:.1f}% | 盈亏比 {d['profit_factor']:.2f} | Sharpe {d['sharpe']:.2f} | {d['max_cons_loss']}连亏")
+    alert_lines = ["### 📊 **机构级回测报表 (含 MAE/MFE 归因分析)**"]
+    for p, d in res.items(): 
+        ai_text = f" | ⚡AI过滤胜率: **{d['ai_win_rate']*100:.1f}%**" if 'ai_win_rate' in d else ""
+        alert_lines.append(f"- **{p}:** 原始胜率 {d['win_rate']*100:.1f}%{ai_text} | 盈亏比 {d['profit_factor']:.2f} | 获利单抗压(MAE) {d['avg_win_mae']*100:.1f}%")
     
-    if f_res:
-        alert_lines.extend(["", "---", "", "### 🧬 **核心因子胜率榜 (T+3)**"])
-        for idx, (tag, d) in enumerate(sorted_f[:3]):
-            icon = ['1️⃣','2️⃣','3️⃣'][idx]
-            alert_lines.append(f"- {icon} **{tag}**: 胜率 {d['win_rate']*100:.1f}% | PF {d['profit_factor']:.2f}")
+    if feature_importances_dict:
+        alert_lines.extend(["", "---", "", "### 🧠 **XAI 市场驱动因子 (Random Forest 提纯)**"])
+        sorted_xai = sorted(feature_importances_dict.items(), key=lambda x: x[1], reverse=True)
+        for idx, (tag, imp) in enumerate(sorted_xai[:3]):
+            icon = ['🔥','🔥','🔥'][idx]
+            alert_lines.append(f"- {icon} **{tag}**: 贡献度 {imp*100:.1f}%")
             
-    send_alert("策略终极回测战报", "\n".join(alert_lines))
+    send_alert("策略终极回测战报 (XAI版)", "\n".join(alert_lines))
 
 if __name__ == "__main__":
     validate_config()
-    m = sys.argv[1] if len(sys.argv) > 1 else "sentinel"
-    if m == "sentinel": run_volatility_sentinel()
-    elif m == "matrix": run_tech_matrix()
+    m = sys.argv[1] if len(sys.argv) > 1 else "matrix"
+    if m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "系统底层已跃迁至无懈可击！哨兵周期延展、止损缓冲垫与 AI 数组防界熔断全部激活。")
+    elif m == "test": send_alert("连通性测试", "灵魂觉醒完毕！痛觉神经系统、VSA巨量滞涨暗池探测与马科维茨反脆弱阵型全面接管现实。")
