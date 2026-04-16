@@ -504,11 +504,6 @@ def set_alerted(sym: str, mode: str) -> None:
         except Exception: pass
 
 def run_volatility_sentinel() -> None:
-    curr_hour = datetime.now(timezone.utc).hour
-    if not (13 <= curr_hour <= 21): 
-        logger.info("💤 当前非美股交易核心时段 (UTC 13-21)，哨兵按风控逻辑保持休眠。")
-        return
-        
     active_pool = get_filtered_watchlist(max_stocks=60)
     alerts = []
     
@@ -518,7 +513,6 @@ def run_volatility_sentinel() -> None:
     for sym in active_pool:
         if is_alerted(sym, "sentinel"): continue 
         try:
-            # 🚀 深度体检修复 1: 放宽 Sentinel 历史读取天数，确保 22日均线/吊灯指标充分预热不报 NaN
             df_d = safe_get_history(sym, period="2mo", interval="1d", fast_mode=True)
             if len(df_d) < 40: continue
             df_d = calculate_indicators(df_d)
@@ -582,11 +576,6 @@ def run_volatility_sentinel() -> None:
         logger.info("📭 本次扫描未发现符合严苛 ATR 归一化脉冲条件的标的，保持静默。")
 
 def run_tech_matrix() -> None:
-    curr_hour = datetime.now(timezone.utc).hour
-    if not (18 <= curr_hour <= 22): 
-        logger.info("💤 矩阵模式依赖日线数据，仅在美股尾盘与盘后 (UTC 18-22) 运行。")
-        return
-
     active_pool = get_filtered_watchlist(max_stocks=120)
     regime, regime_desc, qqq_df, is_credit_risk_high = get_market_regime(active_pool)
     vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
@@ -799,7 +788,6 @@ def run_tech_matrix() -> None:
             if clf_model and factors and hasattr(clf_model, 'classes_'):
                 try:
                     x_row = [1 if f in factors else 0 for f in Config.ALL_FACTORS]
-                    # 🚀 深度体检修复 3: 引入安全的索引映射，避免单类别退化导致的越界崩溃
                     class_idx = np.where(clf_model.classes_ == 1)[0][0] if 1 in clf_model.classes_ else 0
                     ai_prob = clf_model.predict_proba([x_row])[0][class_idx]
                     ml_score = int(ai_prob * 100)
@@ -998,7 +986,6 @@ def run_backtest_engine() -> None:
         
         entry_cost = e_px_raw * (1 + SLIPPAGE * 3 + COMMISSION) if is_half_pos else e_px_raw * (1 + SLIPPAGE + COMMISSION)
         
-        # 🚀 深度体检修复 2: 保证动态止损距离恒正，防止次日大幅低开开在止损线上方时导致的 trail_distance 变为负数而反向止损
         trail_distance = max(e_px_raw * 0.02, e_px_raw - initial_sl) if initial_sl > 0 else e_px_raw * 0.05
         
         for d in [1, 3, 5]:
