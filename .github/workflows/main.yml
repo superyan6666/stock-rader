@@ -53,7 +53,7 @@ jobs:
 
       - name: 安装组件
         run: |
-          pip install -r .requirements.txt
+          pip install -r requirements.txt
 
       - name: 🔍 代码质量检查
         run: |
