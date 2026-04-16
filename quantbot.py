@@ -10,7 +10,6 @@ import logging
 import re
 import json
 import warnings
-from typing import List, Tuple
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
@@ -37,7 +36,7 @@ class Config:
     TELEGRAM_CHAT_ID: str = os.environ.get('TELEGRAM_CHAT_ID', '')
     DINGTALK_KEYWORD: str = "AI"
     
-    CORE_WATCHLIST: List[str] = [
+    CORE_WATCHLIST: list = [
         "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA", "BRK-B", "AVGO", 
         "LLY", "JPM", "V", "XOM", "UNH", "MA", "PG", "JNJ", "HD", "MRK", 
         "ABBV", "CVX", "CRM", "COST", "PEP", "AMD", "WMT", "BAC", "TMO", "KO", 
@@ -68,7 +67,7 @@ class Config:
 
     CROWDING_PENALTY: float = 0.75
     CROWDING_MIN_STOCKS: int = 2
-    CROWDING_EXCLUDE_SECTORS: List[str] = ["QQQ"]
+    CROWDING_EXCLUDE_SECTORS: list = ["QQQ"]
     
     LOG_PREFIX: str = "backtest_log_"
     STATS_FILE: str = "strategy_stats.json"
@@ -77,7 +76,7 @@ class Config:
     ALERT_CACHE_FILE: str = "alert_history.json"
     MODEL_FILE: str = "scoring_model.pkl"
     
-    # 🚀 剔除滞后散户包袱，提纯为 12 大顶级机构行为因子
+    # 🚀 纯血机构 12 大量价/筹码行为学因子
     ALL_FACTORS = [
         "米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "SMC失衡区", 
         "流动性扫盘", "聪明钱抢筹", "巨量滞涨", "放量长阳", "口袋支点", 
@@ -175,7 +174,7 @@ def check_earnings_risk(symbol: str) -> bool:
     except Exception: pass
     return False
 
-def get_filtered_watchlist(max_stocks: int = 120) -> List[str]:
+def get_filtered_watchlist(max_stocks: int = 120) -> list:
     logger.info(">>> 漏斗过滤：从多维度数据源拉取名单 (含纳指与中盘)...")
     tickers = set(Config.CORE_WATCHLIST)
     
@@ -394,8 +393,8 @@ def get_market_regime(active_pool: List[str] = None) -> Tuple[str, str, pd.DataF
         else: 
             return "range", f"⚖️ 熊市底部震荡{breadth_desc}{credit_desc}", df, credit_risk_alert
 
-# 🚀 指标核算极简提纯：去除了 SuperTrend, Ichimoku, Bollinger/KC, MACD 等冗余包袱
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    # 🚀 极致性能优化：已删除所有 MACD, Bollinger Bands, Ichimoku, SuperTrend 等无关滞后指标
     df = df.sort_index()
     
     df['Close'], df['Volume'] = df['Close'].ffill(), df['Volume'].ffill()
@@ -423,6 +422,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['Range_60'] = df['High'].rolling(60).max() - df['Low'].rolling(60).min()
     df['Range_20'] = df['High'].rolling(20).max() - df['Low'].rolling(20).min()
     
+    # 仅保留 RSI 用于顶背离判定 (Bearish Divergence)
     delta = df['Close'].diff()
     up = delta.where(delta > 0, 0).ewm(span=14, adjust=False).mean()
     down = -delta.where(delta < 0, 0).ewm(span=14, adjust=False).mean()
@@ -441,6 +441,15 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     
     clv = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / (df['High'] - df['Low'] + 1e-10)
     df['Smart_Money_Flow'] = clv.rolling(window=10).mean()
+
+    hist_vol_rolling = df['Volume'].shift(10).rolling(window=50, min_periods=10).quantile(0.8)
+    vol_10d_mean = df['Volume'].rolling(window=10, min_periods=1).mean()
+    vol_spike = (vol_10d_mean / (hist_vol_rolling + 1e-10)) > 2.5
+    price_spike = df['Close'].pct_change().abs().rolling(window=5, min_periods=1).max() > 0.08
+    df['Event_Risk'] = 0.0
+    df.loc[vol_spike, 'Event_Risk'] += 0.6
+    df.loc[price_spike, 'Event_Risk'] += 0.4
+    df['Event_Risk'] = df['Event_Risk'].clip(upper=1.0)
 
     return df
 
@@ -482,13 +491,11 @@ def run_tech_matrix() -> None:
                     if t3.get('max_cons_loss', 0) >= 4 or t3.get('profit_factor', 1.0) < 1.2:
                         PORTFOLIO_MAX_RISK_PER_TRADE = 0.0075  
                         pain_warning = "\n- 🩸 **痛觉神经激活**: 近期回测遭重挫，引擎已主动执行**防守降杠杆**协议！"
-                        logger.info("🩸 系统痛觉神经被激活：检测到近期连亏，已将全局最大单笔风险压降至 0.75%！")
     except Exception: pass
 
     active_pool = get_filtered_watchlist(max_stocks=120)
     regime, regime_desc, qqq_df, is_credit_risk_high = get_market_regime(active_pool)
     vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
-    
     vix_scalar = max(0.6, min(1.4, 18.0 / max(vix, 1.0)))
     
     valid_sector_data = {}
@@ -502,10 +509,7 @@ def run_tech_matrix() -> None:
     lagging_sectors = [s[0] for s in sorted_sectors[-2:]] if len(sorted_sectors) >= 4 else []
                   
     health_score = -0.9 if vix > 30 else (-0.6 if vix > 25 else (0.9 if vix < 15 and 'bull' in regime else (0.6 if 'bull' in regime else (0.3 if 'rebound' in regime else (-0.7 if 'bear' in regime else 0.0)))))
-    
-    if is_credit_risk_high:
-        health_score -= 0.5
-        
+    if is_credit_risk_high: health_score -= 0.5
     w_mul = 1.0 + health_score * 0.8
     
     factor_weights = {}
@@ -519,28 +523,22 @@ def run_tech_matrix() -> None:
                     cnt = data.get("count", 0)
                     pf = data.get("profit_factor", 1.0)
                     
-                    MIN_SAMPLES = 5.0        
-                    PRIOR_WIN_RATE = 0.52    
-                    PRIOR_AVG_RET = 0.0      
-                    
-                    alpha = min(1.0, cnt / MIN_SAMPLES)
-                    shrunk_wr = alpha * wr + (1.0 - alpha) * PRIOR_WIN_RATE
-                    shrunk_avg_ret = alpha * avg_ret + (1.0 - alpha) * PRIOR_AVG_RET
+                    alpha = min(1.0, cnt / 5.0)
+                    shrunk_wr = alpha * wr + (1.0 - alpha) * 0.52
+                    shrunk_avg_ret = alpha * avg_ret + (1.0 - alpha) * 0.0
                     
                     w = 1.0 + (shrunk_wr - 0.5) * 2.0 + (shrunk_avg_ret * 20) 
-                    if pf < 1.0 and cnt >= MIN_SAMPLES: w *= (pf ** 2) 
+                    if pf < 1.0 and cnt >= 5.0: w *= (pf ** 2) 
                     factor_weights[tag] = max(0.2, min(2.0, w)) 
     except Exception: pass
 
-    def get_fw(tag_name: str) -> float:
-        return factor_weights.get(f"[{tag_name}]", 1.0)
+    def get_fw(tag_name: str) -> float: return factor_weights.get(f"[{tag_name}]", 1.0)
         
     clf_model = None
     if os.path.exists(Config.MODEL_FILE):
         try:
             import pickle
-            with open(Config.MODEL_FILE, 'rb') as f:
-                clf_model = pickle.load(f)
+            with open(Config.MODEL_FILE, 'rb') as f: clf_model = pickle.load(f)
         except Exception: pass
 
     reports = []
@@ -553,27 +551,22 @@ def run_tech_matrix() -> None:
             df_w = safe_get_history(sym, "2y", "1wk", fast_mode=True)
             if len(df_w) >= 40:
                 sma40_w = df_w['Close'].rolling(40).mean().iloc[-1]
-                if df_w['Close'].iloc[-1] < sma40_w:
-                    continue 
+                if df_w['Close'].iloc[-1] < sma40_w: continue 
                     
             df = safe_get_history(sym, "8mo", "1d", fast_mode=True) 
             if len(df) < 130: continue
             df = calculate_indicators(df)
             
             price_history_dict[sym] = df['Close'].iloc[-60:]
-            
             curr, prev = df.iloc[-1], df.iloc[-2]
             
-            # 简化过滤条件，仅保留绝对红线
-            if curr['ATR'] / curr['Close'] > 0.15: continue
-            if pd.notna(curr['SMA_200']) and curr['Close'] < curr['SMA_200'] and curr['SMA_50'] < curr['SMA_200']: 
-                continue
+            if curr['Event_Risk'] > 0.85 or (curr['ATR'] / curr['Close'] > 0.15): continue
+            if pd.notna(curr['SMA_200']) and curr['Close'] < curr['SMA_200'] and curr['SMA_50'] < curr['SMA_200']: continue
             
             fvg_lower, fvg_upper = 0.0, 0.0
             for i in range(len(df)-20, len(df)-1):
                 if df['Low'].iloc[i] > df['High'].iloc[i-2]:
-                    fvg_lower = df['High'].iloc[i-2]
-                    fvg_upper = df['Low'].iloc[i]
+                    fvg_lower, fvg_upper = df['High'].iloc[i-2], df['Low'].iloc[i]
             
             df_60 = df.iloc[-60:]
             poc_price = 0.0
@@ -582,15 +575,14 @@ def run_tech_matrix() -> None:
                 max_bin_idx = np.argmax(counts)
                 poc_price = (bins[max_bin_idx] + bins[max_bin_idx+1]) / 2.0
             
-            sig, factors, st_cnt = [], [], 0
+            sig, factors = [], []
             is_vol = (curr['Volume'] / curr['Vol_MA20'] > 1.5) and (curr['Close'] > curr['Open'])
-            
             triggered = []
 
-            # 🚀 纯血 12 大因子触发逻辑
+            # 🚀 纯血 12 大量价/行为学因子探测
             if pd.notna(curr['SMA_200']) and curr['Close'] > curr['SMA_50'] > curr['SMA_150'] > curr['SMA_200']:
                 fw = get_fw("米奈尔维尼")
-                triggered.append(("trend_align", "LT", "米奈尔维尼", f"🏆 [米奈尔维尼] 主升形态 (权:{fw:.1f}x)", 8 * w_mul * fw, True))
+                triggered.append(("米奈尔维尼", f"🏆 [米奈尔维尼] 主升形态 (权:{fw:.1f}x)", 8 * w_mul * fw))
                 
             if not qqq_df.empty:
                 m_df = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, how='inner')
@@ -598,117 +590,87 @@ def run_tech_matrix() -> None:
                     rs_20 = (m_df['Close_x'].iloc[-1]/m_df['Close_x'].iloc[-20]) / max(m_df['Close_y'].iloc[-1]/m_df['Close_y'].iloc[-20], 0.5)
                     if rs_20 > 1.08: 
                         fw = get_fw("强相对强度")
-                        triggered.append(("flow", "LT", "强相对强度", f"⚡ [强相对强度] 跑赢大盘 (权:{fw:.1f}x)", (7 if is_vol else 4) * w_mul * fw, False))
+                        triggered.append(("强相对强度", f"⚡ [强相对强度] 跑赢大盘 (权:{fw:.1f}x)", (7 if is_vol else 4) * w_mul * fw))
             
             if curr['Close'] > curr['VWAP_20'] and prev['Close'] <= prev['VWAP_20']:
                 fw = get_fw("VWAP突破")
-                triggered.append(("flow", "ST", "VWAP突破", f"🌊 [VWAP突破] 放量逾越机构均价 (权:{fw:.1f}x)", 8 * w_mul * fw, True))
+                triggered.append(("VWAP突破", f"🌊 [VWAP突破] 放量逾越机构均价 (权:{fw:.1f}x)", 8 * w_mul * fw))
                 
             if pd.notna(curr['AVWAP']) and curr['Close'] > curr['AVWAP'] and prev['Close'] <= prev['AVWAP']:
                 fw = get_fw("AVWAP突破")
-                triggered.append(("flow", "ST", "AVWAP突破", f"⚓ [AVWAP突破] 巨鲸建仓成本区夺回 (权:{fw:.1f}x)", 12 * w_mul * fw, True))
+                triggered.append(("AVWAP突破", f"⚓ [AVWAP突破] 巨鲸建仓成本区夺回 (权:{fw:.1f}x)", 12 * w_mul * fw))
                 
             if fvg_lower > 0 and curr['Low'] <= fvg_upper and curr['Close'] > fvg_lower and is_vol:
                 fw = get_fw("SMC失衡区")
-                triggered.append(("reversal", "ST", "SMC失衡区", f"🧲 [SMC失衡区] 精准回踩机构流动性缺口 (权:{fw:.1f}x)", 15 * w_mul * fw, True))
+                triggered.append(("SMC失衡区", f"🧲 [SMC失衡区] 精准回踩机构流动性缺口 (权:{fw:.1f}x)", 15 * w_mul * fw))
             
             if pd.notna(curr['Swing_Low_20']) and curr['Low'] < curr['Swing_Low_20'] and curr['Close'] > curr['Swing_Low_20'] and is_vol:
                 fw = get_fw("流动性扫盘")
-                triggered.append(("reversal", "ST", "流动性扫盘", f"🧹 [流动性扫盘] 刺穿前低完成 Stop-Hunt 诱空反转 (权:{fw:.1f}x)", 15 * w_mul * fw, True))
+                triggered.append(("流动性扫盘", f"🧹 [流动性扫盘] 刺穿前低完成 Stop-Hunt 诱空反转 (权:{fw:.1f}x)", 15 * w_mul * fw))
                 
             if curr['Smart_Money_Flow'] > 0.5 and curr['Close'] > curr['EMA_20']:
                 fw = get_fw("聪明钱抢筹")
-                triggered.append(("flow", "ST", "聪明钱抢筹", f"🕵️ [聪明资金] 连续10日尾盘吸筹 (权:{fw:.1f}x)", 6 * w_mul * fw, True))
+                triggered.append(("聪明钱抢筹", f"🕵️ [聪明资金] 连续10日尾盘吸筹 (权:{fw:.1f}x)", 6 * w_mul * fw))
                 
             if curr['Volume'] > curr['Vol_MA20'] * 2.0 and abs(curr['Close'] - curr['Open']) < curr['ATR'] * 0.5:
                 fw = get_fw("巨量滞涨")
-                triggered.append(("flow", "ST", "巨量滞涨", f"🛑 [巨量滞涨] 触发暗池 Iceberg 吸筹异象 (权:{fw:.1f}x)", 12 * w_mul * fw, True))
+                triggered.append(("巨量滞涨", f"🛑 [巨量滞涨] 触发暗池 Iceberg 吸筹异象 (权:{fw:.1f}x)", 12 * w_mul * fw))
                 
             atr_pct = (curr['ATR'] / prev['Close']) * 100
-            pulse_threshold = max(3.0, atr_pct * 0.6)
-            day_chg = (curr['Close'] - curr['Open']) / curr['Open'] * 100
-            if day_chg > pulse_threshold and curr['Volume'] > curr['Vol_MA20'] * 1.5:
+            if (curr['Close'] - curr['Open']) / curr['Open'] * 100 > max(3.0, atr_pct * 0.6) and curr['Volume'] > curr['Vol_MA20'] * 1.5:
                 fw = get_fw("放量长阳")
-                triggered.append(("flow", "ST", "放量长阳", f"⚡ [放量长阳] 强劲日内脉冲 +{day_chg:.1f}% (权:{fw:.1f}x)", 8 * w_mul * fw, True))
+                triggered.append(("放量长阳", f"⚡ [放量长阳] 强劲日内动能脉冲 (权:{fw:.1f}x)", 8 * w_mul * fw))
             
             if curr['Close'] > prev['Close'] and curr['Volume'] > curr['Max_Down_Vol_10'] > 0 and curr['Close'] >= curr['EMA_50'] and prev['Close'] <= curr['EMA_50'] * 1.02:
                 fw = get_fw("口袋支点")
-                triggered.append(("reversal", "ST", "口袋支点", f"💎 [口袋支点] 巨量吞噬近10日最大阴量 (权:{fw:.1f}x)", 12 * w_mul * fw, True))
+                triggered.append(("口袋支点", f"💎 [口袋支点] 巨量吞噬近10日最大阴量 (权:{fw:.1f}x)", 12 * w_mul * fw))
                 
-            if curr['Range_20'] > 0 and curr['Range_60'] > 0:
-                if curr['Range_20'] < curr['Range_60'] * 0.5 and curr['Close'] > curr['SMA_50'] and is_vol:
-                    fw = get_fw("VCP收缩")
-                    triggered.append(("squeeze", "ST", "VCP收缩", f"🌪️ [VCP收缩] 波动率极度压缩后起爆 (权:{fw:.1f}x)", 15 * w_mul * fw, True))
+            if curr['Range_20'] > 0 and curr['Range_60'] > 0 and curr['Range_20'] < curr['Range_60'] * 0.5 and curr['Close'] > curr['SMA_50'] and is_vol:
+                fw = get_fw("VCP收缩")
+                triggered.append(("VCP收缩", f"🌪️ [VCP收缩] 波动率极度压缩后起爆 (权:{fw:.1f}x)", 15 * w_mul * fw))
                     
-            if poc_price > 0 and prev['Close'] <= poc_price and curr['Close'] > poc_price and is_vol:
+            if poc_price > 0 and prev['Close'] <= poc_price < curr['Close'] and is_vol:
                 fw = get_fw("筹码峰突破")
-                triggered.append(("flow", "ST", "筹码峰突破", f"🏔️ [筹码峰突破] 强势跨越 60日核心成本区 (权:{fw:.1f}x)", 12 * w_mul * fw, True))
+                triggered.append(("筹码峰突破", f"🏔️ [筹码峰突破] 强势跨越 60日核心成本区 (权:{fw:.1f}x)", 12 * w_mul * fw))
             
-            cat_counts = defaultdict(int)
-            lt_pts_dict = defaultdict(float)
-            st_pts_dict = defaultdict(float)
-            
-            for cat, tf, tag, text, pts, is_s in triggered:
+            score_raw = 0.0
+            for tag, text, pts in triggered:
                 adj_pts = pts
-                if regime in ["bear", "range", "hidden_bear"]:
-                    if cat in ["trend_align", "trend_confirm", "squeeze"]:
-                        adj_pts *= 0.5  
-                    elif cat == "reversal":
-                        adj_pts *= 1.5  
-                elif regime in ["bull", "rebound"]:
-                    if cat == "trend_align":
-                        adj_pts *= 1.2  
+                if regime in ["bear", "range", "hidden_bear"] and tag in ["米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "筹码峰突破"]:
+                    adj_pts *= 0.5  
+                elif regime in ["bull", "rebound"] and tag in ["米奈尔维尼"]:
+                    adj_pts *= 1.2  
+                elif regime in ["bear", "range", "hidden_bear"] and tag in ["SMC失衡区", "流动性扫盘", "口袋支点"]:
+                    adj_pts *= 1.5
                 
-                cat_counts[cat] += 1
-                if tf == "LT": lt_pts_dict[cat] += adj_pts
-                else: st_pts_dict[cat] += adj_pts
+                score_raw += adj_pts
                 sig.append(text)
                 factors.append(tag)
-                if is_s: st_cnt += 1
                 
-            lt_score_raw = 0.0
-            st_score_raw = 0.0
-            for cat in cat_counts.keys():
-                k = cat_counts[cat]
-                discount = max(0.65, 1.0 / (1 + 0.2 * (k - 1))) if k >= 2 else 1.0
-                lt_score_raw += lt_pts_dict[cat] * discount
-                st_score_raw += st_pts_dict[cat] * discount
+            total_score = int(score_raw)
 
             is_bearish_div = False
             if curr['Close'] >= curr['Price_High_20'] * 0.98 and curr['RSI'] < curr['RSI_High_20'] * 0.90:
                 is_bearish_div = True
-                st_score_raw = 0.0 
+                total_score = 0 
                 sig.append(f"🩸 [顶背离危局] 价格近高但动能显著衰竭，严禁追高")
 
             if curr['RSI'] > 85.0:
-                st_score_raw = max(0, st_score_raw - 30)
+                total_score = max(0, total_score - 30)
                 sig.append(f"⚠️ [极端超买] RSI 高达 {curr['RSI']:.1f} (严防获利盘踩踏)")
                 
             bias_20 = (curr['Close'] - curr['EMA_20']) / curr['EMA_20']
             if bias_20 > 0.08:
-                penalty = (bias_20 - 0.08) * 100
-                st_score_raw = max(0, st_score_raw - penalty)
+                total_score = max(0, total_score - int((bias_20 - 0.08) * 100))
                 sig.append(f"⚠️ [短线高估] 偏离20日均线 +{bias_20*100:.1f}% (防追高扣减)")
 
             sym_sec = Config.get_sector_etf(sym)
             if sym_sec in leading_sectors:
-                lt_score_raw *= 1.15
-                st_score_raw *= 1.15
+                total_score = int(total_score * 1.15)
                 sig.append(f"🔥 [板块共振] 所属板块 {sym_sec} 资金领跑 (+15%)")
             elif sym_sec in lagging_sectors:
-                lt_score_raw *= 0.85
-                st_score_raw *= 0.85
+                total_score = int(total_score * 0.85)
                 sig.append(f"🧊 [板块拖累] 所属板块 {sym_sec} 动能垫底 (-15%)")
-
-            lt_score = int(lt_score_raw)
-            st_score = int(st_score_raw)
-            
-            if (lt_score + st_score) > 0 and st_cnt < 1 and not is_vol: 
-                lt_score = int(lt_score * 0.3)
-                st_score = int(st_score * 0.3)
-            if st_cnt >= 2: 
-                lt_score += 3
-                st_score += 2
             
             ai_prob = 0.52
             if clf_model and factors and hasattr(clf_model, 'classes_'):
@@ -716,12 +678,8 @@ def run_tech_matrix() -> None:
                     x_row = [1 if f in factors else 0 for f in Config.ALL_FACTORS]
                     class_idx = np.where(clf_model.classes_ == 1)[0][0] if 1 in clf_model.classes_ else 0
                     ai_prob = clf_model.predict_proba([x_row])[0][class_idx]
-                    ml_score = int(ai_prob * 100)
-                    st_score = int(st_score * 0.6 + ml_score * 0.4)
-                    sig.append(f"🤖 [AI非线性预测] T+3盈利概率: {ai_prob:.1%}")
                 except Exception: pass
 
-            total_score = lt_score + st_score
             if total_score > 0:
                 all_raw_scores.append(total_score)
             
@@ -733,8 +691,7 @@ def run_tech_matrix() -> None:
             if pd.isna(sl_chandelier): sl_chandelier = curr['Close'] - 1.5 * vix_scalar * curr['ATR']
             sl_val = max(sl_chandelier, curr['Close'] - 1.5 * vix_scalar * curr['ATR'])
             
-            sl_pct_distance = (curr['Close'] - sl_val) / curr['Close']
-            sl_pct_distance = max(0.01, sl_pct_distance) 
+            sl_pct_distance = max(0.01, (curr['Close'] - sl_val) / curr['Close']) 
             
             position_advice = "✅ 标准仓位"
             pos_percentage = 0.0
@@ -744,16 +701,12 @@ def run_tech_matrix() -> None:
                 pos_percentage = 0.0
             else:
                 risk_parity_pos = PORTFOLIO_MAX_RISK_PER_TRADE / sl_pct_distance
-                safe_kelly = min(0.20, kelly_fraction / 2.0)
-                pos_percentage = min(safe_kelly, risk_parity_pos)
-                
-                if is_credit_risk_high:
-                    pos_percentage *= 0.6
+                pos_percentage = min(min(0.20, kelly_fraction / 2.0), risk_parity_pos)
+                if is_credit_risk_high: pos_percentage *= 0.6
                 
                 gap_pct = (curr['Open'] - prev['Close']) / prev['Close']
                 if gap_pct > 0.03:
-                    st_score = int(st_score * 0.5)
-                    total_score = lt_score + st_score
+                    total_score = int(total_score * 0.5)
                     pos_percentage *= 0.5 
                     position_advice = f"⚠️ 建议仓位 {pos_percentage:.1%} (已防备跳空高开，单笔风险锁死)"
                 elif bias_20 > 0.12:
@@ -765,23 +718,17 @@ def run_tech_matrix() -> None:
             if sig and total_score > 0 and pos_percentage > 0:
                 if check_earnings_risk(sym):
                     sig.append("💣 [财报雷区] 近5日发财报,风险极高")
-                    lt_score = int(lt_score * 0.5)
-                    st_score = int(st_score * 0.5)
-                    total_score = lt_score + st_score
+                    total_score = int(total_score * 0.5)
                     pos_percentage *= 0.2
                     position_advice = f"⚠️ 建议仓位 {pos_percentage:.1%} (财报赌博极限风控)"
 
                 news = get_latest_news(sym)
-                
                 reports.append({
-                    "symbol": sym, "lt_score": lt_score, "st_score": st_score, "score": total_score, 
+                    "symbol": sym, "score": total_score, "ai_prob": ai_prob,
                     "signals": sig[:8], "factors": factors,
                     "curr_close": curr['Close'], 
-                    "tp": tp_val, 
-                    "sl": sl_val, 
-                    "news": news,
-                    "sector": sym_sec,
-                    "pos_advice": position_advice
+                    "tp": tp_val, "sl": sl_val, 
+                    "news": news, "sector": sym_sec, "pos_advice": position_advice
                 })
         except Exception: pass
 
@@ -802,11 +749,10 @@ def run_tech_matrix() -> None:
                 else:
                     base_pen = max(0.6, min(0.9, Config.CROWDING_PENALTY * (1.0 + health_score * 0.3)))
                     for s in stks[1:]:
-                        s["lt_score"] = int(s["lt_score"] * base_pen)
-                        s["st_score"] = int(s["st_score"] * base_pen)
-                        s["score"] = s["lt_score"] + s["st_score"]
+                        s["score"] = int(s["score"] * base_pen)
 
-        reports.sort(key=lambda x: (x["lt_score"], x["st_score"]), reverse=True)
+        # 🚀 选股终局重构：让 AI 胜率成为第一择优标准，分数仅作底线过滤与同分排序
+        reports.sort(key=lambda x: (x["ai_prob"], x["score"]), reverse=True)
         candidate_pool = reports[:25]
         
         final_reports = []
@@ -815,13 +761,10 @@ def run_tech_matrix() -> None:
                 corr_df_data = {r['symbol']: price_history_dict[r['symbol']] for r in candidate_pool if r['symbol'] in price_history_dict}
                 if corr_df_data:
                     corr_df = pd.DataFrame(corr_df_data).fillna(method='ffill').pct_change().corr()
-                    
                     for candidate in candidate_pool:
                         if len(final_reports) >= 15: break
-                        
                         sym = candidate['symbol']
                         is_redundant = False
-                        
                         for accepted in final_reports:
                             acc_sym = accepted['symbol']
                             if sym in corr_df.columns and acc_sym in corr_df.columns:
@@ -829,17 +772,13 @@ def run_tech_matrix() -> None:
                                     is_redundant = True
                                     logger.info(f"🛡️ 反脆弱机制：踢除 {sym}，因为它与已选高分股 {acc_sym} 相关性高达 {corr_df.loc[sym, acc_sym]:.2f}，拒绝同质化风险。")
                                     break
-                        
-                        if not is_redundant:
-                            final_reports.append(candidate)
-                else:
-                    final_reports = candidate_pool[:15]
+                        if not is_redundant: final_reports.append(candidate)
+                else: final_reports = candidate_pool[:15]
             except Exception as e:
                 logger.warning(f"反脆弱协方差矩阵构建失败: {e}")
                 final_reports = candidate_pool[:15]
         
-        for r in final_reports:
-            set_alerted(r["symbol"])
+        for r in final_reports: set_alerted(r["symbol"])
             
         medals = ['🥇', '🥈', '🥉']
         txts = []
@@ -848,9 +787,10 @@ def run_tech_matrix() -> None:
             sigs_fmt = "\n".join([f"- {s}" for s in r["signals"]])
             news_fmt = f"\n- 📰 {r['news']}" if r['news'] else ""
             
+            # 🚀 UI 卡片极致净化，剔除无用评分，凸显 AI 智慧与机构底牌
             card = (
-                f"### {icon} **{r['symbol']}** | 🌟 长线: {r['lt_score']}分 | ⚡ 短线: {r['st_score']}分\n"
-                f"**💡 触发共振:**\n{sigs_fmt}{news_fmt}\n\n"
+                f"### {icon} **{r['symbol']}** | 🌟 机构共振度: {r['score']}分 | 🤖 AI胜率: {r.get('ai_prob', 0):.1%}\n"
+                f"**💡 主力底牌透视:**\n{sigs_fmt}{news_fmt}\n\n"
                 f"**💰 交易计划:**\n"
                 f"- 💵 现价: `{r['curr_close']:.2f}`\n"
                 f"- ⚖️ {r.get('pos_advice', '✅ 标准仓位')}\n"
@@ -1021,7 +961,6 @@ def run_backtest_engine() -> None:
                         for f_name in factor_list:
                             factor_rets.setdefault(f"[{f_name}]", []).append(ret)
                             
-                        # 确保回测训练维度与最新的极简 12 因子强一致
                         x_row = [1 if f in factor_list else 0 for f in Config.ALL_FACTORS]
                         X_train.append(x_row)
                         y_train.append(1 if ret > 0.015 else 0)
@@ -1154,4 +1093,4 @@ if __name__ == "__main__":
     m = sys.argv[1] if len(sys.argv) > 1 else "matrix"
     if m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "Alpha洗礼完成！散户滞后指标已尽数剥离，提纯为最纯粹的十二大机构级量价/筹码行为因子。")
+    elif m == "test": send_alert("连通性测试", "Alpha洗礼完成！所有滞后指标已剥离，提纯为最纯粹的十二大机构量价行为系统。")
