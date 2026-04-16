@@ -76,11 +76,12 @@ class Config:
     ALERT_CACHE_FILE: str = "alert_history.json"
     MODEL_FILE: str = "scoring_model.pkl"
     
-    # 🚀 纯血 15 大机构量价行为学因子
+    # 🚀 时空拓展：完成 16 维终极量价基因链，注入 [威科夫弹簧(Spring)]
     ALL_FACTORS = [
         "米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "SMC失衡区", 
         "流动性扫盘", "聪明钱抢筹", "巨量滞涨", "放量长阳", "口袋支点", 
-        "VCP收缩", "筹码峰突破", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘"
+        "VCP收缩", "筹码峰突破", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘",
+        "威科夫弹簧(Spring)"
     ]
 
     @classmethod
@@ -500,12 +501,18 @@ def run_tech_matrix() -> None:
     vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
     vix_scalar = max(0.6, min(1.4, 18.0 / max(vix, 1.0)))
     
+    # 🚀 遐想三：跨界资金黑洞探测 (Sector Liquidity Black Hole)
     valid_sector_data = {}
+    black_hole_sectors = []
     for etf in Config.SECTOR_MAP.keys():
         sdf = safe_get_history(etf, "2mo", "1d", fast_mode=True)
         if not sdf.empty and len(sdf) >= 20:
             valid_sector_data[etf] = (sdf['Close'].ffill().iloc[-1] / sdf['Close'].iloc[-20]) - 1
-            
+            # 计算该 ETF 今天的成交量异动倍数
+            vol_surge = sdf['Volume'].iloc[-1] / (sdf['Volume'].iloc[-20:].mean() + 1e-10)
+            if vol_surge > 1.6:  # 资金疯狂涌入该板块
+                black_hole_sectors.append(etf)
+                
     sorted_sectors = sorted(valid_sector_data.items(), key=lambda x: x[1], reverse=True)
     leading_sectors = [s[0] for s in sorted_sectors[:2]] if len(sorted_sectors) >= 4 else []
     lagging_sectors = [s[0] for s in sorted_sectors[-2:]] if len(sorted_sectors) >= 4 else []
@@ -514,7 +521,6 @@ def run_tech_matrix() -> None:
     if is_credit_risk_high: health_score -= 0.5
     w_mul = 1.0 + health_score * 0.8
     
-    # 🚀 AI 自我进化：直接读取 Random Forest 的特征重要性，彻底接管打分权重
     xai_weights = {}
     try:
         if os.path.exists(Config.STATS_FILE):
@@ -524,7 +530,6 @@ def run_tech_matrix() -> None:
                 if xai_data and len(xai_data) > 0:
                     avg_imp = 1.0 / len(Config.ALL_FACTORS)
                     for tag, imp in xai_data.items():
-                        # AI 判断重要性翻倍，则权重乘 2；最少保留 0.5 倍，最高封顶 3.0 倍
                         w = max(0.5, min(3.0, float(imp) / avg_imp))
                         xai_weights[tag] = w
     except Exception as e:
@@ -646,6 +651,13 @@ def run_tech_matrix() -> None:
             if curr['Close'] > curr['Open'] and (lower_wick / tr_val) > 0.3 and (upper_wick / tr_val) < 0.15 and is_vol:
                 fw = get_fw("AMD操盘")
                 triggered.append(("AMD操盘", f"🎭 [AMD操盘] 开盘深度诱空下杀，随后全天拉升派发 (权:{fw:.2f}x)", 12 * w_mul * fw))
+                
+            # 🚀 遐想二：威科夫弹簧测试 (Wyckoff Spring)
+            # 股价跌破了过去20天的最低点，但成交量极度萎缩（抛压耗尽），且收盘价强行收回日内中轴之上
+            if pd.notna(curr['Swing_Low_20']) and curr['Low'] < curr['Swing_Low_20']:
+                if curr['Volume'] < curr['Vol_MA20'] * 0.8 and curr['Close'] > (curr['Low'] + tr_val * 0.5):
+                    fw = get_fw("威科夫弹簧(Spring)")
+                    triggered.append(("威科夫弹簧(Spring)", f"🏹 [威科夫弹簧] 跌破前低但抛压枯竭，深蹲起爆 (权:{fw:.2f}x)", 18 * w_mul * fw))
             
             score_raw = 0.0
             for tag, text, pts in triggered:
@@ -654,7 +666,7 @@ def run_tech_matrix() -> None:
                     adj_pts *= 0.5  
                 elif regime in ["bull", "rebound"] and tag in ["米奈尔维尼"]:
                     adj_pts *= 1.2  
-                elif regime in ["bear", "range", "hidden_bear"] and tag in ["SMC失衡区", "流动性扫盘", "口袋支点", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘"]:
+                elif regime in ["bear", "range", "hidden_bear"] and tag in ["SMC失衡区", "流动性扫盘", "口袋支点", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘", "威科夫弹簧(Spring)"]:
                     adj_pts *= 1.5
                 
                 score_raw += adj_pts
@@ -664,7 +676,6 @@ def run_tech_matrix() -> None:
             total_score = int(score_raw)
 
             is_bearish_div = False
-            # 只有 RSI，移除了过多的冗余指标
             if curr['Close'] >= curr['Price_High_20'] * 0.98 and curr['RSI'] < 60.0 and prev['RSI'] > 60.0:
                 is_bearish_div = True
                 total_score = 0 
@@ -680,7 +691,12 @@ def run_tech_matrix() -> None:
                 sig.append(f"⚠️ [短线高估] 偏离20日均线 +{bias_20*100:.1f}% (防追高扣减)")
 
             sym_sec = Config.get_sector_etf(sym)
-            if sym_sec in leading_sectors:
+            
+            # 🚀 黑洞引力加持：如果个股所处板块正好是当天的“资金黑洞”，分数获得史诗级爆增！
+            if sym_sec in black_hole_sectors:
+                total_score = int(total_score * 1.30)
+                sig.append(f"🕳️ [流动性黑洞] 所属板块 {sym_sec} 正疯狂吸血全市场资金 (+30%)")
+            elif sym_sec in leading_sectors:
                 total_score = int(total_score * 1.15)
                 sig.append(f"🔥 [板块共振] 所属板块 {sym_sec} 资金领跑 (+15%)")
             elif sym_sec in lagging_sectors:
@@ -766,7 +782,6 @@ def run_tech_matrix() -> None:
                     for s in stks[1:]:
                         s["score"] = int(s["score"] * base_pen)
 
-        # 🚀 排位铁律：第一顺位永远是 AI 胜率，第二顺位是底层共振分
         reports.sort(key=lambda x: (x["ai_prob"], x["score"]), reverse=True)
         candidate_pool = reports[:25]
         
@@ -802,12 +817,11 @@ def run_tech_matrix() -> None:
             sigs_fmt = "\n".join([f"- {s}" for s in r["signals"]])
             news_fmt = f"\n- 📰 {r['news']}" if r['news'] else ""
             
-            # 🚀 净化 UI 卡片，移除毫无意义的长短线，凸显 AI 智慧
             ai_display = f"{r.get('ai_prob', 0):.1%}"
             if r.get('ai_prob', 0) > 0.60: ai_display = f"🔥 **{ai_display}**"
             
             card = (
-                f"### {icon} **{r['symbol']}** | 🤖 AI胜率: {ai_display} | 🌟 动能共振: {r['score']}分\n"
+                f"### {icon} **{r['symbol']}** | 🤖 AI胜率: {ai_display} | 🌟 机构共振度: {r['score']}分\n"
                 f"**💡 主力底牌透视:**\n{sigs_fmt}{news_fmt}\n\n"
                 f"**💰 交易计划:**\n"
                 f"- 💵 现价: `{r['curr_close']:.2f}`\n"
@@ -823,9 +837,9 @@ def run_tech_matrix() -> None:
         
         final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
                         "\n\n---\n\n".join(txts) + \
-                        f"\n\n*(引擎重构: AI自我权重接管 (XAI Self-Evolving Weights) 已激活)*"
+                        f"\n\n*(奇点降临: AI遗忘曲线、板块黑洞引力与威科夫弹簧探测已全线激活)*"
         
-        send_alert("量化诸神之战 (AI觉醒版)", final_content)
+        send_alert("量化诸神之战 (破壁奇点版)", final_content)
         
         with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
             f.write(json.dumps({"date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", []), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports]}, ensure_ascii=False) + "\n")
@@ -997,11 +1011,16 @@ def run_backtest_engine() -> None:
         try:
             from sklearn.ensemble import RandomForestClassifier
             import pickle
+            
+            # 🚀 遐想一：AI 记忆遗忘曲线 (Time-Decay Memory Weighting)
+            # 让 AI 聚焦于最新的市场特征，对过于古老的数据进行指数级权重衰减
+            sample_weights = np.exp(np.linspace(-2.5, 0, len(y_train)))
+            
             clf = RandomForestClassifier(n_estimators=100, max_depth=5, class_weight='balanced', random_state=42)
-            clf.fit(X_train, y_train)
+            clf.fit(X_train, y_train, sample_weight=sample_weights)
             with open(Config.MODEL_FILE, 'wb') as f:
                 pickle.dump(clf, f)
-            logger.info("🧠 非线性机器学习打分模型 (Random Forest) 已基于纯血因子完成重训并落盘。")
+            logger.info("🧠 搭载【遗忘曲线】的非线性打分模型 (Random Forest) 已完成重训，AI 成功完成市场周期自适应。")
             
             if hasattr(clf, 'feature_importances_'):
                 importances = clf.feature_importances_
@@ -1086,7 +1105,7 @@ def run_backtest_engine() -> None:
             report_md.append(f"| {tag} | {imp*100:.1f}% |")
 
     if f_res:
-        report_md.append("\n## 🧬 终极15大先进因子验证 (T+3)\n| 因子 | 胜率 | 盈亏比 | 触发次数 |\n|:---|:---:|:---:|:---:|")
+        report_md.append("\n## 🧬 终极16大破壁因子验证 (T+3)\n| 因子 | 胜率 | 盈亏比 | 触发次数 |\n|:---|:---:|:---:|:---:|")
         sorted_f = sorted(f_res.items(), key=lambda x: x[1]['win_rate'], reverse=True)
         for tag, d in sorted_f: report_md.append(f"| {tag} | {d['win_rate']*100:.1f}% | {d['profit_factor']:.2f} | {d['count']} |")
     
@@ -1104,11 +1123,11 @@ def run_backtest_engine() -> None:
             icon = ['🔥','🔥','🔥'][idx]
             alert_lines.append(f"- {icon} **{tag}**: 贡献度 {imp*100:.1f}%")
             
-    send_alert("策略终极回测战报 (15因子XAI版)", "\n".join(alert_lines))
+    send_alert("策略终极回测战报 (16因子奇点版)", "\n".join(alert_lines))
 
 if __name__ == "__main__":
     validate_config()
     m = sys.argv[1] if len(sys.argv) > 1 else "matrix"
     if m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "灵魂接管完成！所有因子权重已交由 XAI (特征重要性矩阵) 动态演算。")
+    elif m == "test": send_alert("连通性测试", "The Singularity 奇点更新！遗忘曲线(记忆衰减)、黑洞引力与威科夫弹簧已突破量化边界。")
