@@ -518,8 +518,9 @@ def run_volatility_sentinel() -> None:
     for sym in active_pool:
         if is_alerted(sym, "sentinel"): continue 
         try:
-            df_d = safe_get_history(sym, period="1mo", interval="1d", fast_mode=True)
-            if len(df_d) < 15: continue
+            # 🚀 深度体检修复 1: 放宽 Sentinel 历史读取天数，确保 22日均线/吊灯指标充分预热不报 NaN
+            df_d = safe_get_history(sym, period="2mo", interval="1d", fast_mode=True)
+            if len(df_d) < 40: continue
             df_d = calculate_indicators(df_d)
             
             atr = df_d['ATR'].iloc[-1]
@@ -553,7 +554,9 @@ def run_volatility_sentinel() -> None:
                 set_alerted(sym, "sentinel") 
                 
                 tp = curr_px_d + 3.0 * vix_scalar * atr
-                sl = max(df_d['Chandelier_Exit'].iloc[-1], curr_px_d - 1.5 * vix_scalar * atr)
+                sl_chandelier = df_d['Chandelier_Exit'].iloc[-1]
+                if pd.isna(sl_chandelier): sl_chandelier = curr_px_d - 1.5 * vix_scalar * atr
+                sl = max(sl_chandelier, curr_px_d - 1.5 * vix_scalar * atr)
                 
                 trade_plan = (
                     f"**💰 交易计划:**\n"
@@ -590,7 +593,6 @@ def run_tech_matrix() -> None:
     
     vix_scalar = max(0.6, min(1.4, 18.0 / max(vix, 1.0)))
     
-    # 🚀 板块真实动量，提前算出供后续使用
     valid_sector_data = {}
     for etf in Config.SECTOR_MAP.keys():
         sdf = safe_get_history(etf, "2mo", "1d", fast_mode=True)
@@ -694,12 +696,10 @@ def run_tech_matrix() -> None:
                         fw = get_fw("强相对强度")
                         triggered.append(("flow", "LT", "强相对强度", f"⚡ [强相对强度] 跑赢大盘 (权:{fw:.1f}x)", (7 if is_vol else 4) * w_mul * fw, False))
             
-            # 🚀 VWAP 放量突破主力成本线
             if curr['Close'] > curr['VWAP_20'] and prev['Close'] <= prev['VWAP_20']:
                 fw = get_fw("VWAP突破")
                 triggered.append(("flow", "ST", "VWAP突破", f"🌊 [VWAP突破] 放量逾越机构均价 (权:{fw:.1f}x)", 8 * w_mul * fw, True))
                 
-            # 🚀 探测聪明钱尾盘吸筹 (Smart Money Flow)
             if curr['Smart_Money_Flow'] > 0.5 and curr['Close'] > curr['EMA_20']:
                 fw = get_fw("聪明钱抢筹")
                 triggered.append(("flow", "ST", "聪明钱抢筹", f"🕵️ [聪明资金] 连续10日尾盘吸筹 (权:{fw:.1f}x)", 6 * w_mul * fw, True))
@@ -799,7 +799,9 @@ def run_tech_matrix() -> None:
             if clf_model and factors and hasattr(clf_model, 'classes_'):
                 try:
                     x_row = [1 if f in factors else 0 for f in Config.ALL_FACTORS]
-                    ai_prob = clf_model.predict_proba([x_row])[0][1]
+                    # 🚀 深度体检修复 3: 引入安全的索引映射，避免单类别退化导致的越界崩溃
+                    class_idx = np.where(clf_model.classes_ == 1)[0][0] if 1 in clf_model.classes_ else 0
+                    ai_prob = clf_model.predict_proba([x_row])[0][class_idx]
                     ml_score = int(ai_prob * 100)
                     st_score = int(st_score * 0.6 + ml_score * 0.4)
                     sig.append(f"🤖 [AI预测] T+3盈利概率: {ai_prob:.1%}")
@@ -847,9 +849,10 @@ def run_tech_matrix() -> None:
 
                 news = get_latest_news(sym)
                 
-                # 🚀 将吊灯止损写入回测池，这比普通的固定 ATR 要聪明得多
                 tp_val = curr['Close'] + 3.0 * vix_scalar * curr['ATR']
-                sl_val = max(curr['Chandelier_Exit'], curr['Close'] - 1.5 * vix_scalar * curr['ATR'])
+                sl_chandelier = curr['Chandelier_Exit']
+                if pd.isna(sl_chandelier): sl_chandelier = curr['Close'] - 1.5 * vix_scalar * curr['ATR']
+                sl_val = max(sl_chandelier, curr['Close'] - 1.5 * vix_scalar * curr['ATR'])
                 
                 reports.append({
                     "symbol": sym, "lt_score": lt_score, "st_score": st_score, "score": total_score, 
@@ -974,7 +977,9 @@ def run_backtest_engine() -> None:
     for t in trades:
         sym, r_dt = t['symbol'], t['date']
         initial_sl = t.get('sl', 0)
+        if pd.isna(initial_sl): initial_sl = 0
         tp_price = t.get('tp', float('inf'))
+        if pd.isna(tp_price): tp_price = float('inf')
         
         if sym not in df_c.columns or sym not in df_o.columns: continue
         valid = df_c.index[df_c.index >= r_dt]
@@ -993,7 +998,8 @@ def run_backtest_engine() -> None:
         
         entry_cost = e_px_raw * (1 + SLIPPAGE * 3 + COMMISSION) if is_half_pos else e_px_raw * (1 + SLIPPAGE + COMMISSION)
         
-        trail_distance = e_px_raw - initial_sl if initial_sl > 0 else e_px_raw * 0.05
+        # 🚀 深度体检修复 2: 保证动态止损距离恒正，防止次日大幅低开开在止损线上方时导致的 trail_distance 变为负数而反向止损
+        trail_distance = max(e_px_raw * 0.02, e_px_raw - initial_sl) if initial_sl > 0 else e_px_raw * 0.05
         
         for d in [1, 3, 5]:
             exit_idx = e_idx + d
@@ -1148,4 +1154,4 @@ if __name__ == "__main__":
     if m == "sentinel": run_volatility_sentinel()
     elif m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "终极进化达成！宏观信用利差、聪明钱抓取与吊灯追踪止损 (Chandelier) 全面激活！")
+    elif m == "test": send_alert("连通性测试", "系统底层已跃迁至无懈可击！哨兵周期延展、止损缓冲垫与 AI 数组防界熔断全部激活。")
