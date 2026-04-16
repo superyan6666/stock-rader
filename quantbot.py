@@ -77,7 +77,7 @@ class Config:
     ALERT_CACHE_FILE: str = "alert_history.json"
     MODEL_FILE: str = "scoring_model.pkl"
     
-    ALL_FACTORS = ["米奈尔维尼", "OBV底背离", "强相对强度", "强势回踩", "MACD金叉", "TTM Squeeze ON", "机构控盘", "一目多头", "突破缺口"]
+    ALL_FACTORS = ["米奈尔维尼", "OBV底背离", "强相对强度", "强势回踩", "MACD金叉", "TTM Squeeze ON", "机构控盘", "一目多头", "突破缺口", "VWAP突破"]
 
     @classmethod
     def get_current_log_file(cls) -> str:
@@ -276,7 +276,8 @@ def load_strategy_performance_tag() -> str:
                 stats_data = json.load(f)
                 t3 = stats_data.get("overall", {}).get("T+3") if "overall" in stats_data else stats_data.get("T+3")
                 if t3 and t3.get('total_trades', 0) > 0:
-                    return f"**📈 策略表现 (T+3):** 胜率 {t3['win_rate']:.1%} | 均收益 {t3['avg_ret']:+.2%} "
+                    pf_str = f" | 盈亏比 {t3.get('profit_factor', 0.0):.2f}" if 'profit_factor' in t3 else ""
+                    return f"**📈 策略表现 (T+3):** 胜率 {t3['win_rate']:.1%}{pf_str} | 均收益 {t3['avg_ret']:+.2%} "
     except Exception: pass
     return ""
 
@@ -336,15 +337,31 @@ def get_vix_level(qqq_df_for_shadow: pd.DataFrame = None) -> Tuple[float, str]:
     if vix < 15: return vix, f"✅ 市场平静 ({prefix}: {vix:.2f})"
     return vix, f"⚖️ 正常波动 ({prefix}: {vix:.2f})"
 
-def get_market_regime(active_pool: List[str] = None) -> Tuple[str, str, pd.DataFrame]:
+def get_market_regime(active_pool: List[str] = None) -> Tuple[str, str, pd.DataFrame, bool]:
+    # 返回: regime, desc, df, is_credit_risk_high
     df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", auto_adjust=False, fast_mode=True)
-    if len(df) < 200: return "range", "数据不足，默认震荡", df
+    if len(df) < 200: return "range", "数据不足，默认震荡", df, False
     
     c_close = df['Close'].ffill().iloc[-1]
     ma200 = df['Close'].rolling(200).mean().iloc[-1]
     ma50_curr = df['Close'].rolling(50).mean().iloc[-1]
     ma50_prev = df['Close'].rolling(50).mean().iloc[-20]
     trend_20d = (c_close - df['Close'].iloc[-20]) / df['Close'].iloc[-20]
+    
+    # 🚀 宏观维度：探测高收益垃圾债(HYG) vs 避险国债(IEF) 的系统性信用利差 (Credit Spread)
+    credit_risk_alert = False
+    credit_desc = ""
+    try:
+        hyg = safe_get_history("HYG", "3mo", "1d", fast_mode=True)
+        ief = safe_get_history("IEF", "3mo", "1d", fast_mode=True)
+        if not hyg.empty and not ief.empty:
+            ratio = hyg['Close'] / ief['Close']
+            ratio_ma20 = ratio.rolling(20).mean().iloc[-1]
+            # 如果垃圾债表现远弱于国债，且处于明显下降通道，说明聪明资金(Smart Money)正在抽离股市避险
+            if ratio.iloc[-1] < ratio_ma20 and ratio.iloc[-1] < ratio.iloc[-10]:
+                credit_risk_alert = True
+                credit_desc = "\n- 🚨 **宏观信用风控触发**: 高收益债资金正在疯狂流出避险，市场随时面临流动性枯竭重挫！"
+    except Exception: pass
     
     breadth_desc = ""
     if active_pool and len(active_pool) >= 30:
@@ -358,21 +375,21 @@ def get_market_regime(active_pool: List[str] = None) -> Tuple[str, str, pd.DataF
                 breadth_desc = f" | 市场宽度: {breadth:.0%} 站上50日均线"
                 
                 if c_close > ma200 and breadth < 0.4:
-                    return "hidden_bear", f"⚠️ 指数虚高但宽度严重背离{breadth_desc}", df
+                    return "hidden_bear", f"⚠️ 指数虚高但宽度严重背离{breadth_desc}{credit_desc}", df, credit_risk_alert
                 elif c_close < ma200 and breadth > 0.6:
-                    return "hidden_bull", f"🔥 指数弱势但暗流涌动{breadth_desc}", df
+                    return "hidden_bull", f"🔥 指数弱势但暗流涌动{breadth_desc}{credit_desc}", df, credit_risk_alert
         except Exception: pass
 
     if c_close > ma200:
-        if trend_20d > 0.02: return "bull", f"🐂 牛市主升阶段{breadth_desc}", df
-        else: return "range", f"⚖️ 牛市高位震荡{breadth_desc}", df
+        if trend_20d > 0.02: return "bull", f"🐂 牛市主升阶段{breadth_desc}{credit_desc}", df, credit_risk_alert
+        else: return "range", f"⚖️ 牛市高位震荡{breadth_desc}{credit_desc}", df, credit_risk_alert
     else:
         if c_close > ma50_curr and ma50_curr > ma50_prev and trend_20d > 0.04:
-            return "rebound", f"🦅 熊市超跌反弹 (V反){breadth_desc}", df
+            return "rebound", f"🦅 熊市超跌反弹 (V反){breadth_desc}{credit_desc}", df, credit_risk_alert
         elif trend_20d < -0.02: 
-            return "bear", f"🐻 熊市回调阶段{breadth_desc}", df
+            return "bear", f"🐻 熊市回调阶段{breadth_desc}{credit_desc}", df, credit_risk_alert
         else: 
-            return "range", f"⚖️ 熊市底部震荡{breadth_desc}", df
+            return "range", f"⚖️ 熊市底部震荡{breadth_desc}{credit_desc}", df, credit_risk_alert
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_index()
@@ -384,6 +401,9 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['SMA_200'] = df['Close'].rolling(window=200).mean()
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
     
+    df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
+    df['VWAP_20'] = (df['Typical_Price'] * df['Volume']).rolling(window=20).sum() / (df['Volume'].rolling(window=20).sum() + 1e-10)
+    
     df['High_52W'] = df['High'].rolling(window=252, min_periods=120).max()
     df['Low_52W'] = df['Low'].rolling(window=252, min_periods=120).min()
     df['OBV'] = (np.sign(df['Close'].diff()).fillna(0) * df['Volume']).cumsum()
@@ -393,6 +413,10 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     down = -delta.where(delta < 0, 0).ewm(span=14, adjust=False).mean()
     rs = up / (down + 1e-10)
     df['RSI'] = 100 - (100 / (1 + rs))
+    
+    # 🚀 引入 RSI 高点追踪，用于后续顶背离(Bearish Divergence)判定
+    df['RSI_High_20'] = df['RSI'].rolling(20).max()
+    df['Price_High_20'] = df['High'].rolling(20).max()
     
     df['RSI_P20'] = df['RSI'].shift(1).rolling(window=120, min_periods=60).quantile(0.20).fillna(30.0)
 
@@ -555,17 +579,28 @@ def run_tech_matrix() -> None:
         return
 
     active_pool = get_filtered_watchlist(max_stocks=120)
-    regime, regime_desc, qqq_df = get_market_regime(active_pool)
+    regime, regime_desc, qqq_df, is_credit_risk_high = get_market_regime(active_pool)
     vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
     
     vix_scalar = max(0.6, min(1.4, 18.0 / max(vix, 1.0)))
     
-    sector_data = {etf: (sdf['Close'].ffill().iloc[-1] / sdf['Close'].iloc[-20]) - 1 
-                  for etf in Config.SECTOR_MAP.keys() 
-                  if not (sdf := safe_get_history(etf, "2mo", "1d", fast_mode=True)).empty and len(sdf) >= 20}
+    valid_sector_data = {}
+    for etf in Config.SECTOR_MAP.keys():
+        sdf = safe_get_history(etf, "2mo", "1d", fast_mode=True)
+        if not sdf.empty and len(sdf) >= 20:
+            valid_sector_data[etf] = (sdf['Close'].ffill().iloc[-1] / sdf['Close'].iloc[-20]) - 1
+            
+    sorted_sectors = sorted(valid_sector_data.items(), key=lambda x: x[1], reverse=True)
+    leading_sectors = [s[0] for s in sorted_sectors[:2]] if len(sorted_sectors) >= 4 else []
+    lagging_sectors = [s[0] for s in sorted_sectors[-2:]] if len(sorted_sectors) >= 4 else []
                   
     health_score = -0.9 if vix > 30 else (-0.6 if vix > 25 else (0.9 if vix < 15 and 'bull' in regime else (0.6 if 'bull' in regime else (0.3 if 'rebound' in regime else (-0.7 if 'bear' in regime else 0.0)))))
-    w_mul, min_score = 1.0 + health_score * 0.8, max(Config.MIN_SCORE_THRESHOLD, 8 + round(health_score * -6))
+    
+    # 🚀 宏观一票否决：一旦发现垃圾债资金出逃（信用危机），全面压制全市场得分，并强制削减买入仓位
+    if is_credit_risk_high:
+        health_score -= 0.5
+        
+    w_mul = 1.0 + health_score * 0.8
     
     factor_weights = {}
     try:
@@ -576,6 +611,7 @@ def run_tech_matrix() -> None:
                     wr = data.get("win_rate", 0.5)
                     avg_ret = data.get("avg_ret", 0.0)
                     cnt = data.get("count", 0)
+                    pf = data.get("profit_factor", 1.0)
                     
                     MIN_SAMPLES = 5.0        
                     PRIOR_WIN_RATE = 0.52    
@@ -586,6 +622,10 @@ def run_tech_matrix() -> None:
                     shrunk_avg_ret = alpha * avg_ret + (1.0 - alpha) * PRIOR_AVG_RET
                     
                     w = 1.0 + (shrunk_wr - 0.5) * 2.0 + (shrunk_avg_ret * 20) 
+                    
+                    if pf < 1.0 and cnt >= MIN_SAMPLES:
+                        w *= (pf ** 2) 
+                        
                     factor_weights[tag] = max(0.2, min(2.0, w)) 
     except Exception as e:
         logger.warning(f"动态权重解析跳过: {e}")
@@ -604,6 +644,8 @@ def run_tech_matrix() -> None:
             logger.debug(f"模型加载失败: {e}")
 
     reports = []
+    all_raw_scores = []
+    
     for sym in active_pool:
         if is_alerted(sym, "matrix"): continue
         try:
@@ -645,7 +687,11 @@ def run_tech_matrix() -> None:
                     if rs_20 > 1.08: 
                         fw = get_fw("强相对强度")
                         triggered.append(("flow", "LT", "强相对强度", f"⚡ [强相对强度] 跑赢大盘 (权:{fw:.1f}x)", (7 if is_vol else 4) * w_mul * fw, False))
-                        
+            
+            if curr['Close'] > curr['VWAP_20'] and prev['Close'] <= prev['VWAP_20']:
+                fw = get_fw("VWAP突破")
+                triggered.append(("flow", "ST", "VWAP突破", f"🌊 [VWAP突破] 放量逾越机构均价 (权:{fw:.1f}x)", 8 * w_mul * fw, True))
+                
             dyn_rsi = curr['RSI_P20']
             if curr['RSI'] < dyn_rsi and prev['RSI'] >= dyn_rsi and is_st:
                 fw = get_fw("强势回踩")
@@ -701,11 +747,31 @@ def run_tech_matrix() -> None:
                 st_score_raw *= 0.4
                 sig.append("☁️ [云下压制] 长短线全面降权")
 
+            # 🚀 顶背离(Bearish Divergence) 绝对死刑：股价新高，RSI 却未能新高，主力衰竭
+            is_bearish_div = False
+            if curr['Close'] >= curr['Price_High_20'] * 0.98 and curr['RSI'] < curr['RSI_High_20'] * 0.90:
+                is_bearish_div = True
+                st_score_raw = 0.0 # 短线分直接爆扣归零
+                sig.append(f"🩸 [顶背离危局] 价格近高但动能显著衰竭，严禁追高")
+
+            if curr['RSI'] > 85.0:
+                st_score_raw = max(0, st_score_raw - 30)
+                sig.append(f"⚠️ [极端超买] RSI 高达 {curr['RSI']:.1f} (严防获利盘踩踏)")
+                
             bias_20 = (curr['Close'] - curr['EMA_20']) / curr['EMA_20']
             if bias_20 > 0.08:
                 penalty = (bias_20 - 0.08) * 100
                 st_score_raw = max(0, st_score_raw - penalty)
                 sig.append(f"⚠️ [短线高估] 偏离20日均线 +{bias_20*100:.1f}% (防追高扣减)")
+
+            if sym_sec in leading_sectors:
+                lt_score_raw *= 1.15
+                st_score_raw *= 1.15
+                sig.append(f"🔥 [板块共振] 所属板块 {sym_sec} 资金领跑 (+15%)")
+            elif sym_sec in lagging_sectors:
+                lt_score_raw *= 0.85
+                st_score_raw *= 0.85
+                sig.append(f"🧊 [板块拖累] 所属板块 {sym_sec} 动能垫底 (-15%)")
 
             lt_score = int(lt_score_raw)
             st_score = int(st_score_raw)
@@ -717,54 +783,76 @@ def run_tech_matrix() -> None:
                 lt_score += 3
                 st_score += 2
             
-            # 🚀 科学细化一：拦截“未熟”AI模型，防崩溃体系
+            ai_prob = 0.52
             if clf_model and factors and hasattr(clf_model, 'classes_'):
                 try:
                     x_row = [1 if f in factors else 0 for f in Config.ALL_FACTORS]
-                    prob = clf_model.predict_proba([x_row])[0][1]
-                    ml_score = int(prob * 100)
+                    ai_prob = clf_model.predict_proba([x_row])[0][1]
+                    ml_score = int(ai_prob * 100)
                     st_score = int(st_score * 0.6 + ml_score * 0.4)
-                    sig.append(f"🤖 [AI预测] T+3盈利概率: {prob:.1%}")
+                    sig.append(f"🤖 [AI预测] T+3盈利概率: {ai_prob:.1%}")
                 except Exception as e:
-                    logger.debug(f"AI推理预测受阻: {e}")
+                    logger.debug(f"AI推理受阻: {e}")
 
             total_score = lt_score + st_score
-            position_advice = "✅ 标准仓位"
+            if total_score > 0:
+                all_raw_scores.append(total_score)
             
-            if gap_pct > 0.03:
-                st_score = int(st_score * 0.5)
-                total_score = lt_score + st_score
-                position_advice = "⚠️ 半仓观察 (今日跳空偏高，提防回落)"
-            elif bias_20 > 0.12:
-                position_advice = "⚠️ 极小仓位 (乖离率过大，随时触发获利盘砸盘)"
+            odds_b = 2.0
+            kelly_fraction = ai_prob - (1.0 - ai_prob) / odds_b
+            
+            position_advice = "✅ 标准仓位"
+            pos_percentage = 0.0
+            
+            if kelly_fraction <= 0 or is_bearish_div:
+                position_advice = "❌ 放弃建仓 (AI盈亏比劣势 或 顶背离确认)"
+                pos_percentage = 0.0
+            else:
+                safe_kelly = min(0.20, kelly_fraction / 2.0)
+                pos_percentage = safe_kelly
+                # 宏观信用风险叠加惩罚
+                if is_credit_risk_high:
+                    pos_percentage *= 0.6
+                
+                if gap_pct > 0.03:
+                    st_score = int(st_score * 0.5)
+                    total_score = lt_score + st_score
+                    pos_percentage *= 0.5 
+                    position_advice = f"⚠️ 建议仓位 {pos_percentage:.1%} (已计算跳空高开防守)"
+                elif bias_20 > 0.12:
+                    pos_percentage = min(0.05, safe_kelly * 0.3)
+                    position_advice = f"⚠️ 建议仓位 {pos_percentage:.1%} (乖离率过大，防获利盘砸盘)"
+                else:
+                    position_advice = f"✅ 建议仓位 {pos_percentage:.1%} (基于凯利公式风控)"
 
-            if sig and total_score >= min_score:
+            if sig and total_score > 0 and pos_percentage > 0:
                 if check_earnings_risk(sym):
                     sig.append("💣 [财报雷区] 近5日发财报,风险极高")
                     lt_score = int(lt_score * 0.5)
                     st_score = int(st_score * 0.5)
                     total_score = lt_score + st_score
-                    position_advice = "⚠️ 极小仓位 (财报赌博风险)"
+                    pos_percentage *= 0.2
+                    position_advice = f"⚠️ 建议仓位 {pos_percentage:.1%} (财报盲盒赌博风险)"
 
-                if total_score >= min_score:
-                    set_alerted(sym, "matrix") 
-                    news = get_latest_news(sym)
-                    # 🚀 科学细化二：为回测记录精确的止盈(tp)和止损(sl)触发锚点
-                    tp_val = curr['Close'] + 3.0 * vix_scalar * curr['ATR']
-                    sl_val = curr['Close'] - 1.5 * vix_scalar * curr['ATR']
-                    reports.append({
-                        "symbol": sym, "lt_score": lt_score, "st_score": st_score, "score": total_score, 
-                        "signals": sig[:8], "factors": factors,
-                        "curr_close": curr['Close'], 
-                        "tp": tp_val, 
-                        "sl": sl_val, 
-                        "news": news,
-                        "sector": Config.get_sector_etf(sym),
-                        "pos_advice": position_advice
-                    })
+                news = get_latest_news(sym)
+                tp_val = curr['Close'] + 3.0 * vix_scalar * curr['ATR']
+                sl_val = curr['Close'] - 1.5 * vix_scalar * curr['ATR']
+                reports.append({
+                    "symbol": sym, "lt_score": lt_score, "st_score": st_score, "score": total_score, 
+                    "signals": sig[:8], "factors": factors,
+                    "curr_close": curr['Close'], 
+                    "tp": tp_val, 
+                    "sl": sl_val, 
+                    "news": news,
+                    "sector": Config.get_sector_etf(sym),
+                    "pos_advice": position_advice
+                })
         except Exception: pass
 
-    if reports:
+    if reports and all_raw_scores:
+        dynamic_min_score = max(Config.MIN_SCORE_THRESHOLD, np.percentile(all_raw_scores, 85))
+        reports = [r for r in reports if r['score'] >= dynamic_min_score]
+        
         groups = defaultdict(list)
         for r in reports: groups[r["sector"]].append(r)
         for sec, stks in groups.items():
@@ -783,9 +871,13 @@ def run_tech_matrix() -> None:
 
         reports.sort(key=lambda x: (x["lt_score"], x["st_score"]), reverse=True)
         
+        final_reports = reports[:15]
+        for r in final_reports:
+            set_alerted(r["symbol"], "matrix")
+            
         medals = ['🥇', '🥈', '🥉']
         txts = []
-        for idx, r in enumerate(reports[:15]):
+        for idx, r in enumerate(final_reports):
             icon = medals[idx] if idx < 3 else '🔸'
             sigs_fmt = "\n".join([f"- {s}" for s in r["signals"]])
             news_fmt = f"\n- 📰 {r['news']}" if r['news'] else ""
@@ -795,7 +887,7 @@ def run_tech_matrix() -> None:
                 f"**💡 触发共振:**\n{sigs_fmt}{news_fmt}\n\n"
                 f"**💰 交易计划:**\n"
                 f"- 💵 现价: `{r['curr_close']:.2f}`\n"
-                f"- ⚖️ 建议仓位: **{r.get('pos_advice', '✅ 标准仓位')}**\n"
+                f"- ⚖️ {r.get('pos_advice', '✅ 标准仓位')}\n"
                 f"- 🎯 建议止盈: **${r['tp']:.2f}**\n"
                 f"- 🛡️ 初始止损: **${r['sl']:.2f}**\n"
                 f"- 📈 移动防守: **新高后按 Max(最高价 - {1.5 * vix_scalar:.1f}*ATR) 追踪**"
@@ -803,19 +895,18 @@ def run_tech_matrix() -> None:
             txts.append(card)
 
         perf = load_strategy_performance_tag()
-        header = f"**📊 环境感知:**\n- {vix_desc}\n- {regime_desc}"
+        header = f"**📊 环境感知:**\n- {vix_desc}\n- {regime_desc}\n- ⚔️ 今日截面淘汰线 (Top 15%): **{dynamic_min_score:.1f}分**"
         
         final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
                         "\n\n---\n\n".join(txts) + \
-                        f"\n\n*(门槛: {min_score}分 | 长短线定序与防追高惩罚已激活)*"
+                        f"\n\n*(本策略已接入 Kelly 公式仓位管理与截面相对动量模型)*"
         
-        send_alert("多因子优选 (矩阵版)", final_content)
+        send_alert("多因子优选 (截面强化版)", final_content)
         
         with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
-            # 日志追加写入了 tp 和 sl 极点
-            f.write(json.dumps({"date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", []), "tp": r.get("tp"), "sl": r.get("sl")} for r in reports[:15]]}, ensure_ascii=False) + "\n")
+            f.write(json.dumps({"date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", []), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports]}, ensure_ascii=False) + "\n")
     else:
-        logger.info("📭 本次矩阵扫描未发现符合硬性门槛的新鲜强共振标的，不发送推送。")
+        logger.info("📭 本次矩阵扫描无标的突破 Top 15% 截面排位，宁缺毋滥，保持静默。")
 
 def run_backtest_engine() -> None:
     log_files = [f for f in os.listdir('.') if f.startswith('backtest_log') and f.endswith('.jsonl')]
@@ -830,7 +921,6 @@ def run_backtest_engine() -> None:
                 for line in f:
                     try:
                         log = json.loads(line.strip())
-                        # 安全提取可能遗留或新增的 tp / sl 数据
                         trades.extend([{'date': log['date'], 'symbol': p['symbol'], 'signals': p.get('signals', []), 'factors': p.get('factors', []), 'tp': p.get('tp', float('inf')), 'sl': p.get('sl', 0)} for p in log.get('top_picks', [])])
                     except: pass
         except Exception as e:
@@ -840,7 +930,6 @@ def run_backtest_engine() -> None:
     syms = list(set([t['symbol'] for t in trades]))
     
     try:
-        # 🚀 科学细化三：下载 High 和 Low 数据，以模拟真实的日内爆仓与冲高止盈
         df_all = yf.download(syms, period="2mo", progress=False, threads=2)
         if isinstance(df_all.columns, pd.MultiIndex):
             df_c = df_all['Close']
@@ -869,7 +958,7 @@ def run_backtest_engine() -> None:
     
     for t in trades:
         sym, r_dt = t['symbol'], t['date']
-        sl_price = t.get('sl', 0)
+        initial_sl = t.get('sl', 0)
         tp_price = t.get('tp', float('inf'))
         
         if sym not in df_c.columns or sym not in df_o.columns: continue
@@ -889,29 +978,47 @@ def run_backtest_engine() -> None:
         
         entry_cost = e_px_raw * (1 + SLIPPAGE * 3 + COMMISSION) if is_half_pos else e_px_raw * (1 + SLIPPAGE + COMMISSION)
         
+        # 计算该笔交易设定的止损容忍距离（即多少美元），用于移动止损计算
+        trail_distance = e_px_raw - initial_sl if initial_sl > 0 else e_px_raw * 0.05
+        
         for d in [1, 3, 5]:
             exit_idx = e_idx + d
             if exit_idx < len(df_c):
                 exit_revenue = None
                 
-                # 🚀 模拟逐日价格演化，如果在持仓期内触碰了止盈/止损线，强制结束交易！根除回测“死扛”假象
+                # 🚀 极致真实：动态移动止损 (Trailing Stop) 与 跳空穿透模拟
+                highest_seen_px = e_px_raw
+                dynamic_sl = initial_sl
+                
                 for i in range(1, d + 1):
                     check_idx = e_idx + i
+                    day_open = df_o.iloc[check_idx][sym]
                     day_low = df_l.iloc[check_idx][sym]
                     day_high = df_h.iloc[check_idx][sym]
                     day_close = df_c.iloc[check_idx][sym]
                     
-                    if not pd.isna(day_low) and sl_price > 0 and day_low <= sl_price:
-                        # 触发真实止损：模拟市价单砍仓带来的 5 倍恐慌滑点
-                        exit_revenue = sl_price * (1 - SLIPPAGE * 5 - COMMISSION)
+                    if pd.isna(day_open) or pd.isna(day_low) or pd.isna(day_high): continue
+                    
+                    # 1. 每日开盘跳空地狱测试 (Gap-Down Hell Test)
+                    if dynamic_sl > 0 and day_open < dynamic_sl:
+                        exit_revenue = day_open * (1 - SLIPPAGE * 5 - COMMISSION)
+                        break
+                        
+                    # 2. 日内跌破移动止损防线 (Hit Trailing Stop)
+                    if dynamic_sl > 0 and day_low <= dynamic_sl:
+                        exit_revenue = dynamic_sl * (1 - SLIPPAGE * 3 - COMMISSION)
                         break
                     
-                    if not pd.isna(day_high) and tp_price > 0 and day_high >= tp_price:
-                        # 触发真实止盈：触价单成交
+                    # 3. 触碰硬止盈线 (Take Profit)
+                    if tp_price > 0 and day_high >= tp_price:
                         exit_revenue = tp_price * (1 - SLIPPAGE - COMMISSION)
                         break
+                        
+                    # 4. 更新移动止损线：如果今日创了持仓期新高，止损防线同步上移！
+                    highest_seen_px = max(highest_seen_px, day_high)
+                    dynamic_sl = max(dynamic_sl, highest_seen_px - trail_distance)
                     
-                    # 熬过考验：以目标天数的收盘价平仓
+                    # 5. 期满平仓
                     if i == d:
                         prev_x_px = df_c.iloc[check_idx-1][sym] if check_idx > e_idx else e_px_raw
                         daily_volatility = abs((day_close - prev_x_px) / prev_x_px)
@@ -938,7 +1045,6 @@ def run_backtest_engine() -> None:
                         X_train.append(x_row)
                         y_train.append(1 if ret > 0.015 else 0)
     
-    # 🚀 AI 模型保护机制：仅当样本具有实际多空对照意义（双分类）且大于30次时进行重训练
     if len(X_train) >= 30 and len(set(y_train)) > 1:
         try:
             from sklearn.linear_model import LogisticRegression
@@ -957,36 +1063,74 @@ def run_backtest_engine() -> None:
     for p, r in stats.items():
         if not r: continue
         ret_arr = np.array(r)
-        wr = len(ret_arr[ret_arr > 0]) / len(ret_arr)
+        
+        win_returns = ret_arr[ret_arr > 0]
+        loss_returns = ret_arr[ret_arr < 0]
+        
+        wr = len(win_returns) / len(ret_arr)
         avg_r = np.mean(ret_arr)
         std_r = np.std(ret_arr) if len(ret_arr) > 1 else 1e-6
         sharpe = avg_r / (std_r + 1e-10)
         worst = np.min(ret_arr)
-        res[p] = {'win_rate': wr, 'avg_ret': avg_r, 'sharpe': sharpe, 'worst_trade': worst, 'total_trades': len(r)}
+        
+        sum_wins = np.sum(win_returns) if len(win_returns) > 0 else 0.0
+        sum_losses = abs(np.sum(loss_returns)) if len(loss_returns) > 0 else 1e-6
+        pf = sum_wins / sum_losses if sum_losses > 0 else 99.0
+        
+        max_cons_loss = 0
+        curr_cons_loss = 0
+        for ret in ret_arr:
+            if ret < 0:
+                curr_cons_loss += 1
+                max_cons_loss = max(max_cons_loss, curr_cons_loss)
+            else:
+                curr_cons_loss = 0
+                
+        res[p] = {
+            'win_rate': wr, 'avg_ret': avg_r, 'sharpe': sharpe, 
+            'worst_trade': worst, 'total_trades': len(r),
+            'profit_factor': pf, 'max_cons_loss': max_cons_loss
+        }
 
-    f_res = {t: {'win_rate': sum(1 for x in r if x > 0)/len(r), 'avg_ret': sum(r)/len(r), 'count': len(r)} for t, r in factor_rets.items() if len(r) >= 2}
+    f_res = {}
+    for t, r in factor_rets.items():
+        if len(r) >= 2:
+            ret_arr = np.array(r)
+            win_returns = ret_arr[ret_arr > 0]
+            loss_returns = ret_arr[ret_arr < 0]
+            sum_wins = np.sum(win_returns) if len(win_returns) > 0 else 0.0
+            sum_losses = abs(np.sum(loss_returns)) if len(loss_returns) > 0 else 1e-6
+            pf = sum_wins / sum_losses if sum_losses > 0 else 99.0
+            
+            f_res[t] = {
+                'win_rate': len(win_returns)/len(r), 
+                'avg_ret': sum(r)/len(r), 
+                'count': len(r),
+                'profit_factor': pf
+            }
+            
     with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: json.dump({"overall": res, "factors": f_res}, f, indent=4)
     
-    report_md = [f"# 📈 自动量化战报\n**更新:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n| 周期 | 胜率 | 均收益 | Sharpe | 单笔极亏 | 笔数 |\n|:---:|:---:|:---:|:---:|:---:|:---:|"]
+    report_md = [f"# 📈 自动量化战报\n**更新:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n| 周期 | 胜率 | 均收益 | 盈亏比 | Sharpe | 极差/连亏 | 笔数 |\n|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"]
     for p in ['T+1', 'T+3', 'T+5']:
-        d = res.get(p, {'win_rate':0,'avg_ret':0,'sharpe':0,'worst_trade':0,'total_trades':0})
-        report_md.append(f"| {p} | {d['win_rate']*100:.1f}% | {d['avg_ret']*100:+.2f}% | {d['sharpe']:.2f} | {d['worst_trade']*100:.1f}% | {d['total_trades']} |")
+        d = res.get(p, {'win_rate':0,'avg_ret':0,'profit_factor':0,'sharpe':0,'worst_trade':0,'max_cons_loss':0,'total_trades':0})
+        report_md.append(f"| {p} | {d['win_rate']*100:.1f}% | {d['avg_ret']*100:+.2f}% | {d['profit_factor']:.2f} | {d['sharpe']:.2f} | {d['worst_trade']*100:.1f}% / {d['max_cons_loss']}连 | {d['total_trades']} |")
     
     if f_res:
-        report_md.append("\n## 🧬 因子排行 (T+3)\n| 因子 | 胜率 | 次数 |\n|:---|:---:|:---:|")
+        report_md.append("\n## 🧬 核心因子剥离表现 (T+3)\n| 因子 | 胜率 | 盈亏比 | 次数 |\n|:---|:---:|:---:|:---:|")
         sorted_f = sorted(f_res.items(), key=lambda x: x[1]['win_rate'], reverse=True)
-        for tag, d in sorted_f: report_md.append(f"| {tag} | {d['win_rate']*100:.1f}% | {d['count']} |")
+        for tag, d in sorted_f: report_md.append(f"| {tag} | {d['win_rate']*100:.1f}% | {d['profit_factor']:.2f} | {d['count']} |")
     
     with open(Config.REPORT_FILE, 'w', encoding='utf-8') as f: f.write('\n'.join(report_md))
 
-    alert_lines = ["### 📊 **周期胜率总览 (含严格日内TP/SL摩擦模拟)**"]
-    for p, d in res.items(): alert_lines.append(f"- **{p}:** 胜率 {d['win_rate']*100:.1f}% | 均收益 {d['avg_ret']*100:+.2%} | Sharpe {d['sharpe']:.2f} | 极回撤 {d['worst_trade']*100:.1f}%")
+    alert_lines = ["### 📊 **机构级回测报表 (含Trailing Stop追踪止损模拟)**"]
+    for p, d in res.items(): alert_lines.append(f"- **{p}:** 胜率 {d['win_rate']*100:.1f}% | 盈亏比 {d['profit_factor']:.2f} | Sharpe {d['sharpe']:.2f} | {d['max_cons_loss']}连亏")
     
     if f_res:
-        alert_lines.extend(["", "---", "", "### 🧬 **核心因子排行 (T+3)**"])
+        alert_lines.extend(["", "---", "", "### 🧬 **核心因子胜率榜 (T+3)**"])
         for idx, (tag, d) in enumerate(sorted_f[:3]):
             icon = ['1️⃣','2️⃣','3️⃣'][idx]
-            alert_lines.append(f"- {icon} **{tag}**: 胜率 {d['win_rate']*100:.1f}%")
+            alert_lines.append(f"- {icon} **{tag}**: 胜率 {d['win_rate']*100:.1f}% | PF {d['profit_factor']:.2f}")
             
     send_alert("策略终极回测战报", "\n".join(alert_lines))
 
@@ -996,4 +1140,4 @@ if __name__ == "__main__":
     if m == "sentinel": run_volatility_sentinel()
     elif m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "系统已完成底层引擎究极提纯！幸存者偏差过滤、AI 防御校验与日内高低点穿透测试已激活。")
+    elif m == "test": send_alert("连通性测试", "终极进化达成！宏观信用利差、顶背离防御与动态追踪止损 (Trailing Stop) 全面介入！")
