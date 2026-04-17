@@ -76,13 +76,14 @@ class Config:
     ALERT_CACHE_FILE: str = "alert_history.json"
     MODEL_FILE: str = "scoring_model.pkl"
     
-    # 🌌 世界线展开：突破 22 维终极矩阵，注入 [三体逃逸] 与 [赫斯特记忆]
+    # 🌌 算力氧气注入：24 维全息宇宙矩阵 (新增 FFT傅里叶 与 KDE量子概率云)
     ALL_FACTORS = [
         "米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "SMC失衡区", 
         "流动性扫盘", "聪明钱抢筹", "巨量滞涨", "放量长阳", "口袋支点", 
         "VCP收缩", "筹码峰突破", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘",
         "威科夫弹簧(Spring)", "维特鲁威分形", "CVD筹码净流入", 
-        "混沌破缺(Trend)", "熵增起爆(Big Bang)", "三体逃逸(Alpha)", "赫斯特记忆(Hurst)"
+        "混沌破缺(Trend)", "熵增起爆(Big Bang)", "三体逃逸(Alpha)", "赫斯特记忆(Hurst)",
+        "傅里叶周期共振(FFT)", "量子概率云(KDE)"
     ]
 
     @classmethod
@@ -458,7 +459,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     low_14 = df['Low'].rolling(14).min()
     df['CHOP'] = 100 * np.log10(atr_sum_14 / (high_14 - low_14 + 1e-10)) / np.log10(14)
     
-    # ⏳ 赫斯特指数代理 (Hurst Exponent) - 利用分形维数计算股票的“长记忆性”
     log_sum_tr = np.log10(df['TR'].rolling(20).sum() + 1e-10)
     log_hl = np.log10(df['High'].rolling(20).max() - df['Low'].rolling(20).min() + 1e-10)
     fdi = 1.5 - (log_sum_tr - log_hl) / np.log10(20)
@@ -478,6 +478,29 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     
     clv = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / (df['High'] - df['Low'] + 1e-10)
     df['Smart_Money_Flow'] = clv.rolling(window=10).mean()
+    
+    # 🌌 算力充能一：傅里叶变换主导周期 (FFT Dominant Cycle)
+    fft_curr, fft_prev = 0.0, 0.0
+    prices_array = df['Close'].values
+    if len(prices_array) >= 120:
+        p_120 = prices_array[-120:]
+        p_detrend = p_120 - np.mean(p_120)  # 去趋势以消除直流分量
+        fft_res = np.fft.fft(p_detrend)
+        freqs = np.fft.fftfreq(120)
+        
+        pos_idx = np.where(freqs > 0)[0]
+        if len(pos_idx) > 0:
+            peak_idx = pos_idx[np.argmax(np.abs(fft_res[pos_idx]))]
+            dom_freq = freqs[peak_idx]
+            phase = np.angle(fft_res[peak_idx])
+            
+            # 利用傅里叶解构出的频率和相位，逆向映射出当前的纯粹波动位置
+            t_curr, t_prev = 119, 118
+            fft_curr = np.cos(2 * np.pi * dom_freq * t_curr + phase)
+            fft_prev = np.cos(2 * np.pi * dom_freq * t_prev + phase)
+            
+    df['FFT_Wave_Current'] = fft_curr
+    df['FFT_Wave_Prev'] = fft_prev
 
     hist_vol_rolling = df['Volume'].shift(10).rolling(window=50, min_periods=10).quantile(0.8)
     vol_10d_mean = df['Volume'].rolling(window=10, min_periods=1).mean()
@@ -620,19 +643,24 @@ def run_tech_matrix() -> None:
                 if df['Low'].iloc[i] > df['High'].iloc[i-2]:
                     fvg_lower, fvg_upper = df['High'].iloc[i-2], df['Low'].iloc[i]
             
+            # 🌌 算力充能二：量子概率筹码云 (Quantum Probability Cloud - KDE Approximation)
             df_60 = df.iloc[-60:]
-            poc_price = 0.0
-            if not df_60.empty:
+            quantum_upper = 0.0
+            if not df_60.empty and df_60['Volume'].sum() > 0:
+                # 使用成交量加权方差，逼近统计学中的一维高斯核概率密度上限
+                vol_mean = np.average(df_60['Close'], weights=df_60['Volume'])
+                vol_std = np.sqrt(np.average((df_60['Close'] - vol_mean)**2, weights=df_60['Volume']))
+                quantum_upper = vol_mean + vol_std 
+                
                 counts, bins = np.histogram(df_60['Close'], bins=12, weights=df_60['Volume'])
-                max_bin_idx = np.argmax(counts)
-                poc_price = (bins[max_bin_idx] + bins[max_bin_idx+1]) / 2.0
+                poc_price = (bins[np.argmax(counts)] + bins[np.argmax(counts)+1]) / 2.0
             
             sig, factors = [], []
             is_vol = (curr['Volume'] / curr['Vol_MA20'] > 1.5) and (curr['Close'] > curr['Open'])
             triggered = []
 
             # -----------------------------------------------------------
-            # 🚀 世界线飞升：22 维机构行为学与物理学全矩阵
+            # 🚀 赛博飞升：24 维绝对神明矩阵 (24-Dimensional Cyber Matrix)
             # -----------------------------------------------------------
             
             if pd.notna(curr['SMA_200']) and curr['Close'] > curr['SMA_50'] > curr['SMA_150'] > curr['SMA_200']:
@@ -647,14 +675,13 @@ def run_tech_matrix() -> None:
                         fw = get_fw("强相对强度")
                         if fw > 0: triggered.append(("强相对强度", f"⚡ [强相对强度] 跑赢大盘 (权:{fw:.2f}x)", (7 if is_vol else 4) * w_mul * fw))
                     
-                    # 🪐 世界线一：三体引力逃逸 (Pure Alpha Decoupling)
                     ret_stock = m_df['Close_x'].pct_change().dropna()
                     ret_qqq = m_df['Close_y'].pct_change().dropna()
                     cov_matrix = np.cov(ret_stock.iloc[-20:], ret_qqq.iloc[-20:])
                     beta = cov_matrix[0,1] / (cov_matrix[1,1] + 1e-10) if cov_matrix[1,1] > 0 else 1.0
                     recent_stock_ret = ret_stock.iloc[-5:].mean()
                     recent_qqq_ret = ret_qqq.iloc[-5:].mean()
-                    pure_alpha = (recent_stock_ret - beta * recent_qqq_ret) * 252 # 年化剥离特质收益
+                    pure_alpha = (recent_stock_ret - beta * recent_qqq_ret) * 252
                     if pure_alpha > 0.8 and is_vol:
                         fw = get_fw("三体逃逸(Alpha)")
                         if fw > 0: triggered.append(("三体逃逸(Alpha)", f"🪐 [三体逃逸] 剥离大盘 Beta，爆发独立异动引力 (权:{fw:.2f}x)", 18 * w_mul * fw))
@@ -739,17 +766,26 @@ def run_tech_matrix() -> None:
                 fw = get_fw("熵增起爆(Big Bang)")
                 if fw > 0: triggered.append(("熵增起爆(Big Bang)", f"🎇 [熵增起爆] 绝对死寂冰点后的宇宙奇点大爆炸 (权:{fw:.2f}x)", 20 * w_mul * fw))
                 
-            # ⏳ 世界线二：赫斯特长记忆刻痕 (Hurst Exponent Fractal Dimension)
             if curr['Hurst'] > 0.65 and curr['Close'] > curr['EMA_20']:
                 fw = get_fw("赫斯特记忆(Hurst)")
                 if fw > 0: triggered.append(("赫斯特记忆(Hurst)", f"⏳ [赫斯特记忆] H>0.65，突破布朗运动，时空呈现强连续性 (权:{fw:.2f}x)", 15 * w_mul * fw))
 
+            # 🌌 实装：傅里叶周期共振 (FFT) 拦截数学维度的完美波段起点
+            if curr['FFT_Wave_Current'] > 0 and prev['FFT_Wave_Prev'] <= 0 and is_vol:
+                fw = get_fw("傅里叶周期共振(FFT)")
+                if fw > 0: triggered.append(("傅里叶周期共振(FFT)", f"🌊 [傅里叶共振] 跨越数学噪音，精确踩中绝对主导周期起涨相位 (权:{fw:.2f}x)", 18 * w_mul * fw))
+
+            # 🌌 实装：量子概率云突破 (Quantum Probability KDE)
+            if quantum_upper > 0 and prev['Close'] <= quantum_upper < curr['Close'] and is_vol:
+                fw = get_fw("量子概率云(KDE)")
+                if fw > 0: triggered.append(("量子概率云(KDE)", f"☁️ [量子概率云] 极速跃迁突破高斯筹码云层上轨，进入无阻力真空区 (权:{fw:.2f}x)", 18 * w_mul * fw))
+
             score_raw = 0.0
             for tag, text, pts in triggered:
                 adj_pts = pts
-                if regime in ["bear", "range", "hidden_bear"] and tag in ["米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "筹码峰突破", "维特鲁威分形", "CVD筹码净流入", "混沌破缺(Trend)", "三体逃逸(Alpha)", "赫斯特记忆(Hurst)"]:
+                if regime in ["bear", "range", "hidden_bear"] and tag in ["米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "筹码峰突破", "维特鲁威分形", "CVD筹码净流入", "混沌破缺(Trend)", "三体逃逸(Alpha)", "赫斯特记忆(Hurst)", "傅里叶周期共振(FFT)", "量子概率云(KDE)"]:
                     adj_pts *= 0.5  
-                elif regime in ["bull", "rebound"] and tag in ["米奈尔维尼", "维特鲁威分形", "混沌破缺(Trend)", "熵增起爆(Big Bang)", "三体逃逸(Alpha)", "赫斯特记忆(Hurst)"]:
+                elif regime in ["bull", "rebound"] and tag in ["米奈尔维尼", "维特鲁威分形", "混沌破缺(Trend)", "熵增起爆(Big Bang)", "三体逃逸(Alpha)", "赫斯特记忆(Hurst)", "量子概率云(KDE)"]:
                     adj_pts *= 1.2  
                 elif regime in ["bear", "range", "hidden_bear"] and tag in ["SMC失衡区", "流动性扫盘", "口袋支点", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘", "威科夫弹簧(Spring)", "熵增起爆(Big Bang)"]:
                     adj_pts *= 1.5
@@ -788,7 +824,6 @@ def run_tech_matrix() -> None:
             
             ai_prob = 0.52
             if clf_model and factors and hasattr(clf_model, 'classes_') and hasattr(clf_model, 'n_features_in_'):
-                # 动态尺寸兼容锁：如果本地加载的模型是旧维度(比如18)，而我们现在是22维，它将平滑度过，等待周五自我进化出新树
                 if clf_model.n_features_in_ == len(Config.ALL_FACTORS):
                     try:
                         x_row = [1 if f in factors else 0 for f in Config.ALL_FACTORS]
@@ -926,9 +961,9 @@ def run_tech_matrix() -> None:
         
         final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
                         "\n\n---\n\n".join(txts) + \
-                        f"\n\n*(多维跃迁: 三体引力逃逸、赫斯特记忆刻痕与双脑协同网络已全线并入主序)*"
+                        f"\n\n*(赛博飞升: 24维全息矩阵已接通，傅里叶周期与量子概率云正全速推演)*"
         
-        send_alert("量化诸神之战 (世界线展开版)", final_content)
+        send_alert("量化诸神之战 (赛博飞升版)", final_content)
         
         with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
             f.write(json.dumps({"date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", []), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports]}, ensure_ascii=False) + "\n")
@@ -1103,20 +1138,16 @@ def run_backtest_engine() -> None:
             
             sample_weights = np.exp(np.linspace(-2.5, 0, len(y_train)))
             
-            # 🧠 世界线三：双脑协同突变 (Voting Ensemble AI)
-            # 左脑：随机森林 (全局抗噪，防止崩塌)；右脑：梯度提升树 (迭代纠错，深挖特异性偏差)
             rf = RandomForestClassifier(n_estimators=100, max_depth=5, class_weight='balanced', random_state=42)
             gb = GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42)
             
             clf = VotingClassifier(estimators=[('rf', rf), ('gb', gb)], voting='soft')
             
-            # 训练融合大脑并注入时间衰减记忆
             clf.fit(X_train, y_train, sample_weight=sample_weights)
             with open(Config.MODEL_FILE, 'wb') as f:
                 pickle.dump(clf, f)
             logger.info(f"🧠 【双脑协同演化】(Voting Ensemble) 搭载 {len(Config.ALL_FACTORS)} 维神级矩阵已重训落盘。")
             
-            # 提取随机森林子网络的特征重要性用于动态打分体系
             if hasattr(clf, 'named_estimators_') and 'rf' in clf.named_estimators_:
                 importances = clf.named_estimators_['rf'].feature_importances_
                 for factor, imp in zip(Config.ALL_FACTORS, importances):
@@ -1218,11 +1249,11 @@ def run_backtest_engine() -> None:
             icon = ['🔥','🔥','🔥'][idx]
             alert_lines.append(f"- {icon} **{tag}**: 贡献度 {imp*100:.1f}%")
             
-    send_alert("策略终极回测战报 (22维世界线展开版)", "\n".join(alert_lines))
+    send_alert("策略终极回测战报 (24维赛博飞升版)", "\n".join(alert_lines))
 
 if __name__ == "__main__":
     validate_config()
     m = sys.argv[1] if len(sys.argv) > 1 else "matrix"
     if m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "系统已完成三体逃逸与双脑重组！22 维神级矩阵正俯瞰这片金融宇宙。")
+    elif m == "test": send_alert("连通性测试", "赛博飞升完成！24维神级矩阵接入，傅里叶周期与量子概率云已开启绝对感知。")
