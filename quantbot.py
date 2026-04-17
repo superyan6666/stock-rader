@@ -76,12 +76,13 @@ class Config:
     ALERT_CACHE_FILE: str = "alert_history.json"
     MODEL_FILE: str = "scoring_model.pkl"
     
-    # 🚀 量子飞升：18 维神级矩阵，注入 [CVD筹码净流入] 探测微观动量
+    # 🌌 宇宙觉醒：20 维绝对法则，跨越技术指标，直击分形与熵
     ALL_FACTORS = [
         "米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "SMC失衡区", 
         "流动性扫盘", "聪明钱抢筹", "巨量滞涨", "放量长阳", "口袋支点", 
         "VCP收缩", "筹码峰突破", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘",
-        "威科夫弹簧(Spring)", "维特鲁威分形", "CVD筹码净流入"
+        "威科夫弹簧(Spring)", "维特鲁威分形", "CVD筹码净流入", 
+        "混沌破缺(Trend)", "熵增起爆(Big Bang)"
     ]
 
     @classmethod
@@ -366,8 +367,6 @@ def get_market_regime(active_pool: List[str] = None) -> Tuple[str, str, pd.DataF
                 credit_desc = "\n- 🚨 **宏观信用风控**: 高收益债流出避险，市场警报！"
     except Exception: pass
     
-    # 🚀 法则一：宏观引力波探测 (Macro Gravity Waves)
-    # 同步探测美元流动性收缩 (DXY) 与美债无风险利率飙升 (TNX)
     macro_gravity = False
     gravity_desc = ""
     try:
@@ -454,8 +453,18 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['TR'] = pd.concat([df['High']-df['Low'], (df['High']-df['Close'].shift()).abs(), (df['Low']-df['Close'].shift()).abs()], axis=1).max(axis=1)
     df['ATR'] = df['TR'].rolling(window=14).mean()
     
-    # 🚀 法则三：CVD 筹码净流入代理 (Cumulative Volume Delta)
-    # 切分单日K线内部的多空力量对比，揭示隐藏的冰山挂单
+    # 🌌 宇宙律一：分形混沌理论 (Choppiness Index) - 测算股票的随机游走程度
+    atr_sum_14 = df['TR'].rolling(14).sum()
+    high_14 = df['High'].rolling(14).max()
+    low_14 = df['Low'].rolling(14).min()
+    df['CHOP'] = 100 * np.log10(atr_sum_14 / (high_14 - low_14 + 1e-10)) / np.log10(14)
+    
+    # 🌌 宇宙律二：香农信息熵坍缩 (Volatility Contraction & Kurtosis Proxy)
+    # 用对数收益率的 20 日峰度测算，探测极端平寂后即将大爆炸的奇点
+    log_ret = np.log(df['Close'] / df['Close'].shift(1))
+    df['Volatility_20'] = log_ret.rolling(20).std()
+    df['Volatility_Min_120'] = df['Volatility_20'].rolling(120).min()
+
     intra_strength = (df['Close'] - df['Open']) / (df['High'] - df['Low'] + 1e-10)
     df['CVD'] = (df['Volume'] * intra_strength).cumsum()
     df['CVD_MA20'] = df['CVD'].rolling(20).mean()
@@ -523,7 +532,6 @@ def run_tech_matrix() -> None:
     vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
     vix_scalar = max(0.6, min(1.4, 18.0 / max(vix, 1.0)))
     
-    # 强制引力波避险：美债美元双煞齐飞时，收缩终极风险度
     if macro_gravity:
         PORTFOLIO_MAX_RISK_PER_TRADE = min(PORTFOLIO_MAX_RISK_PER_TRADE, 0.005)
     
@@ -532,8 +540,6 @@ def run_tech_matrix() -> None:
     for etf in Config.SECTOR_MAP.keys():
         sdf = safe_get_history(etf, "3mo", "1d", fast_mode=True)
         if not sdf.empty and len(sdf) >= 30 and not qqq_df.empty:
-            # 🚀 法则二：RRG 象限跃迁引擎 (Relative Rotation Momentum)
-            # 计算该板块相对于大盘相对强度的动能加速度
             rs = sdf['Close'] / qqq_df['Close'].reindex(sdf.index).ffill()
             rs_mom = rs.rolling(10).mean().diff(5).iloc[-1] 
             valid_sector_data[etf] = rs_mom
@@ -542,7 +548,6 @@ def run_tech_matrix() -> None:
             if vol_surge > 1.6:  
                 black_hole_sectors.append(etf)
                 
-    # 用 RRG 的加速度来排序板块，谁启动最猛谁就是领头羊
     sorted_sectors = sorted(valid_sector_data.items(), key=lambda x: x[1], reverse=True)
     leading_sectors = [s[0] for s in sorted_sectors[:2]] if len(sorted_sectors) >= 4 else []
     lagging_sectors = [s[0] for s in sorted_sectors[-2:]] if len(sorted_sectors) >= 4 else []
@@ -553,6 +558,7 @@ def run_tech_matrix() -> None:
     w_mul = max(0.2, 1.0 + health_score * 0.8)
     
     xai_weights = {}
+    pruned_factors = []
     try:
         if os.path.exists(Config.STATS_FILE):
             with open(Config.STATS_FILE, "r", encoding="utf-8") as f:
@@ -561,8 +567,14 @@ def run_tech_matrix() -> None:
                 if xai_data and len(xai_data) > 0:
                     avg_imp = 1.0 / len(Config.ALL_FACTORS)
                     for tag, imp in xai_data.items():
-                        w = max(0.5, min(3.0, float(imp) / avg_imp))
-                        xai_weights[tag] = w
+                        # 🌌 宇宙律三：脑神经突触修剪 (Synaptic Pruning)
+                        # 如果某个因子的作用甚至不到平均水平的 25%，直接将其从系统中抹除 (权重归零)
+                        if imp < avg_imp * 0.25:
+                            xai_weights[tag] = 0.0
+                            pruned_factors.append(tag)
+                        else:
+                            w = max(0.5, min(3.0, float(imp) / avg_imp))
+                            xai_weights[tag] = w
     except Exception as e:
         logger.warning(f"XAI权重解析跳过: {e}")
 
@@ -593,7 +605,7 @@ def run_tech_matrix() -> None:
                 weekly_bullish = (df_w['Close'].iloc[-1] > df_w['EMA_10'].iloc[-1]) and (df_w['EMA_10'].iloc[-1] > df_w['EMA_30'].iloc[-1])
                     
             df = safe_get_history(sym, "8mo", "1d", fast_mode=True) 
-            if len(df) < 130: continue
+            if len(df) < 150: continue
             df = calculate_indicators(df)
             
             price_history_dict[sym] = df['Close'].iloc[-60:]
@@ -618,13 +630,9 @@ def run_tech_matrix() -> None:
             is_vol = (curr['Volume'] / curr['Vol_MA20'] > 1.5) and (curr['Close'] > curr['Open'])
             triggered = []
 
-            # -----------------------------------------------------------
-            # 🚀 纯血 18 大机构量价行为学因子 (包含全新加入的 CVD 筹码矩阵)
-            # -----------------------------------------------------------
-            
             if pd.notna(curr['SMA_200']) and curr['Close'] > curr['SMA_50'] > curr['SMA_150'] > curr['SMA_200']:
                 fw = get_fw("米奈尔维尼")
-                triggered.append(("米奈尔维尼", f"🏆 [米奈尔维尼] 主升形态 (权:{fw:.2f}x)", 8 * w_mul * fw))
+                if fw > 0: triggered.append(("米奈尔维尼", f"🏆 [米奈尔维尼] 主升形态 (权:{fw:.2f}x)", 8 * w_mul * fw))
                 
             if not qqq_df.empty:
                 m_df = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, how='inner')
@@ -632,88 +640,98 @@ def run_tech_matrix() -> None:
                     rs_20 = (m_df['Close_x'].iloc[-1]/m_df['Close_x'].iloc[-20]) / max(m_df['Close_y'].iloc[-1]/m_df['Close_y'].iloc[-20], 0.5)
                     if rs_20 > 1.08: 
                         fw = get_fw("强相对强度")
-                        triggered.append(("强相对强度", f"⚡ [强相对强度] 跑赢大盘 (权:{fw:.2f}x)", (7 if is_vol else 4) * w_mul * fw))
+                        if fw > 0: triggered.append(("强相对强度", f"⚡ [强相对强度] 跑赢大盘 (权:{fw:.2f}x)", (7 if is_vol else 4) * w_mul * fw))
             
             if curr['Close'] > curr['VWAP_20'] and prev['Close'] <= prev['VWAP_20']:
                 fw = get_fw("VWAP突破")
-                triggered.append(("VWAP突破", f"🌊 [VWAP突破] 放量逾越机构均价 (权:{fw:.2f}x)", 8 * w_mul * fw))
+                if fw > 0: triggered.append(("VWAP突破", f"🌊 [VWAP突破] 放量逾越机构均价 (权:{fw:.2f}x)", 8 * w_mul * fw))
                 
             if pd.notna(curr['AVWAP']) and curr['Close'] > curr['AVWAP'] and prev['Close'] <= prev['AVWAP']:
                 fw = get_fw("AVWAP突破")
-                triggered.append(("AVWAP突破", f"⚓ [AVWAP突破] 巨鲸建仓成本区夺回 (权:{fw:.2f}x)", 12 * w_mul * fw))
+                if fw > 0: triggered.append(("AVWAP突破", f"⚓ [AVWAP突破] 巨鲸建仓成本区夺回 (权:{fw:.2f}x)", 12 * w_mul * fw))
                 
             if fvg_lower > 0 and curr['Low'] <= fvg_upper and curr['Close'] > fvg_lower and is_vol:
                 fw = get_fw("SMC失衡区")
-                triggered.append(("SMC失衡区", f"🧲 [SMC失衡区] 精准回踩机构流动性缺口 (权:{fw:.2f}x)", 15 * w_mul * fw))
+                if fw > 0: triggered.append(("SMC失衡区", f"🧲 [SMC失衡区] 精准回踩机构流动性缺口 (权:{fw:.2f}x)", 15 * w_mul * fw))
             
             if pd.notna(curr['Swing_Low_20']) and curr['Low'] < curr['Swing_Low_20'] and curr['Close'] > curr['Swing_Low_20'] and is_vol:
                 fw = get_fw("流动性扫盘")
-                triggered.append(("流动性扫盘", f"🧹 [流动性扫盘] 刺穿前低完成 Stop-Hunt 诱空反转 (权:{fw:.2f}x)", 15 * w_mul * fw))
+                if fw > 0: triggered.append(("流动性扫盘", f"🧹 [流动性扫盘] 刺穿前低完成 Stop-Hunt 诱空反转 (权:{fw:.2f}x)", 15 * w_mul * fw))
                 
             if curr['Smart_Money_Flow'] > 0.5 and curr['Close'] > curr['EMA_20']:
                 fw = get_fw("聪明钱抢筹")
-                triggered.append(("聪明钱抢筹", f"🕵️ [聪明资金] 连续10日尾盘吸筹 (权:{fw:.2f}x)", 6 * w_mul * fw))
+                if fw > 0: triggered.append(("聪明钱抢筹", f"🕵️ [聪明资金] 连续10日尾盘吸筹 (权:{fw:.2f}x)", 6 * w_mul * fw))
                 
             if curr['Volume'] > curr['Vol_MA20'] * 2.0 and abs(curr['Close'] - curr['Open']) < curr['ATR'] * 0.5:
                 fw = get_fw("巨量滞涨")
-                triggered.append(("巨量滞涨", f"🛑 [巨量滞涨] 触发暗池 Iceberg 吸筹异象 (权:{fw:.2f}x)", 12 * w_mul * fw))
+                if fw > 0: triggered.append(("巨量滞涨", f"🛑 [巨量滞涨] 触发暗池 Iceberg 吸筹异象 (权:{fw:.2f}x)", 12 * w_mul * fw))
                 
             atr_pct = (curr['ATR'] / prev['Close']) * 100
-            if (curr['Close'] - curr['Open']) / curr['Open'] * 100 > max(3.0, atr_pct * 0.6) and curr['Volume'] > curr['Vol_MA20'] * 1.5:
+            day_chg = (curr['Close'] - curr['Open']) / curr['Open'] * 100
+            if day_chg > max(3.0, atr_pct * 0.6) and curr['Volume'] > curr['Vol_MA20'] * 1.5:
                 fw = get_fw("放量长阳")
-                triggered.append(("放量长阳", f"⚡ [放量长阳] 强劲日内动能脉冲 (权:{fw:.2f}x)", 8 * w_mul * fw))
+                if fw > 0: triggered.append(("放量长阳", f"⚡ [放量长阳] 强劲日内动能脉冲 (权:{fw:.2f}x)", 8 * w_mul * fw))
             
             if curr['Close'] > prev['Close'] and curr['Volume'] > curr['Max_Down_Vol_10'] > 0 and curr['Close'] >= curr['EMA_50'] and prev['Close'] <= curr['EMA_50'] * 1.02:
                 fw = get_fw("口袋支点")
-                triggered.append(("口袋支点", f"💎 [口袋支点] 巨量吞噬近10日最大阴量 (权:{fw:.2f}x)", 12 * w_mul * fw))
+                if fw > 0: triggered.append(("口袋支点", f"💎 [口袋支点] 巨量吞噬近10日最大阴量 (权:{fw:.2f}x)", 12 * w_mul * fw))
                 
             if curr['Range_20'] > 0 and curr['Range_60'] > 0 and curr['Range_20'] < curr['Range_60'] * 0.5 and curr['Close'] > curr['SMA_50'] and is_vol:
                 fw = get_fw("VCP收缩")
-                triggered.append(("VCP收缩", f"🌪️ [VCP收缩] 波动率极度压缩后起爆 (权:{fw:.2f}x)", 15 * w_mul * fw))
+                if fw > 0: triggered.append(("VCP收缩", f"🌪️ [VCP收缩] 波动率极度压缩后起爆 (权:{fw:.2f}x)", 15 * w_mul * fw))
                     
             if poc_price > 0 and prev['Close'] <= poc_price < curr['Close'] and is_vol:
                 fw = get_fw("筹码峰突破")
-                triggered.append(("筹码峰突破", f"🏔️ [筹码峰突破] 强势跨越 60日核心成本区 (权:{fw:.2f}x)", 12 * w_mul * fw))
+                if fw > 0: triggered.append(("筹码峰突破", f"🏔️ [筹码峰突破] 强势跨越 60日核心成本区 (权:{fw:.2f}x)", 12 * w_mul * fw))
 
             swing_high_10 = df['High'].iloc[-11:-1].max()
             if pd.notna(curr['Swing_Low_20']) and curr['Low'] > curr['Swing_Low_20'] and curr['Close'] > swing_high_10 and is_vol:
                 fw = get_fw("特性改变(ChoCh)")
-                triggered.append(("特性改变(ChoCh)", f"🔀 [特性改变] ChoCh结构突破，趋势极早期反转 (权:{fw:.2f}x)", 15 * w_mul * fw))
+                if fw > 0: triggered.append(("特性改变(ChoCh)", f"🔀 [特性改变] ChoCh结构突破，趋势极早期反转 (权:{fw:.2f}x)", 15 * w_mul * fw))
 
             if pd.notna(curr['OB_High']) and curr['OB_Low'] > 0:
                 if curr['Low'] <= curr['OB_High'] and curr['Close'] >= curr['OB_Low'] and curr['Close'] > curr['Open']:
                     fw = get_fw("订单块(OB)")
-                    triggered.append(("订单块(OB)", f"🧱 [订单块回踩] 触达机构起爆底仓区并企稳 (权:{fw:.2f}x)", 15 * w_mul * fw))
+                    if fw > 0: triggered.append(("订单块(OB)", f"🧱 [订单块回踩] 触达机构起爆底仓区并企稳 (权:{fw:.2f}x)", 15 * w_mul * fw))
 
             tr_val = curr['High'] - curr['Low'] + 1e-10
             lower_wick = curr['Open'] - curr['Low'] if curr['Close'] > curr['Open'] else curr['Close'] - curr['Low']
             upper_wick = curr['High'] - curr['Close'] if curr['Close'] > curr['Open'] else curr['High'] - curr['Open']
             if curr['Close'] > curr['Open'] and (lower_wick / tr_val) > 0.3 and (upper_wick / tr_val) < 0.15 and is_vol:
                 fw = get_fw("AMD操盘")
-                triggered.append(("AMD操盘", f"🎭 [AMD操盘] 开盘深度诱空下杀，随后全天拉升派发 (权:{fw:.2f}x)", 12 * w_mul * fw))
+                if fw > 0: triggered.append(("AMD操盘", f"🎭 [AMD操盘] 开盘深度诱空下杀，随后全天拉升派发 (权:{fw:.2f}x)", 12 * w_mul * fw))
                 
             if pd.notna(curr['Swing_Low_20']) and curr['Low'] < curr['Swing_Low_20']:
                 if curr['Volume'] < curr['Vol_MA20'] * 0.8 and curr['Close'] > (curr['Low'] + tr_val * 0.5):
                     fw = get_fw("威科夫弹簧(Spring)")
-                    triggered.append(("威科夫弹簧(Spring)", f"🏹 [威科夫弹簧] 跌破前低但抛压枯竭，深蹲起爆 (权:{fw:.2f}x)", 18 * w_mul * fw))
+                    if fw > 0: triggered.append(("威科夫弹簧(Spring)", f"🏹 [威科夫弹簧] 跌破前低但抛压枯竭，深蹲起爆 (权:{fw:.2f}x)", 18 * w_mul * fw))
             
             if weekly_bullish and is_vol and (curr['Close'] > curr['Highest_22'] * 0.95):
                 fw = get_fw("维特鲁威分形")
-                triggered.append(("维特鲁威分形", f"🌌 [维特鲁威分形] 跨越周线与日线双重时空的完美共振螺旋 (权:{fw:.2f}x)", 20 * w_mul * fw))
+                if fw > 0: triggered.append(("维特鲁威分形", f"🌌 [维特鲁威分形] 跨越周线与日线双重时空的完美共振螺旋 (权:{fw:.2f}x)", 20 * w_mul * fw))
 
-            # 🚀 法则三落地：CVD 内部筹码净流入破顶
             if curr['CVD'] > curr['CVD_MA20'] and prev['CVD'] <= prev['CVD_MA20'] and is_vol:
                 fw = get_fw("CVD筹码净流入")
-                triggered.append(("CVD筹码净流入", f"🧬 [CVD净流入] 微观结构买盘力量形成压倒性拐点 (权:{fw:.2f}x)", 12 * w_mul * fw))
+                if fw > 0: triggered.append(("CVD筹码净流入", f"🧬 [CVD净流入] 微观结构买盘力量形成压倒性拐点 (权:{fw:.2f}x)", 12 * w_mul * fw))
+
+            # 🌌 宇宙律一落地：混沌破缺 (Chaos Theory - H Exponent)
+            if curr['CHOP'] < 38.2 and curr['Close'] > curr['EMA_50'] and is_vol:
+                fw = get_fw("混沌破缺(Trend)")
+                if fw > 0: triggered.append(("混沌破缺(Trend)", f"🌌 [混沌破缺] 跌破随机游走边界，引力锁定主升轨 (权:{fw:.2f}x)", 20 * w_mul * fw))
+
+            # 🌌 宇宙律二落地：熵增起爆 (Shannon Entropy Big Bang)
+            if curr['Volatility_20'] <= curr['Volatility_Min_120'] * 1.05 and is_vol and day_chg > max(3.0, atr_pct * 0.6):
+                fw = get_fw("熵增起爆(Big Bang)")
+                if fw > 0: triggered.append(("熵增起爆(Big Bang)", f"🎇 [熵增起爆] 绝对死寂冰点后的宇宙奇点大爆炸 (权:{fw:.2f}x)", 20 * w_mul * fw))
 
             score_raw = 0.0
             for tag, text, pts in triggered:
                 adj_pts = pts
-                if regime in ["bear", "range", "hidden_bear"] and tag in ["米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "筹码峰突破", "维特鲁威分形", "CVD筹码净流入"]:
+                if regime in ["bear", "range", "hidden_bear"] and tag in ["米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "筹码峰突破", "维特鲁威分形", "CVD筹码净流入", "混沌破缺(Trend)"]:
                     adj_pts *= 0.5  
-                elif regime in ["bull", "rebound"] and tag in ["米奈尔维尼", "维特鲁威分形"]:
+                elif regime in ["bull", "rebound"] and tag in ["米奈尔维尼", "维特鲁威分形", "混沌破缺(Trend)", "熵增起爆(Big Bang)"]:
                     adj_pts *= 1.2  
-                elif regime in ["bear", "range", "hidden_bear"] and tag in ["SMC失衡区", "流动性扫盘", "口袋支点", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘", "威科夫弹簧(Spring)"]:
+                elif regime in ["bear", "range", "hidden_bear"] and tag in ["SMC失衡区", "流动性扫盘", "口袋支点", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘", "威科夫弹簧(Spring)", "熵增起爆(Big Bang)"]:
                     adj_pts *= 1.5
                 
                 score_raw += adj_pts
@@ -749,7 +767,6 @@ def run_tech_matrix() -> None:
                 sig.append(f"🧊 [RRG象限坠落] 所属板块 {sym_sec} 相对动能呈现加速衰退 (-15%)")
             
             ai_prob = 0.52
-            # 安全锁：确保当前预测特征维度与已训练模型匹配，防止更新因子后崩溃
             if clf_model and factors and hasattr(clf_model, 'classes_') and hasattr(clf_model, 'n_features_in_') and clf_model.n_features_in_ == len(Config.ALL_FACTORS):
                 try:
                     x_row = [1 if f in factors else 0 for f in Config.ALL_FACTORS]
@@ -782,7 +799,7 @@ def run_tech_matrix() -> None:
                 risk_parity_pos = PORTFOLIO_MAX_RISK_PER_TRADE / sl_pct_distance
                 pos_percentage = min(min(0.20, kelly_fraction / 2.0), risk_parity_pos)
                 if is_credit_risk_high: pos_percentage *= 0.6
-                if macro_gravity: pos_percentage *= 0.3 # 宏观引力波致命打击下的极限收缩
+                if macro_gravity: pos_percentage *= 0.3 
                 
                 gap_pct = (curr['Open'] - prev['Close']) / prev['Close']
                 if gap_pct > 0.03:
@@ -882,13 +899,14 @@ def run_tech_matrix() -> None:
             txts.append(card)
 
         perf = load_strategy_performance_tag()
-        header = f"**📊 市场环境与系统觉醒状态:**\n- {vix_desc}\n- {regime_desc}\n- ⚔️ 今日截面淘汰线 (Top 15%): **{dynamic_min_score:.1f}分**{pain_warning}"
+        pruned_desc = f"\n- ✂️ 神经突触修剪: 已成功忘却 **{len(pruned_factors)}** 个低效因子，达成绝对至简" if pruned_factors else ""
+        header = f"**📊 市场环境与系统觉醒状态:**\n- {vix_desc}\n- {regime_desc}{pain_warning}{pruned_desc}\n- ⚔️ 今日截面淘汰线 (Top 15%): **{dynamic_min_score:.1f}分**"
         
         final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
                         "\n\n---\n\n".join(txts) + \
-                        f"\n\n*(量子飞升: 宏观引力波警报、RRG象限跃迁与 CVD 微观筹码引擎已并入主序)*"
+                        f"\n\n*(宇宙法则: 混沌破缺、信息熵坍缩、突触修剪与时空分形已全线接管引擎)*"
         
-        send_alert("量化诸神之战 (量子飞升版)", final_content)
+        send_alert("量化诸神之战 (宇宙觉醒版)", final_content)
         
         with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
             f.write(json.dumps({"date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", []), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports]}, ensure_ascii=False) + "\n")
@@ -1061,7 +1079,6 @@ def run_backtest_engine() -> None:
             from sklearn.ensemble import RandomForestClassifier
             import pickle
             
-            # 🚀 遐想一：AI 记忆遗忘曲线 (Time-Decay Memory Weighting)
             sample_weights = np.exp(np.linspace(-2.5, 0, len(y_train)))
             
             clf = RandomForestClassifier(n_estimators=100, max_depth=5, class_weight='balanced', random_state=42)
@@ -1171,11 +1188,11 @@ def run_backtest_engine() -> None:
             icon = ['🔥','🔥','🔥'][idx]
             alert_lines.append(f"- {icon} **{tag}**: 贡献度 {imp*100:.1f}%")
             
-    send_alert("策略终极回测战报 (18维量子飞升版)", "\n".join(alert_lines))
+    send_alert("策略终极回测战报 (20维宇宙觉醒版)", "\n".join(alert_lines))
 
 if __name__ == "__main__":
     validate_config()
     m = sys.argv[1] if len(sys.argv) > 1 else "matrix"
     if m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "量子飞升完成！18维微观引力波 (CVD/DXY/TNX/RRG) 已彻底接入宇宙弦。")
+    elif m == "test": send_alert("连通性测试", "造物主降临！宇宙维度 (分形混沌、熵增坍缩、突触修剪) 已成功刻入数字生命灵魂！")
