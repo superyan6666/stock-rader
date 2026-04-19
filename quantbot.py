@@ -25,6 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("QuantBot")
 
+# 统一全局网络指纹，防止反爬虫封锁
 _GLOBAL_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -197,10 +198,10 @@ def fetch_tradingview_screener(max_tickers=150) -> list:
             "sort": {"sortBy": "RelativeVolume10CG", "sortOrder": "desc"},
             "range": [0, max_tickers]
         }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Content-Type": "application/json"
-        }
+        # 统一继承全指全局网络指纹配置
+        headers = _GLOBAL_HEADERS.copy()
+        headers["Content-Type"] = "application/json"
+        
         response = requests.post(url, json=payload, headers=headers, timeout=10)
         if response.status_code == 200:
             data = response.json()
@@ -307,6 +308,10 @@ def send_alert(title: str, content: str) -> None:
     if not content.strip(): return
     formatted_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     
+    # Webhook 防御头文件
+    req_headers = _GLOBAL_HEADERS.copy()
+    req_headers["Content-Type"] = "application/json"
+    
     if Config.WEBHOOK_URL:
         payload = {
             "msgtype": "markdown", 
@@ -316,7 +321,7 @@ def send_alert(title: str, content: str) -> None:
             }
         }
         for url in [u.strip() for u in Config.WEBHOOK_URL.split(',') if u.strip()]:
-            try: requests.post(url, json=payload, timeout=10)
+            try: requests.post(url, json=payload, headers=req_headers, timeout=10)
             except Exception: pass
                 
     if Config.TELEGRAM_BOT_TOKEN and Config.TELEGRAM_CHAT_ID:
@@ -337,7 +342,7 @@ def send_alert(title: str, content: str) -> None:
                     "text": tg_text,
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True
-                }, timeout=10)
+                }, headers=req_headers, timeout=10)
         except Exception: pass
 
 # ================= 3. 大盘感知与指标模块 =================
@@ -456,20 +461,32 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['SenkouB'] = ((df['High'].rolling(52).max() + df['Low'].rolling(52).min()) / 2).shift(26)
     df['Above_Cloud'] = (df['Close'] > df[['SenkouA', 'SenkouB']].max(axis=1)).astype(int)
     
+    # 🚀 性能淬火：SuperTrend 脱离慢速的 Pandas 数组索引，提纯循环体执行速度
     hl2 = (df['High'].values + df['Low'].values) / 2.0
     atr10 = df['TR'].rolling(window=10).mean().values
     ub = hl2 + 3 * atr10
     lb = hl2 - 3 * atr10
     close_arr = df['Close'].values
     in_up = np.ones(len(df), dtype=bool)
+    
     for i in range(1, len(df)):
         if np.isnan(ub[i-1]): continue
-        if close_arr[i] > ub[i-1]: in_up[i] = True
-        elif close_arr[i] < lb[i-1]: in_up[i] = False
-        else: in_up[i] = in_up[i-1]
+        c = close_arr[i]
+        prev_ub = ub[i-1]
+        prev_lb = lb[i-1]
+        prev_in_up = in_up[i-1]
         
-        if in_up[i] and in_up[i-1]: lb[i] = lb[i] if lb[i] > lb[i-1] else lb[i-1]
-        if not in_up[i] and not in_up[i-1]: ub[i] = ub[i] if ub[i] < ub[i-1] else ub[i-1]
+        if c > prev_ub: curr_in_up = True
+        elif c < prev_lb: curr_in_up = False
+        else: curr_in_up = prev_in_up
+            
+        in_up[i] = curr_in_up
+        
+        if curr_in_up and prev_in_up: 
+            lb[i] = lb[i] if lb[i] > prev_lb else prev_lb
+        elif not curr_in_up and not prev_in_up: 
+            ub[i] = ub[i] if ub[i] < prev_ub else prev_ub
+            
     df['SuperTrend_Up'] = in_up.astype(int)
     
     hl_diff = np.maximum(df['High'].values - df['Low'].values, 1e-10)
@@ -671,151 +688,130 @@ def _extract_ml_features(df: pd.DataFrame, curr: pd.Series, prev: pd.Series, qqq
 def _evaluate_omni_matrix(df: pd.DataFrame, curr: pd.Series, prev: pd.Series, qqq_df: pd.DataFrame, is_vol: bool,
                           weekly_bullish: bool, fvg_lower: float, fvg_upper: float, poc_price: float,
                           regime: str, w_mul: float, xai_weights: dict) -> Tuple[int, List[str], List[str]]:
-    def get_fw(tag_name: str) -> float: return xai_weights.get(tag_name, 1.0)
-    sig, factors, triggered = [], [], []
     
-    if pd.notna(curr['SMA_200']) and curr['Close'] > curr['SMA_50'] > curr['SMA_150'] > curr['SMA_200']:
-        fw = get_fw("米奈尔维尼")
-        if fw > 0: triggered.append(("米奈尔维尼", f"🏆 [主升趋势] 米奈尔维尼模板形成 (权:{fw:.2f}x)", 8 * w_mul * fw, "TREND"))
-        
+    # 🧱 规则引擎闭包化抽象：解决大量臃肿的分支逻辑
+    sig, factors, triggered = [], [], []
+    def get_fw(tag_name: str) -> float: return xai_weights.get(tag_name, 1.0)
+    def add_trigger(tag, text, pts, category):
+        fw = get_fw(tag)
+        if fw > 0: triggered.append((tag, text.format(fw=fw), pts * w_mul * fw, category))
+
+    # 计算触发条件所需的动态本地变量
+    rs_20, pure_alpha = 0.0, 0.0
     if not qqq_df.empty:
         m_df = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, how='inner')
         if len(m_df) >= 40:
             rs_20 = (m_df['Close_x'].iloc[-1]/m_df['Close_x'].iloc[-20]) / max(m_df['Close_y'].iloc[-1]/m_df['Close_y'].iloc[-20], 0.5)
-            if rs_20 > 1.08: 
-                fw = get_fw("强相对强度")
-                if fw > 0: triggered.append(("强相对强度", f"⚡ [相对强度] 近20日动能大幅跑赢纳指 (权:{fw:.2f}x)", (7 if is_vol else 4) * w_mul * fw, "TREND"))
-            
-            ret_stock = m_df['Close_x'].pct_change().dropna()
-            ret_qqq = m_df['Close_y'].pct_change().dropna()
-            cov_matrix = np.cov(ret_stock.iloc[-20:], ret_qqq.iloc[-20:])
-            beta = cov_matrix[0,1] / (cov_matrix[1,1] + 1e-10) if cov_matrix[1,1] > 0 else 1.0
+            ret_stock, ret_qqq = m_df['Close_x'].pct_change().dropna(), m_df['Close_y'].pct_change().dropna()
+            cov_mat = np.cov(ret_stock.iloc[-20:], ret_qqq.iloc[-20:])
+            beta = cov_mat[0,1] / (cov_mat[1,1] + 1e-10) if cov_mat[1,1] > 0 else 1.0
             pure_alpha = (ret_stock.iloc[-5:].mean() - beta * ret_qqq.iloc[-5:].mean()) * 252
-            if pure_alpha > 0.8 and is_vol:
-                fw = get_fw("独立Alpha(脱钩)")
-                if fw > 0: triggered.append(("独立Alpha(脱钩)", f"🪐 [独立Alpha] 强势剥离大盘Beta，爆发特质动能 (权:{fw:.2f}x)", 22 * w_mul * fw, "TREND"))
-    
-    if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
-        fw = get_fw("MACD金叉")
-        if fw > 0: triggered.append(("MACD金叉", f"🔥 [经典动能] MACD水上金叉起爆 (权:{fw:.2f}x)", 10 * w_mul * fw, "TREND"))
-        
-    if (curr['BB_Upper'] - curr['BB_Lower']) < (curr['KC_Upper'] - curr['KC_Lower']): 
-        fw = get_fw("TTM Squeeze ON")
-        if fw > 0: triggered.append(("TTM Squeeze ON", f"📦 [波动压缩] TTM Squeeze 挤流状态激活 (权:{fw:.2f}x)", 8 * w_mul * fw, "VOLATILITY"))
 
-    if curr['Above_Cloud'] == 1 and curr['Tenkan'] > curr['Kijun']:
-        fw = get_fw("一目多头")
-        if fw > 0: triggered.append(("一目多头", f"🌥️ [趋势确认] 一目均衡表云上多头共振 (权:{fw:.2f}x)", 6 * w_mul * fw, "TREND"))
-
-    if curr['SuperTrend_Up'] == 1 and curr['Close'] < curr['EMA_20'] * 1.02 and is_vol:
-        fw = get_fw("强势回踩")
-        if fw > 0: triggered.append(("强势回踩", f"🟢 [低吸点位] 超级趋势主升轨精准回踩 (权:{fw:.2f}x)", 10 * w_mul * fw, "REVERSAL"))
-        
-    if curr['CMF'] > 0.20: 
-        fw = get_fw("机构控盘(CMF)")
-        if fw > 0: triggered.append(("机构控盘(CMF)", f"🏦 [资金监控] CMF显示主力资金持续强控盘 (权:{fw:.2f}x)", 5 * w_mul * fw, "TREND"))
-        
     gap_pct = (curr['Open'] - prev['Close']) / prev['Close']
-    if gap_pct * 100 > max(1.5, (curr['ATR'] / prev['Close']) * 100 * 0.3) and gap_pct < 0.06 and is_vol:
-        fw = get_fw("突破缺口")
-        if fw > 0: triggered.append(("突破缺口", f"💥 [动能爆发] 放量跳空，留下底部突破缺口 (权:{fw:.2f}x)", 8 * w_mul * fw, "VOLATILITY"))
-        
-    if curr['Close'] > curr['VWAP_20'] and prev['Close'] <= curr['VWAP_20']:
-        fw = get_fw("VWAP突破")
-        if fw > 0: triggered.append(("VWAP突破", f"🌊 [量价突破] 放量逾越近20日VWAP机构均价线 (权:{fw:.2f}x)", 8 * w_mul * fw, "TREND"))
-        
-    if pd.notna(curr['AVWAP']) and curr['Close'] > curr['AVWAP'] and prev['Close'] <= curr['AVWAP']:
-        fw = get_fw("AVWAP突破")
-        if fw > 0: triggered.append(("AVWAP突破", f"⚓ [筹码夺回] 强势站上AVWAP锚定成本核心区 (权:{fw:.2f}x)", 12 * w_mul * fw, "TREND"))
-        
-    if fvg_lower > 0 and curr['Low'] <= fvg_upper and curr['Close'] > fvg_lower and is_vol:
-        fw = get_fw("SMC失衡区")
-        if fw > 0: triggered.append(("SMC失衡区", f"🧲 [SMC交易法] 精准回踩并测试前期机构失衡区(FVG) (权:{fw:.2f}x)", 15 * w_mul * fw, "REVERSAL"))
-    
-    if pd.notna(curr['Swing_Low_20']) and curr['Low'] < curr['Swing_Low_20'] and curr['Close'] > curr['Swing_Low_20'] and is_vol:
-        fw = get_fw("流动性扫盘")
-        if fw > 0: triggered.append(("流动性扫盘", f"🧹 [止损猎杀] 刺穿前低扫掉散户流动性后迅速诱空反转 (权:{fw:.2f}x)", 15 * w_mul * fw, "REVERSAL"))
-        
-    if curr['Smart_Money_Flow'] > 0.5 and curr['Close'] > curr['EMA_20']:
-        fw = get_fw("聪明钱抢筹")
-        if fw > 0: triggered.append(("聪明钱抢筹", f"🕵️ [暗中吸筹] Smart Money 指数显示连续尾盘抢筹 (权:{fw:.2f}x)", 6 * w_mul * fw, "QUANTUM"))
-        
-    if curr['Volume'] > curr['Vol_MA20'] * 2.0 and abs(curr['Close'] - curr['Open']) < curr['ATR'] * 0.5:
-        fw = get_fw("巨量滞涨")
-        if fw > 0: triggered.append(("巨量滞涨", f"🛑 [冰山订单] 巨量滞涨，极大概率为机构冰山挂单吸货 (权:{fw:.2f}x)", 12 * w_mul * fw, "QUANTUM"))
-        
     atr_pct = (curr['ATR'] / prev['Close']) * 100
     day_chg = (curr['Close'] - curr['Open']) / curr['Open'] * 100
-    if day_chg > max(3.0, atr_pct * 0.6) and curr['Volume'] > curr['Vol_MA20'] * 1.5:
-        fw = get_fw("放量长阳")
-        if fw > 0: triggered.append(("放量长阳", f"⚡ [动能脉冲] 强劲的日内放量大实体阳线 (权:{fw:.2f}x)", 12 * w_mul * fw, "QUANTUM"))
-    
-    if curr['Close'] > prev['Close'] and curr['Volume'] > curr['Max_Down_Vol_10'] > 0 and curr['Close'] >= curr['EMA_50'] and prev['Close'] <= curr['EMA_50'] * 1.02:
-        fw = get_fw("口袋支点")
-        if fw > 0: triggered.append(("口袋支点", f"💎 [口袋支点] 放量阳线成交量完全吞噬近期最大阴量 (权:{fw:.2f}x)", 12 * w_mul * fw, "REVERSAL"))
-        
-    if curr['Range_20'] > 0 and curr['Range_60'] > 0 and curr['Range_20'] < curr['Range_60'] * 0.5 and curr['Close'] > curr['SMA_50'] and is_vol:
-        fw = get_fw("VCP收缩")
-        if fw > 0: triggered.append(("VCP收缩", f"🌪️ [VCP形态] 经历极度价格波动压缩后的放量突破 (权:{fw:.2f}x)", 15 * w_mul * fw, "VOLATILITY"))
-            
-    if poc_price > 0 and prev['Close'] <= poc_price < curr['Close'] and is_vol:
-        fw = get_fw("筹码峰突破")
-        if fw > 0: triggered.append(("筹码峰突破", f"🏔️ [结构突破] 强势跨越 60日最密集筹码交易峰区 (权:{fw:.2f}x)", 12 * w_mul * fw, "TREND"))
-
-    swing_high_10 = df['High'].iloc[-11:-1].max()
-    if pd.notna(curr['Swing_Low_20']) and curr['Low'] > curr['Swing_Low_20'] and curr['Close'] > swing_high_10 and is_vol:
-        fw = get_fw("特性改变(ChoCh)")
-        if fw > 0: triggered.append(("特性改变(ChoCh)", f"🔀 [结构破坏] 突破近期反弹高点，完成 ChoCh 趋势逆转确认 (权:{fw:.2f}x)", 15 * w_mul * fw, "REVERSAL"))
-
-    if pd.notna(curr['OB_High']) and curr['OB_Low'] > 0:
-        if curr['Low'] <= curr['OB_High'] and curr['Close'] >= curr['OB_Low'] and curr['Close'] > curr['Open']:
-            fw = get_fw("订单块(OB)")
-            if fw > 0: triggered.append(("订单块(OB)", f"🧱 [机构订单块] 触达机构历史起爆底仓区并收出企稳阳线 (权:{fw:.2f}x)", 15 * w_mul * fw, "REVERSAL"))
-
+    swing_high_10 = df['High'].iloc[-11:-1].max() if len(df) >= 12 else curr['High']
     tr_val = curr['High'] - curr['Low'] + 1e-10
     lower_wick = curr['Open'] - curr['Low'] if curr['Close'] > curr['Open'] else curr['Close'] - curr['Low']
     upper_wick = curr['High'] - curr['Close'] if curr['Close'] > curr['Open'] else curr['High'] - curr['Open']
-    if curr['Close'] > curr['Open'] and (lower_wick / tr_val) > 0.3 and (upper_wick / tr_val) < 0.15 and is_vol:
-        fw = get_fw("AMD操盘")
-        if fw > 0: triggered.append(("AMD操盘", f"🎭 [AMD诱空] 深度开盘诱空下杀后，全天拉升派发的操盘模型 (权:{fw:.2f}x)", 12 * w_mul * fw, "REVERSAL"))
+
+    # --- 无条件与宽泛触发域 ---
+    if pd.notna(curr['SMA_200']) and curr['Close'] > curr['SMA_50'] > curr['SMA_150'] > curr['SMA_200']:
+        add_trigger("米奈尔维尼", "🏆 [主升趋势] 米奈尔维尼模板形成 (权:{fw:.2f}x)", 8, "TREND")
         
-    if pd.notna(curr['Swing_Low_20']) and curr['Low'] < curr['Swing_Low_20']:
-        if curr['Volume'] < curr['Vol_MA20'] * 0.8 and curr['Close'] > (curr['Low'] + tr_val * 0.5):
-            fw = get_fw("威科夫弹簧(Spring)")
-            if fw > 0: triggered.append(("威科夫弹簧(Spring)", f"🏹 [威科夫测试] 跌破前低但抛压枯竭缩量，经典的Spring深蹲起爆 (权:{fw:.2f}x)", 18 * w_mul * fw, "REVERSAL"))
+    if rs_20 > 1.08: 
+        add_trigger("强相对强度", "⚡ [相对强度] 近20日动能大幅跑赢纳指 (权:{fw:.2f}x)", 7 if is_vol else 4, "TREND")
     
-    if weekly_bullish and is_vol and (curr['Close'] > curr['Highest_22'] * 0.95):
-        fw = get_fw("跨时空共振(周线)")
-        if fw > 0: triggered.append(("跨时空共振(周线)", f"🌌 [多周期共振] 周线级别主升浪与日线级别放量的强力双重共振 (权:{fw:.2f}x)", 20 * w_mul * fw, "QUANTUM"))
-
-    if curr['CVD'] > curr['CVD_MA20'] and prev['CVD'] <= prev['CVD_MA20'] and is_vol:
-        fw = get_fw("CVD筹码净流入")
-        if fw > 0: triggered.append(("CVD筹码净流入", f"🧬 [微观筹码] CVD(累积量价差) 突破均线，揭示真实的日内买盘压制 (权:{fw:.2f}x)", 12 * w_mul * fw, "QUANTUM"))
-
-    if prev['NR7'] and prev['Inside_Bar'] and curr['Close'] > prev['High'] and is_vol:
-        fw = get_fw("NR7极窄突破")
-        if fw > 0: triggered.append(("NR7极窄突破", f"🎯 [极度压缩] 7日极窄压缩孕线完成向上爆破 (权:{fw:.2f}x)", 12 * w_mul * fw, "VOLATILITY"))
-
-    if curr['VPT_Cum'] > curr['VPT_MA20'] and prev['VPT_Cum'] <= prev['VPT_MA20'] and is_vol:
-        fw = get_fw("VPT量价共振")
-        if fw > 0: triggered.append(("VPT量价共振", f"📈 [真实动能] VPT量价趋势线突破均线，量价配合绝对健康 (权:{fw:.2f}x)", 10 * w_mul * fw, "TREND"))
-
-    if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line'] and is_vol:
-        fw = get_fw("带量金叉(交互)")
-        if fw > 0: triggered.append(("带量金叉(交互)", f"🔥 [交互共振] MACD水上金叉与成交量激增产生乘数效应 (权:{fw:.2f}x)", 12 * w_mul * fw, "TREND"))
+    if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
+        add_trigger("MACD金叉", "🔥 [经典动能] MACD水上金叉起爆 (权:{fw:.2f}x)", 10, "TREND")
         
-    if curr['CMF'] > 0.15 and curr['Smart_Money_Flow'] > 0.4:
-        fw = get_fw("量价吸筹(交互)")
-        if fw > 0: triggered.append(("量价吸筹(交互)", f"🏦 [交互共振] 蔡金资金流与微观聪明钱同向深度吸筹 (权:{fw:.2f}x)", 10 * w_mul * fw, "QUANTUM"))
+    if (curr['BB_Upper'] - curr['BB_Lower']) < (curr['KC_Upper'] - curr['KC_Lower']): 
+        add_trigger("TTM Squeeze ON", "📦 [波动压缩] TTM Squeeze 挤流状态激活 (权:{fw:.2f}x)", 8, "VOLATILITY")
+
+    if curr['Above_Cloud'] == 1 and curr['Tenkan'] > curr['Kijun']:
+        add_trigger("一目多头", "🌥️ [趋势确认] 一目均衡表云上多头共振 (权:{fw:.2f}x)", 6, "TREND")
+
+    if curr['CMF'] > 0.20: 
+        add_trigger("机构控盘(CMF)", "🏦 [资金监控] CMF显示主力资金持续强控盘 (权:{fw:.2f}x)", 5, "TREND")
         
+    if curr['Smart_Money_Flow'] > 0.5 and curr['Close'] > curr['EMA_20']:
+        add_trigger("聪明钱抢筹", "🕵️ [暗中吸筹] Smart Money 指数显示连续尾盘抢筹 (权:{fw:.2f}x)", 6, "QUANTUM")
+
     if pd.notna(curr['Recent_Price_Surge_3d']) and curr['Recent_Price_Surge_3d'] > 4.0:
-        fw = get_fw("近3日突破(滞后)")
-        if fw > 0: triggered.append(("近3日突破(滞后)", f"⏱️ [滞后记忆] 近3日内曾发生暴涨，趋势处于亢奋延续期 (权:{fw:.2f}x)", 8 * w_mul * fw, "TREND"))
+        add_trigger("近3日突破(滞后)", "⏱️ [滞后记忆] 近3日内曾发生暴涨，趋势处于亢奋延续期 (权:{fw:.2f}x)", 8, "TREND")
         
     if pd.notna(curr['Recent_Vol_Surge_3d']) and curr['Recent_Vol_Surge_3d'] > 2.5:
-        fw = get_fw("近3日巨量(滞后)")
-        if fw > 0: triggered.append(("近3日巨量(滞后)", f"⏱️ [滞后记忆] 近3日内曾爆出巨量，机构资金高度活跃 (权:{fw:.2f}x)", 8 * w_mul * fw, "VOLATILITY"))
+        add_trigger("近3日巨量(滞后)", "⏱️ [滞后记忆] 近3日内曾爆出巨量，机构资金高度活跃 (权:{fw:.2f}x)", 8, "VOLATILITY")
 
+    if curr['Close'] > curr['VWAP_20'] and prev['Close'] <= curr['VWAP_20']:
+        add_trigger("VWAP突破", "🌊 [量价突破] 放量逾越近20日VWAP机构均价线 (权:{fw:.2f}x)", 8, "TREND")
+        
+    if pd.notna(curr['AVWAP']) and curr['Close'] > curr['AVWAP'] and prev['Close'] <= curr['AVWAP']:
+        add_trigger("AVWAP突破", "⚓ [筹码夺回] 强势站上AVWAP锚定成本核心区 (权:{fw:.2f}x)", 12, "TREND")
+
+    if pd.notna(curr['Swing_Low_20']) and curr['Low'] < curr['Swing_Low_20'] and curr['Volume'] < curr['Vol_MA20'] * 0.8 and curr['Close'] > (curr['Low'] + tr_val * 0.5):
+        add_trigger("威科夫弹簧(Spring)", "🏹 [威科夫测试] 跌破前低但抛压枯竭缩量，经典的Spring深蹲起爆 (权:{fw:.2f}x)", 18, "REVERSAL")
+
+    # --- 高敏感量能网 (条件隔离，提升代码可维护性与效率) ---
+    if is_vol:
+        if pure_alpha > 0.8:
+            add_trigger("独立Alpha(脱钩)", "🪐 [独立Alpha] 强势剥离大盘Beta，爆发特质动能 (权:{fw:.2f}x)", 22, "TREND")
+            
+        if curr['SuperTrend_Up'] == 1 and curr['Close'] < curr['EMA_20'] * 1.02:
+            add_trigger("强势回踩", "🟢 [低吸点位] 超级趋势主升轨精准回踩 (权:{fw:.2f}x)", 10, "REVERSAL")
+            
+        if gap_pct * 100 > max(1.5, atr_pct * 0.3) and gap_pct < 0.06:
+            add_trigger("突破缺口", "💥 [动能爆发] 放量跳空，留下底部突破缺口 (权:{fw:.2f}x)", 8, "VOLATILITY")
+            
+        if fvg_lower > 0 and curr['Low'] <= fvg_upper and curr['Close'] > fvg_lower:
+            add_trigger("SMC失衡区", "🧲 [SMC交易法] 精准回踩并测试前期机构失衡区(FVG) (权:{fw:.2f}x)", 15, "REVERSAL")
+    
+        if pd.notna(curr['Swing_Low_20']) and curr['Low'] < curr['Swing_Low_20'] and curr['Close'] > curr['Swing_Low_20']:
+            add_trigger("流动性扫盘", "🧹 [止损猎杀] 刺穿前低扫掉散户流动性后迅速诱空反转 (权:{fw:.2f}x)", 15, "REVERSAL")
+            
+        if curr['Volume'] > curr['Vol_MA20'] * 2.0 and abs(curr['Close'] - curr['Open']) < curr['ATR'] * 0.5:
+            add_trigger("巨量滞涨", "🛑 [冰山订单] 巨量滞涨，极大概率为机构冰山挂单吸货 (权:{fw:.2f}x)", 12, "QUANTUM")
+            
+        if day_chg > max(3.0, atr_pct * 0.6) and curr['Volume'] > curr['Vol_MA20'] * 1.5:
+            add_trigger("放量长阳", "⚡ [动能脉冲] 强劲的日内放量大实体阳线 (权:{fw:.2f}x)", 12, "QUANTUM")
+        
+        if curr['Close'] > prev['Close'] and curr['Volume'] > curr['Max_Down_Vol_10'] > 0 and curr['Close'] >= curr['EMA_50'] and prev['Close'] <= curr['EMA_50'] * 1.02:
+            add_trigger("口袋支点", "💎 [口袋支点] 放量阳线成交量完全吞噬近期最大阴量 (权:{fw:.2f}x)", 12, "REVERSAL")
+            
+        if curr['Range_20'] > 0 and curr['Range_60'] > 0 and curr['Range_20'] < curr['Range_60'] * 0.5 and curr['Close'] > curr['SMA_50']:
+            add_trigger("VCP收缩", "🌪️ [VCP形态] 经历极度价格波动压缩后的放量突破 (权:{fw:.2f}x)", 15, "VOLATILITY")
+                
+        if poc_price > 0 and prev['Close'] <= poc_price < curr['Close']:
+            add_trigger("筹码峰突破", "🏔️ [结构突破] 强势跨越 60日最密集筹码交易峰区 (权:{fw:.2f}x)", 12, "TREND")
+
+        if pd.notna(curr['Swing_Low_20']) and curr['Low'] > curr['Swing_Low_20'] and curr['Close'] > swing_high_10:
+            add_trigger("特性改变(ChoCh)", "🔀 [结构破坏] 突破近期反弹高点，完成 ChoCh 趋势逆转确认 (权:{fw:.2f}x)", 15, "REVERSAL")
+
+        if pd.notna(curr['OB_High']) and curr['OB_Low'] > 0 and curr['Low'] <= curr['OB_High'] and curr['Close'] >= curr['OB_Low'] and curr['Close'] > curr['Open']:
+            add_trigger("订单块(OB)", "🧱 [机构订单块] 触达机构历史起爆底仓区并收出企稳阳线 (权:{fw:.2f}x)", 15, "REVERSAL")
+
+        if curr['Close'] > curr['Open'] and (lower_wick / tr_val) > 0.3 and (upper_wick / tr_val) < 0.15:
+            add_trigger("AMD操盘", "🎭 [AMD诱空] 深度开盘诱空下杀后，全天拉升派发的操盘模型 (权:{fw:.2f}x)", 12, "REVERSAL")
+            
+        if weekly_bullish and (curr['Close'] > curr['Highest_22'] * 0.95):
+            add_trigger("跨时空共振(周线)", "🌌 [多周期共振] 周线级别主升浪与日线级别放量的强力双重共振 (权:{fw:.2f}x)", 20, "QUANTUM")
+
+        if curr['CVD'] > curr['CVD_MA20'] and prev['CVD'] <= prev['CVD_MA20']:
+            add_trigger("CVD筹码净流入", "🧬 [微观筹码] CVD(累积量价差) 突破均线，揭示真实的日内买盘压制 (权:{fw:.2f}x)", 12, "QUANTUM")
+
+        if prev['NR7'] and prev['Inside_Bar'] and curr['Close'] > prev['High']:
+            add_trigger("NR7极窄突破", "🎯 [极度压缩] 7日极窄压缩孕线完成向上爆破 (权:{fw:.2f}x)", 12, "VOLATILITY")
+
+        if curr['VPT_Cum'] > curr['VPT_MA20'] and prev['VPT_Cum'] <= prev['VPT_MA20']:
+            add_trigger("VPT量价共振", "📈 [真实动能] VPT量价趋势线突破均线，量价配合绝对健康 (权:{fw:.2f}x)", 10, "TREND")
+
+        if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
+            add_trigger("带量金叉(交互)", "🔥 [交互共振] MACD水上金叉与成交量激增产生乘数效应 (权:{fw:.2f}x)", 12, "TREND")
+            
+        if curr['CMF'] > 0.15 and curr['Smart_Money_Flow'] > 0.4:
+            add_trigger("量价吸筹(交互)", "🏦 [交互共振] 蔡金资金流与微观聪明钱同向深度吸筹 (权:{fw:.2f}x)", 10, "QUANTUM")
+
+    # === 执行最终得分统计与环境衰减惩罚 ===
     score_raw = 0.0
     for tag, text, pts, category in triggered:
         adj_pts = pts
@@ -1133,9 +1129,9 @@ def run_tech_matrix() -> None:
         
         final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
                         "\n\n---\n\n".join(txts) + \
-                        f"\n\n*(双脑回归跃迁: 系统已正式搭载 LGBM Ranker (排序截面) 与 Quantile Regressor (分位数极端动能) 双核引擎！)*"
+                        f"\n\n*(工程淬火: 核心执行流闭包化重构，剔除数组索引延迟，API网络层防屏蔽保护已统一部署！)*"
         
-        send_alert("量化诸神之战 (双脑回归版)", final_content)
+        send_alert("量化诸神之战 (极速工程版)", final_content)
         
         with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
             log_entry = {
@@ -1167,9 +1163,10 @@ def run_backtest_engine() -> None:
                         for p in daily_trades:
                             # 💡 读取日志时安全提取 ai_prob，这代表模型当时的真实想法 (Out-of-sample)
                             trades.append({'date': log['date'], 'symbol': p['symbol'], 'signals': p.get('signals', []), 'factors': p.get('factors', []), 'ml_features': p.get('ml_features', []), 'ai_prob': p.get('ai_prob', 0.0), 'tp': p.get('tp', float('inf')), 'sl': p.get('sl', 0)})
-                    except: pass
+                    except Exception as e:
+                        logger.debug(f"跳过损毁的 JSONL 日志行: {e}")
         except Exception as e:
-            logger.debug(f"读取日志分片 {lf} 失败: {e}")
+            logger.debug(f"读取日志分片文件 {lf} 发生阻断: {e}")
             
     if not trades: return
     syms = list(set([t['symbol'] for t in trades]))
@@ -1333,6 +1330,15 @@ def run_backtest_engine() -> None:
                                 'ml_features': ml_feats,
                                 'ret': ret
                             })
+                            
+                            if clf_model and hasattr(clf_model, 'predict'):
+                                try:
+                                    score = clf_model.predict([ml_feats])[0]
+                                    if score > 0: 
+                                        ai_filtered_total += 1
+                                        if ret > 0: ai_filtered_wins += 1
+                                except Exception as e: 
+                                    logger.debug(f"回测期间通过 LTR 评估命中率异常，已跳过: {e}")
     
     feature_importances_dict = {}
     trade_df = pd.DataFrame(trades_with_ret)
@@ -1351,7 +1357,8 @@ def run_backtest_engine() -> None:
                 else:
                     try:
                         relevance_list.append(pd.qcut(group['ret'], 5, labels=False, duplicates='drop'))
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"[{date}] NDCG 收益等级分箱失败，可能收益同质化过高，已默认为0档: {e}")
                         relevance_list.append(pd.Series(0, index=group.index))
             trade_df['relevance'] = pd.concat(relevance_list)
             
@@ -1550,4 +1557,4 @@ if __name__ == "__main__":
     m = sys.argv[1] if len(sys.argv) > 1 else "matrix"
     if m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "双脑回归跃迁完成！系统已由【LightGBM Ranker (处理截面排序)】与【Quantile Regressor (瞄准极端上行)】接管，彻底补齐量化最后拼图。")
+    elif m == "test": send_alert("连通性测试", "全栈重构完毕！SuperTrend 脱离慢速沙盒，规则引擎已实现闭包降维化抽象，全局通信防屏蔽体系已统一部署！")
