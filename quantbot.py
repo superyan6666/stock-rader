@@ -77,6 +77,7 @@ class Config:
     ALERT_CACHE_FILE: str = "alert_history.json"
     MODEL_FILE: str = "scoring_model.pkl"
     
+    # 🪒 31 维全息张量：引入交互特征(Interaction)与滞后特征(Lag)
     ALL_FACTORS = [
         "米奈尔维尼", "强相对强度", "MACD金叉", "TTM Squeeze ON", "一目多头", "强势回踩", "机构控盘(CMF)",
         "突破缺口", "VWAP突破", "AVWAP突破", "SMC失衡区", "流动性扫盘", "聪明钱抢筹", "巨量滞涨", "放量长阳", "口袋支点", 
@@ -978,7 +979,6 @@ def run_tech_matrix() -> None:
     raw_reports = []
     price_history_dict = {} 
     
-    # 💡 阶段 1：特征提取与过滤遍历 (Batch Collection)
     for sym in active_pool:
         if is_alerted(sym): continue
         try:
@@ -1016,10 +1016,8 @@ def run_tech_matrix() -> None:
             })
         except Exception: pass
 
-    # 💡 阶段 2：截面排序学习跃迁 (Cross-Sectional Rank Inference)
     if clf_model and raw_reports:
         X_batch = np.array([r['ml_features'] for r in raw_reports])
-        # 兼容旧版的概率分类器与新版的 LightGBM Ranker
         if hasattr(clf_model, 'predict_proba'):
             try:
                 class_idx = np.where(clf_model.classes_ == 1)[0][0] if 1 in clf_model.classes_ else 0
@@ -1027,7 +1025,6 @@ def run_tech_matrix() -> None:
             except Exception:
                 probs = np.full(len(raw_reports), 0.52)
         else:
-            # 🚀 Ranker 排序分映射：将相对排名得分映射回 [0, 1] 区间的类概率用于风控凯利校验
             raw_scores = clf_model.predict(X_batch)
             if len(raw_scores) > 1:
                 z_scores = (raw_scores - np.mean(raw_scores)) / (np.std(raw_scores) + 1e-10)
@@ -1040,7 +1037,6 @@ def run_tech_matrix() -> None:
     else:
         for r in raw_reports: r['ai_prob'] = 0.52
 
-    # 💡 阶段 3：风控仓位分配与入池
     reports, background_pool, all_raw_scores = [], [], []
     for r in raw_reports:
         if r['total_score'] > 0: all_raw_scores.append(r['total_score'])
@@ -1096,7 +1092,6 @@ def run_tech_matrix() -> None:
             icon = ['🥇', '🥈', '🥉'][idx] if idx < 3 else '🔸'
             sigs_fmt = "\n".join([f"- {s}" for s in r["signals"]])
             news_fmt = f"\n- 📰 {r['news']}" if r['news'] else ""
-            # 🚀 UI 更新：标注 LTR 截面排序转化概率
             ai_display = f"🔥 **{r.get('ai_prob', 0):.1%}**" if r.get('ai_prob', 0) > 0.60 else f"{r.get('ai_prob', 0):.1%}"
             
             txts.append(
@@ -1116,9 +1111,9 @@ def run_tech_matrix() -> None:
         
         final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
                         "\n\n---\n\n".join(txts) + \
-                        f"\n\n*(模型跃迁: Learning to Rank 排序学习已接管核心，彻底抹平环境干扰，专捕截面龙头！)*"
+                        f"\n\n*(防穿越净化: 系统已搭载 Purged Walk-Forward 交叉验证机制，严防信息泄露，锁定最优迭代边界。)*"
         
-        send_alert("量化诸神之战 (LTR排序跃迁版)", final_content)
+        send_alert("量化诸神之战 (Purged防穿越版)", final_content)
         
         with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
             log_entry = {
@@ -1310,7 +1305,6 @@ def run_backtest_engine() -> None:
                         for f_name in factor_list:
                             factor_rets.setdefault(f"[{f_name}]", []).append(ret)
                             
-                        # 🚀 组装张量记录，以供 LightGBM NDCG 排序优化
                         ml_feats = t.get('ml_features', [])
                         if ml_feats and len(ml_feats) == len(Config.ALL_FACTORS):
                             trades_with_ret.append({
@@ -1319,11 +1313,10 @@ def run_backtest_engine() -> None:
                                 'ret': ret
                             })
                             
-                            # 兼容性推演评估：追踪排名靠前的命中率
                             if clf_model and hasattr(clf_model, 'predict'):
                                 try:
                                     score = clf_model.predict([ml_feats])[0]
-                                    if score > 0: # LightGBM Ranker 输出的相对原始分数，>0代表排位相对靠前
+                                    if score > 0: 
                                         ai_filtered_total += 1
                                         if ret > 0: ai_filtered_wins += 1
                                 except Exception: pass
@@ -1332,13 +1325,11 @@ def run_backtest_engine() -> None:
     trade_df = pd.DataFrame(trades_with_ret)
     if len(trade_df) >= 30:
         try:
-            from lightgbm import LGBMRanker
+            from lightgbm import LGBMRanker, early_stopping
             import pickle
             
-            # 🚀 排序学习关键：将数据严格按交易日排列（Query ID）
             trade_df = trade_df.sort_values('date')
             
-            # 🚀 构建 NDCG 相关度等级 (Relevance): 在同一天内，按照未来真实收益率划分为 5 档 (0-4)
             relevance_list = []
             for date, group in trade_df.groupby('date', sort=False):
                 if len(group) < 3:
@@ -1354,21 +1345,60 @@ def run_backtest_engine() -> None:
             y_train = trade_df['relevance'].values
             groups = trade_df.groupby('date', sort=False).size().values
             
-            # 🚀 降维神罚：LightGBM Lambdarank 模型
-            clf = LGBMRanker(
+            base_lgbm_params = dict(
                 objective="lambdarank",
                 metric="ndcg",
-                n_estimators=100,
                 learning_rate=0.05,
                 max_depth=5,
-                random_state=42
+                random_state=42,
+                n_estimators=150
             )
             
-            clf.fit(X_train, y_train, group=groups)
+            unique_dates = trade_df['date'].unique()
+            # 🚀 时间序列交叉验证 (Purged Walk-Forward CV) 核心逻辑：
+            # 针对 GitHub Actions 短时间重训的特性，采用单折验证动态寻找 Early Stopping
+            if len(unique_dates) > 30:
+                # 划分 80% 训练集, 20% 验证集
+                val_size = max(1, int(len(unique_dates) * 0.2))
+                train_dates = unique_dates[:-val_size]
+                val_dates = unique_dates[-val_size:]
+                
+                # 🚀 Purge 净化：强行剔除训练集末尾 5 个交易日，切断 T+5 标签重叠导致的未来函数泄露！
+                purge_days = 5
+                train_dates = train_dates[:-purge_days] if len(train_dates) > purge_days else train_dates
+                
+                train_mask = trade_df['date'].isin(train_dates)
+                val_mask = trade_df['date'].isin(val_dates)
+                
+                X_train_cv, y_train_cv = X_train[train_mask], y_train[train_mask]
+                groups_train_cv = trade_df[train_mask].groupby('date', sort=False).size().values
+                
+                X_val_cv, y_val_cv = X_train[val_mask], y_train[val_mask]
+                groups_val_cv = trade_df[val_mask].groupby('date', sort=False).size().values
+                
+                clf_cv = LGBMRanker(**base_lgbm_params)
+                # 💡 使用被 Purge 洗净的验证集进行 Early Stopping，防范过拟合
+                clf_cv.fit(
+                    X_train_cv, y_train_cv, group=groups_train_cv,
+                    eval_set=[(X_val_cv, y_val_cv)], eval_group=[groups_val_cv],
+                    callbacks=[early_stopping(stopping_rounds=20, verbose=False)]
+                )
+                
+                best_iters = clf_cv.best_iteration_ if clf_cv.best_iteration_ else 100
+                logger.info(f"🛡️ Purged CV 防穿越净化完成：验证集防过拟合最佳树迭代次数为 {best_iters} 棵。")
+                
+                # 将最佳参数带回全量数据重新拟合
+                clf = LGBMRanker(**base_lgbm_params)
+                clf.set_params(n_estimators=best_iters)
+                clf.fit(X_train, y_train, group=groups)
+            else:
+                # 数据不足 30 天，暂时保守拟合
+                clf = LGBMRanker(**base_lgbm_params)
+                clf.fit(X_train, y_train, group=groups)
             
             with open(Config.MODEL_FILE, 'wb') as f:
                 pickle.dump(clf, f)
-            logger.info(f"🧠 【排序学习跃迁】搭载 LightGBM Ranker 的全息排序模型已重训落盘 (NDCG)。")
+            logger.info(f"🧠 【排序学习跃迁】搭载 Purged Walk-Forward 的全息排序模型已重训落盘。")
             
             if hasattr(clf, 'feature_importances_'):
                 importances = clf.feature_importances_
@@ -1471,11 +1501,11 @@ def run_backtest_engine() -> None:
             icon = ['🔥','🔥','🔥'][idx]
             alert_lines.append(f"- {icon} **{tag}**: 贡献度 {imp*100:.1f}%")
             
-    send_alert("策略终极回测战报 (LTR排序学习版)", "\n".join(alert_lines))
+    send_alert("策略终极回测战报 (Purged CV版)", "\n".join(alert_lines))
 
 if __name__ == "__main__":
     validate_config()
     m = sys.argv[1] if len(sys.argv) > 1 else "matrix"
     if m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "排序学习跃迁成功！引擎已切换至 LightGBM Ranker 架构，完全免疫宏观大盘的系统性偏差。")
+    elif m == "test": send_alert("连通性测试", "防穿越武装完毕！系统已搭载 Purged Walk-Forward 切割器，验证集将前置剥离最后5天以阻断未来函数，锁定真实最优参数。")
