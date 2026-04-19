@@ -77,7 +77,7 @@ class Config:
     ALERT_CACHE_FILE: str = "alert_history.json"
     MODEL_FILE: str = "scoring_model.pkl"
     
-    # 🌌 算力氧气注入：24 维全息宇宙矩阵 (新增 FFT傅里叶 与 KDE量子概率云)
+    # 🌌 24 维绝对矩阵
     ALL_FACTORS = [
         "米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "SMC失衡区", 
         "流动性扫盘", "聪明钱抢筹", "巨量滞涨", "放量长阳", "口袋支点", 
@@ -179,8 +179,8 @@ def check_earnings_risk(symbol: str) -> bool:
     return False
 
 def fetch_tradingview_screener(max_tickers=150) -> list:
-    """👁️ 天眼：秒级扫描全美股 8000+ 标的，抓取相对成交量异动最猛的股票"""
-    logger.info("📡 启动天眼 (TradingView Scanner) 进行全市场广度雷达扫描...")
+    """👁️ 狂暴天眼：注入 Beta 滤网，专猎高弹性黑马"""
+    logger.info("📡 启动狂暴天眼 (TradingView Scanner) 猎杀全市场高动能异动标的...")
     try:
         url = "https://scanner.tradingview.com/america/scan"
         payload = {
@@ -188,8 +188,9 @@ def fetch_tradingview_screener(max_tickers=150) -> list:
                 {"left": "type", "operation": "in_range", "right": ["stock"]},
                 {"left": "subtype", "operation": "in_range", "right": ["common"]},
                 {"left": "exchange", "operation": "in_range", "right": ["AMEX", "NASDAQ", "NYSE"]},
-                {"left": "close", "operation": "greater", "right": 10},
-                {"left": "average_volume_10d_calc", "operation": "greater", "right": 2000000}
+                {"left": "close", "operation": "greater", "right": 15}, # 过滤极低价仙股
+                {"left": "average_volume_10d_calc", "operation": "greater", "right": 2500000}, # 流动性极好
+                {"left": "beta_1_year", "operation": "greater", "right": 1.1} # 🚀 核心：强弹性，剔除老头股
             ],
             "options": {"lang": "en"},
             "markets": ["america"],
@@ -208,27 +209,25 @@ def fetch_tradingview_screener(max_tickers=150) -> list:
             tickers = []
             for item in data.get('data', []):
                 raw_ticker = item['d'][0]
-                # TV 返回格式多为 "NASDAQ:AAPL"，提取纯 Ticker
                 ticker = raw_ticker.split(':')[1] if ':' in raw_ticker else raw_ticker
                 tickers.append(ticker)
             
-            # 过滤掉带点和过长的异常标的，适配 yfinance 格式 (如 BRK.B -> BRK-B)
             valid_tickers = [t.replace('.', '-') for t in tickers if len(t) <= 5]
-            logger.info(f"👁️ 天眼锁定: 成功从全市场捕获 {len(valid_tickers)} 只极致异动标的。")
+            logger.info(f"👁️ 天眼锁定: 成功捕获 {len(valid_tickers)} 只高弹性(Beta>1.1)暴躁黑马。")
             return valid_tickers
     except Exception as e:
-        logger.warning(f"⚠️ 天眼扫描受阻: {e}")
+        logger.warning(f"⚠️ 天眼扫描受阻，退回常规模式: {e}")
     return []
 
-def get_filtered_watchlist(max_stocks: int = 120) -> list:
-    logger.info(">>> 漏斗过滤：从多维度数据源拉取名单 (含天眼雷达与纳指中盘)...")
+def get_filtered_watchlist(max_stocks: int = 150) -> list:
+    logger.info(">>> 漏斗过滤：融合狂暴天眼雷达与核心白马池...")
     tickers = set(Config.CORE_WATCHLIST)
     
-    # 🚀 Phase 1 跃迁：接入 TradingView 天眼雷达
-    tv_tickers = fetch_tradingview_screener(150)
+    # 接入天眼高 Beta 异动名单
+    tv_tickers = fetch_tradingview_screener(120)
     if tv_tickers:
         tickers.update(tv_tickers)
-        
+    
     if os.path.exists(Config.CACHE_FILE):
         try:
             mtime = os.path.getmtime(Config.CACHE_FILE)
@@ -236,50 +235,13 @@ def get_filtered_watchlist(max_stocks: int = 120) -> list:
                 with open(Config.CACHE_FILE, "r", encoding="utf-8") as f:
                     cached_tickers = json.load(f)
                     tickers.update(cached_tickers)
-                    logger.info(f"♻️ 成功加载本地存活缓存: {len(cached_tickers)} 只。")
+                    logger.info(f"♻️ 成功加载本地存活缓存。")
             else:
-                logger.info("🗑️ 本地缓存已过期(>7天)，将执行全局深度清洗重建。")
-        except Exception as e:
-            logger.warning(f"⚠️ 缓存读取失败: {e}")
+                pass
+        except Exception: pass
 
-    online_fetched = 0
-    try:
-        sp500_url = 'https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv'
-        resp = requests.get(sp500_url, headers=_GLOBAL_HEADERS, timeout=10)
-        if resp.status_code == 200:
-            from io import StringIO
-            df_sp500 = pd.read_csv(StringIO(resp.text))
-            if 'Symbol' in df_sp500.columns:
-                fetched = df_sp500['Symbol'].dropna().astype(str).str.replace('.', '-').tolist()
-                tickers.update(fetched)
-                online_fetched += len(fetched)
-    except Exception as e:
-        logger.warning(f"⚠️ 标普500动态拉取受限: {e}")
-
-    try:
-        from io import StringIO
-        wiki_urls = [
-            'https://en.wikipedia.org/wiki/List_of_S%26P_400_companies',
-            'https://en.wikipedia.org/wiki/Nasdaq-100'
-        ]
-        for w_url in wiki_urls:
-            w_resp = requests.get(w_url, headers=_GLOBAL_HEADERS, timeout=10)
-            if w_resp.status_code == 200:
-                for table in pd.read_html(StringIO(w_resp.text), flavor='lxml'):
-                    col = next((c for c in ['Symbol', 'Ticker symbol', 'Ticker'] if c in table.columns), None)
-                    if col:
-                        fetched = table[col].dropna().astype(str).str.replace('.', '-').tolist()
-                        tickers.update(fetched)
-                        online_fetched += len(fetched)
-                        break
-    except Exception as e:
-        logger.warning(f"⚠️ Wiki 拓展列表获取受限: {e}")
-        
-    if online_fetched == 0 and len(tickers) <= len(Config.CORE_WATCHLIST):
-        logger.warning("🔴 外部数据源全部脆断，将依靠【护城河名单】与【本地自洁缓存】安全运行！")
-    
     tickers_list = list(tickers)
-    logger.info(f"✅ 汇总海选池: {len(tickers_list)} 只标的。")
+    logger.info(f"✅ 汇总全维海选池: {len(tickers_list)} 只标的。")
 
     try:
         chunk_size = 50 
@@ -300,11 +262,7 @@ def get_filtered_watchlist(max_stocks: int = 120) -> list:
             close_df, volume_df = df, pd.DataFrame(1e6, index=df.index, columns=df.columns)
 
         available_tickers = set(close_df.columns) if isinstance(close_df, pd.DataFrame) else set()
-        missing_tickers = set(tickers_list) - available_tickers
         
-        if missing_tickers:
-            logger.info(f"🛡️ 数据自净: 发现 {len(missing_tickers)} 只失效/退市标的，已抹除。")
-            
         if len(available_tickers) > 200:
             try:
                 with open(Config.CACHE_FILE, "w", encoding="utf-8") as f:
@@ -427,7 +385,6 @@ def get_market_regime(active_pool: List[str] = None) -> Tuple[str, str, pd.DataF
             if dxy_trend > 0.015 and tnx_trend > 0.04:
                 macro_gravity = True
                 gravity_desc = "\n- 🌑 **宏观引力波**: 美元与美债收益率双飙，流动性黑洞来袭，系统极度承压！"
-                logger.warning("🌑 探测到强烈的宏观引力波：全市场杠杆被强行熔断至极小值！")
     except Exception: pass
     
     breadth_desc = ""
@@ -527,12 +484,11 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     clv = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / (df['High'] - df['Low'] + 1e-10)
     df['Smart_Money_Flow'] = clv.rolling(window=10).mean()
     
-    # 🌌 算力充能一：傅里叶变换主导周期 (FFT Dominant Cycle)
     fft_curr, fft_prev = 0.0, 0.0
     prices_array = df['Close'].values
     if len(prices_array) >= 120:
         p_120 = prices_array[-120:]
-        p_detrend = p_120 - np.mean(p_120)  # 去趋势以消除直流分量
+        p_detrend = p_120 - np.mean(p_120)
         fft_res = np.fft.fft(p_detrend)
         freqs = np.fft.fftfreq(120)
         
@@ -541,23 +497,12 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
             peak_idx = pos_idx[np.argmax(np.abs(fft_res[pos_idx]))]
             dom_freq = freqs[peak_idx]
             phase = np.angle(fft_res[peak_idx])
-            
-            # 利用傅里叶解构出的频率和相位，逆向映射出当前的纯粹波动位置
             t_curr, t_prev = 119, 118
             fft_curr = np.cos(2 * np.pi * dom_freq * t_curr + phase)
             fft_prev = np.cos(2 * np.pi * dom_freq * t_prev + phase)
             
     df['FFT_Wave_Current'] = fft_curr
     df['FFT_Wave_Prev'] = fft_prev
-
-    hist_vol_rolling = df['Volume'].shift(10).rolling(window=50, min_periods=10).quantile(0.8)
-    vol_10d_mean = df['Volume'].rolling(window=10, min_periods=1).mean()
-    vol_spike = (vol_10d_mean / (hist_vol_rolling + 1e-10)) > 2.5
-    price_spike = df['Close'].pct_change().abs().rolling(window=5, min_periods=1).max() > 0.08
-    df['Event_Risk'] = 0.0
-    df.loc[vol_spike, 'Event_Risk'] += 0.6
-    df.loc[price_spike, 'Event_Risk'] += 0.4
-    df['Event_Risk'] = df['Event_Risk'].clip(upper=1.0)
 
     return df
 
@@ -601,7 +546,7 @@ def run_tech_matrix() -> None:
                         pain_warning = "\n- 🩸 **痛觉神经激活**: 近期回测遭重挫，引擎已主动执行**防守降杠杆**协议！"
     except Exception: pass
 
-    active_pool = get_filtered_watchlist(max_stocks=120)
+    active_pool = get_filtered_watchlist(max_stocks=150)
     regime, regime_desc, qqq_df, is_credit_risk_high, macro_gravity = get_market_regime(active_pool)
     vix, vix_desc = get_vix_level(qqq_df_for_shadow=qqq_df)
     vix_scalar = max(0.6, min(1.4, 18.0 / max(vix, 1.0)))
@@ -683,7 +628,7 @@ def run_tech_matrix() -> None:
             price_history_dict[sym] = df['Close'].iloc[-60:]
             curr, prev = df.iloc[-1], df.iloc[-2]
             
-            if curr['Event_Risk'] > 0.85 or (curr['ATR'] / curr['Close'] > 0.15): continue
+            if (curr['ATR'] / curr['Close'] > 0.15): continue
             if pd.notna(curr['SMA_200']) and curr['Close'] < curr['SMA_200'] and curr['SMA_50'] < curr['SMA_200']: continue
             
             fvg_lower, fvg_upper = 0.0, 0.0
@@ -691,11 +636,10 @@ def run_tech_matrix() -> None:
                 if df['Low'].iloc[i] > df['High'].iloc[i-2]:
                     fvg_lower, fvg_upper = df['High'].iloc[i-2], df['Low'].iloc[i]
             
-            # 🌌 算力充能二：量子概率筹码云 (Quantum Probability Cloud - KDE Approximation)
             df_60 = df.iloc[-60:]
             quantum_upper = 0.0
+            poc_price = 0.0
             if not df_60.empty and df_60['Volume'].sum() > 0:
-                # 使用成交量加权方差，逼近统计学中的一维高斯核概率密度上限
                 vol_mean = np.average(df_60['Close'], weights=df_60['Volume'])
                 vol_std = np.sqrt(np.average((df_60['Close'] - vol_mean)**2, weights=df_60['Volume']))
                 quantum_upper = vol_mean + vol_std 
@@ -708,7 +652,7 @@ def run_tech_matrix() -> None:
             triggered = []
 
             # -----------------------------------------------------------
-            # 🚀 赛博飞升：24 维绝对神明矩阵 (24-Dimensional Cyber Matrix)
+            # 🚀 动能解封：在震荡市中大幅松绑对强势股的惩罚，提高暴力因子权重
             # -----------------------------------------------------------
             
             if pd.notna(curr['SMA_200']) and curr['Close'] > curr['SMA_50'] > curr['SMA_150'] > curr['SMA_200']:
@@ -732,7 +676,8 @@ def run_tech_matrix() -> None:
                     pure_alpha = (recent_stock_ret - beta * recent_qqq_ret) * 252
                     if pure_alpha > 0.8 and is_vol:
                         fw = get_fw("三体逃逸(Alpha)")
-                        if fw > 0: triggered.append(("三体逃逸(Alpha)", f"🪐 [三体逃逸] 剥离大盘 Beta，爆发独立异动引力 (权:{fw:.2f}x)", 18 * w_mul * fw))
+                        # 💥 动能解封：提高特质收益权重，哪怕大盘不行，只要个股硬就疯狂加分
+                        if fw > 0: triggered.append(("三体逃逸(Alpha)", f"🪐 [三体逃逸] 强力剥离大盘 Beta，爆发独立引力 (权:{fw:.2f}x)", 22 * w_mul * fw))
             
             if curr['Close'] > curr['VWAP_20'] and prev['Close'] <= prev['VWAP_20']:
                 fw = get_fw("VWAP突破")
@@ -762,7 +707,8 @@ def run_tech_matrix() -> None:
             day_chg = (curr['Close'] - curr['Open']) / curr['Open'] * 100
             if day_chg > max(3.0, atr_pct * 0.6) and curr['Volume'] > curr['Vol_MA20'] * 1.5:
                 fw = get_fw("放量长阳")
-                if fw > 0: triggered.append(("放量长阳", f"⚡ [放量长阳] 强劲日内动能脉冲 (权:{fw:.2f}x)", 8 * w_mul * fw))
+                # 💥 动能解封：提高放量长阳的基础威慑力
+                if fw > 0: triggered.append(("放量长阳", f"⚡ [放量长阳] 强劲日内暴力动能脉冲 (权:{fw:.2f}x)", 12 * w_mul * fw))
             
             if curr['Close'] > prev['Close'] and curr['Volume'] > curr['Max_Down_Vol_10'] > 0 and curr['Close'] >= curr['EMA_50'] and prev['Close'] <= curr['EMA_50'] * 1.02:
                 fw = get_fw("口袋支点")
@@ -812,18 +758,17 @@ def run_tech_matrix() -> None:
 
             if curr['Volatility_20'] <= curr['Volatility_Min_120'] * 1.05 and is_vol and day_chg > max(3.0, atr_pct * 0.6):
                 fw = get_fw("熵增起爆(Big Bang)")
-                if fw > 0: triggered.append(("熵增起爆(Big Bang)", f"🎇 [熵增起爆] 绝对死寂冰点后的宇宙奇点大爆炸 (权:{fw:.2f}x)", 20 * w_mul * fw))
+                # 💥 动能解封：提高起爆奇点的权重
+                if fw > 0: triggered.append(("熵增起爆(Big Bang)", f"🎇 [熵增起爆] 绝对死寂冰点后的宇宙奇点大爆炸 (权:{fw:.2f}x)", 25 * w_mul * fw))
                 
             if curr['Hurst'] > 0.65 and curr['Close'] > curr['EMA_20']:
                 fw = get_fw("赫斯特记忆(Hurst)")
                 if fw > 0: triggered.append(("赫斯特记忆(Hurst)", f"⏳ [赫斯特记忆] H>0.65，突破布朗运动，时空呈现强连续性 (权:{fw:.2f}x)", 15 * w_mul * fw))
 
-            # 🌌 实装：傅里叶周期共振 (FFT) 拦截数学维度的完美波段起点
             if curr['FFT_Wave_Current'] > 0 and prev['FFT_Wave_Prev'] <= 0 and is_vol:
                 fw = get_fw("傅里叶周期共振(FFT)")
                 if fw > 0: triggered.append(("傅里叶周期共振(FFT)", f"🌊 [傅里叶共振] 跨越数学噪音，精确踩中绝对主导周期起涨相位 (权:{fw:.2f}x)", 18 * w_mul * fw))
 
-            # 🌌 实装：量子概率云突破 (Quantum Probability KDE)
             if quantum_upper > 0 and prev['Close'] <= quantum_upper < curr['Close'] and is_vol:
                 fw = get_fw("量子概率云(KDE)")
                 if fw > 0: triggered.append(("量子概率云(KDE)", f"☁️ [量子概率云] 极速跃迁突破高斯筹码云层上轨，进入无阻力真空区 (权:{fw:.2f}x)", 18 * w_mul * fw))
@@ -831,8 +776,11 @@ def run_tech_matrix() -> None:
             score_raw = 0.0
             for tag, text, pts in triggered:
                 adj_pts = pts
-                if regime in ["bear", "range", "hidden_bear"] and tag in ["米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "筹码峰突破", "维特鲁威分形", "CVD筹码净流入", "混沌破缺(Trend)", "三体逃逸(Alpha)", "赫斯特记忆(Hurst)", "傅里叶周期共振(FFT)", "量子概率云(KDE)"]:
+                # 💥 动能解封：在 range 震荡市中，不再直接腰斩突破因子，而是给予0.8的宽容度，让强者恒强
+                if regime in ["bear", "hidden_bear"] and tag in ["米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "筹码峰突破", "维特鲁威分形", "CVD筹码净流入", "混沌破缺(Trend)", "三体逃逸(Alpha)", "赫斯特记忆(Hurst)", "傅里叶周期共振(FFT)", "量子概率云(KDE)"]:
                     adj_pts *= 0.5  
+                elif regime == "range" and tag in ["米奈尔维尼", "强相对强度", "VWAP突破", "AVWAP突破", "筹码峰突破", "维特鲁威分形", "CVD筹码净流入", "混沌破缺(Trend)", "三体逃逸(Alpha)", "赫斯特记忆(Hurst)", "傅里叶周期共振(FFT)", "量子概率云(KDE)"]:
+                    adj_pts *= 0.8 
                 elif regime in ["bull", "rebound"] and tag in ["米奈尔维尼", "维特鲁威分形", "混沌破缺(Trend)", "熵增起爆(Big Bang)", "三体逃逸(Alpha)", "赫斯特记忆(Hurst)", "量子概率云(KDE)"]:
                     adj_pts *= 1.2  
                 elif regime in ["bear", "range", "hidden_bear"] and tag in ["SMC失衡区", "流动性扫盘", "口袋支点", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘", "威科夫弹簧(Spring)", "熵增起爆(Big Bang)"]:
@@ -1009,9 +957,9 @@ def run_tech_matrix() -> None:
         
         final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
                         "\n\n---\n\n".join(txts) + \
-                        f"\n\n*(赛博飞升: 24维全息矩阵已接通，傅里叶周期与量子概率云正全速推演)*"
+                        f"\n\n*(动能解封: 天眼高 Beta 雷达接入，震荡市突破束缚松绑，三体逃逸与熵增起爆权重史诗级上调)*"
         
-        send_alert("量化诸神之战 (赛博飞升版)", final_content)
+        send_alert("量化诸神之战 (动能解封版)", final_content)
         
         with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
             f.write(json.dumps({"date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", []), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports]}, ensure_ascii=False) + "\n")
@@ -1297,11 +1245,11 @@ def run_backtest_engine() -> None:
             icon = ['🔥','🔥','🔥'][idx]
             alert_lines.append(f"- {icon} **{tag}**: 贡献度 {imp*100:.1f}%")
             
-    send_alert("策略终极回测战报 (24维赛博飞升版)", "\n".join(alert_lines))
+    send_alert("策略终极回测战报 (动能解封版)", "\n".join(alert_lines))
 
 if __name__ == "__main__":
     validate_config()
     m = sys.argv[1] if len(sys.argv) > 1 else "matrix"
     if m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "赛博飞升完成！24维神级矩阵接入，傅里叶周期与量子概率云已开启绝对感知。")
+    elif m == "test": send_alert("连通性测试", "系统动能封印已解除！TV天眼已接入高 Beta 雷达，震荡市惩罚大幅松绑。去迎接真正的黑马吧！")
