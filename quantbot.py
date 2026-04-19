@@ -11,6 +11,7 @@ import re
 import json
 import warnings
 import scipy.stats as stats
+import concurrent.futures
 from typing import List, Tuple, Dict
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
@@ -80,7 +81,6 @@ class Config:
     ALERT_CACHE_FILE: str = "alert_history.json"
     MODEL_FILE: str = "scoring_model.pkl"
     
-    # 🪒 46 维极意矩阵：正式接入【另类数据与文本情绪引擎】
     ALL_FACTORS = [
         "米奈尔维尼", "强相对强度", "MACD金叉", "TTM Squeeze ON", "一目多头", "强势回踩", "机构控盘(CMF)",
         "突破缺口", "VWAP突破", "AVWAP突破", "SMC失衡区", "流动性扫盘", "聪明钱抢筹", "巨量滞涨", "放量长阳", "口袋支点", 
@@ -113,7 +113,6 @@ class Config:
         "舆情NLP情感极值(News_NLP)", "散户热度加速度(WSB_Accel)"
     ]
     
-    # 🧠 FinBERT 极速词典降维投影
     FINBERT_POS = ['beat', 'raise', 'upgrade', 'strong', 'surge', 'rally', 'buy', 'bullish', 'record', 'profit', 'outperform', 'exceed', 'soar', 'jump', 'dividend']
     FINBERT_NEG = ['miss', 'cut', 'downgrade', 'weak', 'decline', 'sell', 'bearish', 'warn', 'loss', 'underperform', 'plunge', 'drop', 'lawsuit', 'investigation', 'scandal']
 
@@ -145,7 +144,7 @@ def validate_config():
 
 _KLINE_CACHE = {}
 _SENTIMENT_CACHE = {} 
-_ALT_DATA_CACHE = {}  # 🚀 另类数据缓存 (WSB/Insider/Analyst)
+_ALT_DATA_CACHE = {}  
 
 # ================= 2. 数据工具模块 =================
 def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 5, auto_adjust: bool = True, fast_mode: bool = False) -> pd.DataFrame:
@@ -167,26 +166,32 @@ def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retr
             time.sleep((10 + attempt * 5) if "429" in str(e).lower() else (2 + attempt * 2))
     return pd.DataFrame()
 
-# 🚀 另类数据天眼 1：全局获取 Reddit WSB 热度与情绪 (Tradestie API Proxy)
 def fetch_global_wsb_data() -> Dict[str, dict]:
     if "WSB_GLOBAL" in _ALT_DATA_CACHE:
         return _ALT_DATA_CACHE["WSB_GLOBAL"]
     wsb_dict = {}
-    try:
-        url = "https://tradestie.com/api/v1/apps/reddit"
-        response = requests.get(url, headers=_GLOBAL_HEADERS, timeout=8)
-        if response.status_code == 200:
-            data = response.json()
-            for item in data:
-                tk = item.get('ticker')
-                if tk:
-                    wsb_dict[tk] = {
-                        'sentiment': 1.0 if item.get('sentiment') == 'Bullish' else -1.0,
-                        'comments': item.get('no_of_comments', 0)
-                    }
-            logger.info(f"🌐 成功加载全局 Reddit/WSB 舆情雷达，监控 {len(wsb_dict)} 活跃标的。")
-    except Exception as e:
-        logger.debug(f"WSB 舆情雷达接入超时或断开: {e}")
+    for attempt in range(3):
+        try:
+            url = "https://tradestie.com/api/v1/apps/reddit"
+            response = requests.get(url, headers=_GLOBAL_HEADERS, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                for item in data:
+                    tk = item.get('ticker')
+                    if tk:
+                        wsb_dict[tk] = {
+                            'sentiment': 1.0 if item.get('sentiment') == 'Bullish' else -1.0,
+                            'comments': item.get('no_of_comments', 0)
+                        }
+                logger.info(f"🌐 成功加载全局 Reddit/WSB 舆情雷达，监控 {len(wsb_dict)} 活跃标的。")
+                break
+        except Exception as e:
+            logger.debug(f"WSB 舆情雷达接入尝试 {attempt+1} 失败: {e}")
+            time.sleep(2.0)
+            
+    if not wsb_dict:
+        logger.warning(f"⚠️ WSB 舆情雷达最终接入失败，将使用降级空值处理。")
+        
     _ALT_DATA_CACHE["WSB_GLOBAL"] = wsb_dict
     return wsb_dict
 
@@ -222,9 +227,7 @@ def safe_get_sentiment_data(symbol: str) -> Tuple[float, float, float, float]:
     _SENTIMENT_CACHE[symbol] = (pcr, iv_skew, short_change, short_float)
     return pcr, iv_skew, short_change, short_float
 
-# 🚀 另类数据天眼 2：深度解析高管行为 (SEC Form 4) 与 分析师调级
 def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
-    """返回: (内部人净买入比率, 分析师修正动量, NLP情绪得分, 新闻摘要)"""
     cache_key = f"ALT_{symbol}"
     if cache_key in _ALT_DATA_CACHE:
         return _ALT_DATA_CACHE[cache_key]
@@ -236,17 +239,13 @@ def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
     
     try:
         tk = yf.Ticker(symbol)
-        
-        # 1. 内部人集群交易 (Insider Cluster Buy)
         try:
             insiders = tk.insider_transactions
             if insiders is not None and not insiders.empty:
-                # 筛选近3个月的交易
-                recent_insiders = insiders.head(20) # 粗略取前20条最新记录
+                recent_insiders = insiders.head(20) 
                 buys = 0
                 sells = 0
                 if 'Shares' in recent_insiders.columns:
-                    # 尝试通过正负值或Text判断
                     if 'Text' in recent_insiders.columns:
                         buys = recent_insiders[recent_insiders['Text'].str.contains('Buy|Purchase', case=False, na=False)]['Shares'].sum()
                         sells = recent_insiders[recent_insiders['Text'].str.contains('Sell|Sale', case=False, na=False)]['Shares'].abs().sum()
@@ -259,11 +258,9 @@ def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
         except Exception as e:
             logger.debug(f"[{symbol}] 内部人数据解析跳过: {e}")
 
-        # 2. 分析师修正动量 (Analyst Revision Momentum)
         try:
             upgrades = tk.upgrades_downgrades
             if upgrades is not None and not upgrades.empty:
-                # 提取过去 30 天的评级调整
                 cutoff_date = pd.Timestamp.now(tz=timezone.utc) - pd.Timedelta(days=30)
                 if isinstance(upgrades.index, pd.DatetimeIndex):
                     try:
@@ -276,7 +273,6 @@ def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
         except Exception as e:
             logger.debug(f"[{symbol}] 分析师调级数据解析跳过: {e}")
 
-        # 3. 极速 NLP 情绪分析极值提取
         try:
             news_data = tk.news
             if news_data:
@@ -286,7 +282,7 @@ def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
                 title = latest.get('title', '')
                 publisher = latest.get('publisher', '')
                 
-                for n in news_data[:5]: # 扫描最近5条新闻
+                for n in news_data[:5]: 
                     t = n.get('title', '').lower()
                     pos_hits += sum(1 for word in Config.FINBERT_POS if word in t)
                     neg_hits += sum(1 for word in Config.FINBERT_NEG if word in t)
@@ -294,7 +290,6 @@ def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
                 if (pos_hits + neg_hits) > 0:
                     nlp_score = (pos_hits - neg_hits) / (pos_hits + neg_hits)
                 
-                # 保留头条给 UI 展示
                 if title:
                     sentiment_icon = "🟢" if nlp_score > 0.3 else ("🔴" if nlp_score < -0.3 else "⚪")
                     news_summary = f"{sentiment_icon} {title} ({publisher})"
@@ -1211,7 +1206,6 @@ def _evaluate_omni_matrix(df: pd.DataFrame, curr: pd.Series, prev: pd.Series, qq
         if vrp > 5.0:
             add_trigger("波动率风险溢价(VRP)", "🌋 [风险溢价] VRP(隐含-实现)极度飙升，期权市场定价极端恐慌，捕捉极值底 (权:{fw:.2f}x)", 12, "QUANTUM")
 
-        # 🚀 另类数据引擎触发：文本情绪、内部人与WSB散户追踪
         if insider_net_buy > 0.5:
             add_trigger("内部人集群净买入(Insider)", "👔 [内幕天眼] SEC Form 4 披露高管集群式大额净买入，极其强烈的估值底背书 (权:{fw:.2f}x)", 20, "QUANTUM")
             
@@ -1348,27 +1342,36 @@ def _apply_kelly_cluster_optimization(reports: List[dict], price_history_dict: d
             utility = np.dot(w, norm_scores) - 5.0 * np.dot(w, cvars) 
             return -utility
             
-        constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}] 
-        
         sectors = np.array([r['sector'] for r in candidate_pool])
-        for sec in np.unique(sectors):
-            sec_mask = (sectors == sec).astype(float)
-            constraints.append({'type': 'ineq', 'fun': lambda w, m=sec_mask: 0.40 - np.dot(w, m)})
-            
-        daily_target_var = (0.25 / np.sqrt(252)) ** 2
-        constraints.append({'type': 'ineq', 'fun': lambda w: daily_target_var - np.dot(w.T, np.dot(cov_matrix, w))})
-        
         bounds = tuple((0.02, 0.15) for _ in range(len(syms))) 
         init_w = np.ones(len(syms)) / len(syms)
-        
-        res = minimize(objective, init_w, method='SLSQP', bounds=bounds, constraints=constraints)
+
+        def optimize_with_constraints(sec_limit, vol_limit):
+            constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}] 
+            for sec in np.unique(sectors):
+                sec_mask = (sectors == sec).astype(float)
+                constraints.append({'type': 'ineq', 'fun': lambda w, m=sec_mask, lim=sec_limit: lim - np.dot(w, m)})
+            daily_target_var = (vol_limit / np.sqrt(252)) ** 2
+            constraints.append({'type': 'ineq', 'fun': lambda w, targ=daily_target_var: targ - np.dot(w.T, np.dot(cov_matrix, w))})
+            return minimize(objective, init_w, method='SLSQP', bounds=bounds, constraints=constraints)
+
+        res = optimize_with_constraints(0.40, 0.25)
         
         if res.success:
             opt_weights = res.x
         else:
-            logger.warning(f"凸优化约束过度冲突，回退至 Inverse CVaR 分配。")
-            inv_cvar = 1.0 / (cvars + 1e-5)
-            opt_weights = inv_cvar / np.sum(inv_cvar)
+            logger.warning(f"⚠️ 严格凸优化约束冲突，尝试放宽行业(60%)与波动率(35%)上限...")
+            res_relaxed = optimize_with_constraints(0.60, 0.35)
+            if res_relaxed.success:
+                opt_weights = res_relaxed.x
+                logger.info("✅ 宽松约束优化成功。")
+            else:
+                logger.warning(f"🚨 优化器彻底熔断，回退至 Score-Weighted Inverse CVaR 分配。")
+                inv_cvar = 1.0 / (cvars + 1e-5)
+                raw_w = norm_scores * inv_cvar
+                opt_weights = raw_w / np.sum(raw_w)
+                opt_weights = np.clip(opt_weights, 0.02, 0.15)
+                opt_weights = opt_weights / np.sum(opt_weights)
             
         final_reports = []
         for i, r in enumerate(candidate_pool):
@@ -1425,21 +1428,9 @@ def _generate_and_send_matrix_report(final_reports: List[dict], final_shadow_poo
     final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
                     "\n\n---\n\n".join(txts) + \
                     meta_desc + \
-                    f"\n\n*(另类数据天眼: SEC 内部人追踪、华尔街分析师修正、FinBERT 极速词典及 WSB Reddit 热度探测雷达已全面装载完毕！)*"
+                    f"\n\n*(全维宏观雷达: 顶层 Meta-Learner 已接入 SPY-PCR 与信用利差(HYG/IEF) 6维状态张量，动态感知恐慌阻尼！)*"
     
-    send_alert("量化诸神之战 (另类数据天眼版)", final_content)
-    
-    try:
-        with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
-            log_entry = {
-                "date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), 
-                "vix": float(vix_desc.split(":")[1].replace(")", "").strip()) if "VIX:" in vix_desc else 18.0,
-                "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports],
-                "shadow_pool": [{"symbol": r["symbol"], "score": r["score"], "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0)} for r in final_shadow_pool]
-            }
-            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-    except Exception as e:
-        logger.error(f"严重：写入矩阵回测日志时发生崩溃: {e}")
+    send_alert("量化诸神之战 (全维宏观 Meta 跃迁版)", final_content)
 
 def run_tech_matrix() -> None:
     max_risk = 0.015 
@@ -1465,12 +1456,30 @@ def run_tech_matrix() -> None:
     
     vix_current = float(vix_desc.split(":")[1].replace(")", "").strip()) if "VIX:" in vix_desc else 18.0
     
-    vix9d_df = safe_get_history("^VIX9D", "5d", "1d", fast_mode=True)
+    # 🚀 计算全维度宏观张量 (Macro State Tensor)
+    vix3m_df = safe_get_history("^VIX3M", "5d", "1d", fast_mode=True)
     vix_inv = False
-    if not vix9d_df.empty and vix > 0:
-        if vix9d_df['Close'].iloc[-1] / vix > 1.05:
-            vix_inv = True
-            vix_desc += "\n- 🚨 **VIX曲面倒挂**: 近端恐慌(^VIX9D)碾压远端，全市场防线已强制极致收缩！"
+    vix_term_structure = 1.0
+    if not vix3m_df.empty and vix > 0:
+        vix3m_val = vix3m_df['Close'].iloc[-1]
+        if vix3m_val > 0:
+            vix_term_structure = vix / vix3m_val
+            if vix_term_structure > 1.05:
+                vix_inv = True
+                vix_desc += "\n- 🚨 **VIX曲面倒挂**: 近端恐慌(VIX)碾压远期(VIX3M)，全市场防线已强制极致收缩！"
+            
+    # 计算信用利差真实动能 (Credit Spread Momentum)
+    hyg_df = safe_get_history("HYG", "1mo", "1d", fast_mode=True)
+    ief_df = safe_get_history("IEF", "1mo", "1d", fast_mode=True)
+    credit_spread_mom = 0.0
+    if not hyg_df.empty and not ief_df.empty:
+        ratio = hyg_df['Close'] / ief_df['Close']
+        if len(ratio) >= 10:
+            credit_spread_mom = (ratio.iloc[-1] / ratio.iloc[-10]) - 1.0
+            
+    # 获取大盘级期权避险情绪 (Market Put/Call Ratio via SPY)
+    spy_pcr, _, _, _ = safe_get_sentiment_data("SPY")
+    market_pcr = spy_pcr if spy_pcr > 0 else 1.0
             
     total_market_exposure = 1.0
     if vix_inv: total_market_exposure *= 0.5
@@ -1528,19 +1537,17 @@ def run_tech_matrix() -> None:
     raw_reports = []
     price_history_dict = {} 
     
-    # 🚀 在扫盘前，全局抓取一次 Reddit 热度避免 API 封禁
     global_wsb_data = fetch_global_wsb_data()
     
-    for sym in active_pool:
-        if is_alerted(sym): continue
+    def _process_single_symbol(sym):
+        if is_alerted(sym): return None
         try:
             df_raw = safe_get_history(sym, "2y", "1d", fast_mode=True)
-            if len(df_raw) < 150: continue
+            if len(df_raw) < 150: return None
             
             pcr_val, iv_skew, short_chg, short_flt = safe_get_sentiment_data(sym)
             insider_net_buy, analyst_mom, nlp_score, news_summary = safe_get_alt_data(sym)
             
-            # 从全局 WSB 雷达中提取个股热度加速度
             wsb_accel = 0.0
             if sym in global_wsb_data:
                 wsb_info = global_wsb_data[sym]
@@ -1558,7 +1565,7 @@ def run_tech_matrix() -> None:
             if (curr['ATR'] / curr['Close'] > 0.15): is_untradeable = True
             if pd.notna(curr['SMA_200']) and curr['Close'] < curr['SMA_200'] and curr['SMA_50'] < curr['SMA_200']: is_untradeable = True
             
-            price_history_dict[sym] = df['Close'].iloc[-60:]
+            price_hist = df['Close'].iloc[-60:]
             is_vol = (curr['Volume'] / curr['Vol_MA20'] > 1.5) and (curr['Close'] > curr['Open'])
             
             weekly_bullish, fvg_lower, fvg_upper, kde_breakout_score, fft_ensemble_score, hurst_med, hurst_iqr, hurst_reliable, monthly_inst_flow, weekly_macd_res, rsi_60m_bounce, beta_60d, tlt_corr, dxy_corr, vrp = _extract_complex_features(df, df_w, df_m, df_60m, macro_data, vix_current)
@@ -1598,13 +1605,24 @@ def run_tech_matrix() -> None:
             total_score = int(total_score * (1.0 + 0.3 * adv_composite))
             
             sym_sec = Config.get_sector_etf(sym)
-            raw_reports.append({
+            report_data = {
                 "sym": sym, "curr": curr, "prev": prev, "total_score": total_score, "is_bearish_div": is_bearish_div,
                 "sig": sig, "factors": factors, "ml_features": ml_features_array, "is_untradeable": is_untradeable,
                 "sym_sec": sym_sec, "black_swan_risk": black_swan_risk, "news": news_summary
-            })
+            }
+            return sym, report_data, price_hist
         except Exception as e:
             logger.debug(f"[{sym}] 特征提取/打分计算底层抛错: {e}")
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(_process_single_symbol, sym): sym for sym in active_pool}
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res:
+                sym, report_data, price_hist = res
+                raw_reports.append(report_data)
+                price_history_dict[sym] = price_hist
 
     if clf_model and raw_reports:
         X_batch = np.array([r['ml_features'] for r in raw_reports])
@@ -1631,8 +1649,16 @@ def run_tech_matrix() -> None:
                     prob_A = base_A.predict_proba(X_A)[:, 1]
                     prob_B = base_B.predict_proba(X_B)[:, 1]
                     
-                    vix_batch = np.full(len(raw_reports), vix_scalar)
-                    X_meta = np.column_stack([prob_A, prob_B, vix_batch])
+                    vix_batch = np.full(len(raw_reports), vix_current / 20.0)
+                    cred_batch = np.full(len(raw_reports), credit_spread_mom)
+                    term_batch = np.full(len(raw_reports), vix_term_structure - 1.0)
+                    pcr_batch = np.full(len(raw_reports), market_pcr - 1.0)
+                    
+                    # 🚀 防弹后向兼容机制：老版本 3维 vs 新版本 6维 全息宏观状态张量
+                    if hasattr(meta_clf, 'coef_') and meta_clf.coef_.shape[1] == 6:
+                        X_meta = np.column_stack([prob_A, prob_B, vix_batch, cred_batch, term_batch, pcr_batch])
+                    else:
+                        X_meta = np.column_stack([prob_A, prob_B, vix_batch])
                     
                     probs = meta_clf.predict_proba(X_meta)[:, 1]
                 else:
@@ -1711,6 +1737,24 @@ def run_tech_matrix() -> None:
     else:
         logger.info("📭 本次矩阵扫描无标的突破 Top 15% 截面排位，宁缺毋滥，保持静默。")
 
+    # 🚀 将宏观引力张量压入缓存日志，供周五深夜重组
+    try:
+        with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
+            log_entry = {
+                "date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), 
+                "macro_meta": {
+                    "vix": vix_current,
+                    "credit_spread_mom": credit_spread_mom,
+                    "vix_term_structure": vix_term_structure,
+                    "market_pcr": market_pcr
+                },
+                "top_picks": [{"symbol": r.get("symbol"), "score": r.get("score"), "signals": r.get("signals"), "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0), "tp": r.get("tp"), "sl": r.get("sl")} for r in (final_reports if reports and all_raw_scores else [])],
+                "shadow_pool": [{"symbol": r.get("symbol"), "score": r.get("score"), "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0)} for r in (final_shadow_pool if reports and all_raw_scores else [])]
+            }
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.error(f"严重：写入矩阵全息日志时发生崩溃: {e}")
+
 def run_backtest_engine() -> None:
     log_files = [f for f in os.listdir('.') if f.startswith('backtest_log') and f.endswith('.jsonl')]
     if not log_files: 
@@ -1728,8 +1772,24 @@ def run_backtest_engine() -> None:
                         shadows = log.get('shadow_pool', [])
                         if shadows: daily_trades.extend(shadows)
                         
+                        macro = log.get('macro_meta', {})
+                        
                         for p in daily_trades:
-                            trades.append({'date': log['date'], 'vix': log.get('vix', 18.0), 'symbol': p['symbol'], 'signals': p.get('signals', []), 'factors': p.get('factors', []), 'ml_features': p.get('ml_features', []), 'ai_prob': p.get('ai_prob', 0.0), 'tp': p.get('tp', float('inf')), 'sl': p.get('sl', 0)})
+                            # 🚀 解析与兼容历史宏观张量记录
+                            trades.append({
+                                'date': log['date'], 
+                                'vix': macro.get('vix', log.get('vix', 18.0)), 
+                                'cred': macro.get('credit_spread_mom', 0.0),
+                                'term': macro.get('vix_term_structure', 1.0),
+                                'pcr': macro.get('market_pcr', 1.0),
+                                'symbol': p['symbol'], 
+                                'signals': p.get('signals', []), 
+                                'factors': p.get('factors', []), 
+                                'ml_features': p.get('ml_features', []), 
+                                'ai_prob': p.get('ai_prob', 0.0), 
+                                'tp': p.get('tp', float('inf')), 
+                                'sl': p.get('sl', 0)
+                            })
                     except Exception as e:
                         logger.debug(f"跳过损毁的 JSONL 日志行: {e}")
         except Exception as e:
@@ -1791,7 +1851,7 @@ def run_backtest_engine() -> None:
     SLIPPAGE = 0.003    
     COMMISSION = 0.0005 
     
-    stats, factor_rets = {'T+1': [], 'T+3': [], 'T+5': []}, {}
+    stats_period, factor_rets = {'T+1': [], 'T+3': [], 'T+5': []}, {}
     trades_with_ret = []
     
     ai_filtered_wins, ai_filtered_total = 0, 0
@@ -1872,7 +1932,7 @@ def run_backtest_engine() -> None:
                     trade_mfe = (max_high_during_trade - entry_cost) / entry_cost
                     trade_mae = (min_low_during_trade - entry_cost) / entry_cost
                     mae_mfe_records[f'T+{d}'].append({'ret': ret, 'mfe': trade_mfe, 'mae': trade_mae})
-                    stats[f'T+{d}'].append(ret)
+                    stats_period[f'T+{d}'].append(ret)
                     
                     if d == 3:
                         factor_list = t.get('factors', [])
@@ -1898,6 +1958,9 @@ def run_backtest_engine() -> None:
                                 trades_with_ret.append({
                                     'date': t['date'],
                                     'vix': t.get('vix', 18.0),
+                                    'cred': t.get('cred', 0.0),
+                                    'term': t.get('term', 1.0),
+                                    'pcr': t.get('pcr', 1.0),
                                     'ml_features': ml_feats,
                                     'factors': factor_list,
                                     'ret': ret
@@ -1923,8 +1986,8 @@ def run_backtest_engine() -> None:
             ic_records = {f: [] for f in Config.ALL_FACTORS}
             unique_dates = np.unique(dates_all)
             
-            for d in unique_dates:
-                mask = dates_all == d
+            for d_str in unique_dates:
+                mask = dates_all == d_str
                 if np.sum(mask) < 5: continue
                 
                 X_d = X_all[mask]
@@ -1977,7 +2040,12 @@ def run_backtest_engine() -> None:
             X_B = X_all_active[:, idx_B_in_active]
             
             y_all_class = (y_all_cont > 0.015).astype(int)
-            vix_all = trade_df['vix'].values
+            
+            # 🚀 6 维宏观状态张量构建
+            vix_all = trade_df['vix'].values / 20.0
+            cred_all = trade_df['cred'].values
+            term_all = trade_df['term'].values - 1.0
+            pcr_all = trade_df['pcr'].values - 1.0
             
             tscv = TimeSeriesSplit(n_splits=3)
             oof_pred_A = np.zeros(len(y_all_class))
@@ -2005,10 +2073,14 @@ def run_backtest_engine() -> None:
                 
             valid_meta_idx = np.where(oof_pred_A > 0)[0]
             if len(valid_meta_idx) > 10:
+                # 🧠 L1 正则化 Logistic 将在 6 维宏观天眼下自动选择非噪声特征
                 X_meta_train = np.column_stack([
                     oof_pred_A[valid_meta_idx], 
                     oof_pred_B[valid_meta_idx], 
-                    vix_all[valid_meta_idx] / 20.0  
+                    vix_all[valid_meta_idx],
+                    cred_all[valid_meta_idx],
+                    term_all[valid_meta_idx],
+                    pcr_all[valid_meta_idx]
                 ])
                 y_meta_train = y_all_class[valid_meta_idx]
                 
@@ -2021,7 +2093,7 @@ def run_backtest_engine() -> None:
                 meta_weights_dict['Group_B'] = exp_wB / (exp_wA + exp_wB)
             else:
                 meta_clf = LogisticRegression(class_weight='balanced')
-                meta_clf.fit(np.column_stack([oof_pred_A, oof_pred_B, vix_all]), y_all_class)
+                meta_clf.fit(np.column_stack([oof_pred_A, oof_pred_B, vix_all, cred_all, term_all, pcr_all]), y_all_class)
 
             final_base_A = LGBMClassifier(**lgbm_params).fit(X_A, y_all_class) if can_train_A else None
             final_base_B = LGBMClassifier(**lgbm_params).fit(X_B, y_all_class) if can_train_B else None
@@ -2037,7 +2109,7 @@ def run_backtest_engine() -> None:
             }
             with open(Config.MODEL_FILE, 'wb') as f:
                 pickle.dump(clf_model, f)
-            logger.info(f"🧠 【动态代谢体系】25维优胜张量已封装进 Stacking Ensemble 模型落盘。")
+            logger.info(f"🧠 【动态代谢体系】25维优胜张量已封装进 6维全息宏观感知的 Stacking Ensemble 模型落盘。")
             
             combined_imp = np.zeros(len(Config.ALL_FACTORS))
             if final_base_A and hasattr(final_base_A, 'feature_importances_'):
@@ -2062,7 +2134,7 @@ def run_backtest_engine() -> None:
             logger.error(f"ML 模型代谢淘汰训练受阻: {e}")
             
     res = {}
-    for p, r in stats.items():
+    for p, r in stats_period.items():
         if not r: continue
         ret_arr = np.array(r)
         
@@ -2264,9 +2336,9 @@ def run_synthetic_stress_test() -> None:
         'spy': pd.DataFrame(), 'tlt': pd.DataFrame(), 'dxy': pd.DataFrame()
     }
     
-    for sym in active_pool[:20]: 
+    def _stress_test_worker(sym):
         df_raw = safe_get_history(sym, "5y", "1d", fast_mode=True)
-        if len(df_raw) < 500: continue
+        if len(df_raw) < 500: return None
         
         df_phase, df_noise = _decompose_and_perturb(df_raw)
         
@@ -2274,6 +2346,12 @@ def run_synthetic_stress_test() -> None:
             'Original': df_raw,
             'Phase_Chaos': df_phase,
             'Noise_Explosion': df_noise
+        }
+        
+        local_metrics = {
+            'Original': {'trades': 0, 'wins': 0, 'ret_sum': 0.0},
+            'Phase_Chaos': {'trades': 0, 'wins': 0, 'ret_sum': 0.0},
+            'Noise_Explosion': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}
         }
         
         for env_name, df_env in datasets.items():
@@ -2314,11 +2392,22 @@ def run_synthetic_stress_test() -> None:
                         exit_px = df_ind['Close'].iloc[i+4]
                         ret = (exit_px - entry_px) / entry_px
                         
-                        metrics[env_name]['trades'] += 1
-                        metrics[env_name]['ret_sum'] += ret
-                        if ret > 0: metrics[env_name]['wins'] += 1
+                        local_metrics[env_name]['trades'] += 1
+                        local_metrics[env_name]['ret_sum'] += ret
+                        if ret > 0: local_metrics[env_name]['wins'] += 1
             except Exception as e:
                 logger.debug(f"[{sym}] 压测模拟时阻断: {e}")
+        return local_metrics
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(_stress_test_worker, sym) for sym in active_pool[:20]]
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res:
+                for env_name in metrics:
+                    metrics[env_name]['trades'] += res[env_name]['trades']
+                    metrics[env_name]['wins'] += res[env_name]['wins']
+                    metrics[env_name]['ret_sum'] += res[env_name]['ret_sum']
 
     report_lines = ["### 🌪️ **对抗样本压力测试报告 (Adversarial Stress Test)**"]
     report_lines.append("*通过合成数据对模型进行极限摧残，暴露虚假拟合。*\n")
@@ -2357,4 +2446,4 @@ if __name__ == "__main__":
     if m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
     elif m == "stress": run_synthetic_stress_test()
-    elif m == "test": send_alert("连通性测试", "另类数据天眼已开启！系统将通过 Reddit 雷达、FinBERT 降维词典及 SEC 高管追踪，打破唯K线论的束缚！")
+    elif m == "test": send_alert("连通性测试", "全维宏观 Meta 跃迁完成！系统已通过 L1 正则化，开启了包括信用利差、PCR 与 VIX 曲线在内的 6 维上帝视野。")
