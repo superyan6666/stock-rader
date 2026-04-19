@@ -298,7 +298,7 @@ def load_strategy_performance_tag() -> str:
                 t3 = stats_data.get("overall", {}).get("T+3") if "overall" in stats_data else stats_data.get("T+3")
                 if t3 and t3.get('total_trades', 0) > 0:
                     pf_str = f" | 盈亏比 {t3.get('profit_factor', 0.0):.2f}" if 'profit_factor' in t3 else ""
-                    ai_wr_str = f" | ⚡LTR截面过滤 {t3['ai_win_rate']:.1%}" if 'ai_win_rate' in t3 else ""
+                    ai_wr_str = f" | ⚡LGBM双脑过滤 {t3['ai_win_rate']:.1%}" if 'ai_win_rate' in t3 else ""
                     return f"**📈 策略基底验证 (T+3):** 原始胜率 {t3['win_rate']:.1%}{ai_wr_str}{pf_str}"
     except Exception: pass
     return ""
@@ -1016,9 +1016,31 @@ def run_tech_matrix() -> None:
             })
         except Exception: pass
 
+    # 🚀 双脑融合：LightGBM Ranker (左脑) + Quantile Regressor (右脑) 并发推理
     if clf_model and raw_reports:
         X_batch = np.array([r['ml_features'] for r in raw_reports])
-        if hasattr(clf_model, 'predict_proba'):
+        
+        if isinstance(clf_model, dict) and 'ranker' in clf_model and 'regressor' in clf_model:
+            ranker = clf_model['ranker']
+            regressor = clf_model['regressor']
+            
+            # 左脑：预测截面相对排序优势
+            rank_scores = ranker.predict(X_batch)
+            # 右脑：预测绝对 90% 分位数极限暴涨潜能
+            reg_scores = regressor.predict(X_batch)
+            
+            if len(raw_reports) > 1:
+                r_z = (rank_scores - np.mean(rank_scores)) / (np.std(rank_scores) + 1e-10)
+                p_rank = 1 / (1 + np.exp(-r_z))
+                
+                reg_z = (reg_scores - np.mean(reg_scores)) / (np.std(reg_scores) + 1e-10)
+                p_reg = 1 / (1 + np.exp(-reg_z))
+            else:
+                p_rank = np.array([0.6])
+                p_reg = np.array([0.6])
+                
+            probs = 0.5 * p_rank + 0.5 * p_reg
+        elif hasattr(clf_model, 'predict_proba'): # Legacy fallbacks
             try:
                 class_idx = np.where(clf_model.classes_ == 1)[0][0] if 1 in clf_model.classes_ else 0
                 probs = clf_model.predict_proba(X_batch)[:, class_idx]
@@ -1095,7 +1117,7 @@ def run_tech_matrix() -> None:
             ai_display = f"🔥 **{r.get('ai_prob', 0):.1%}**" if r.get('ai_prob', 0) > 0.60 else f"{r.get('ai_prob', 0):.1%}"
             
             txts.append(
-                f"### {icon} **{r['symbol']}** | 🤖 LTR 截面排序概率: {ai_display} | 🌟 逻辑共振度: {r['score']}分\n"
+                f"### {icon} **{r['symbol']}** | 🤖 双脑融合胜率: {ai_display} | 🌟 逻辑共振度: {r['score']}分\n"
                 f"**💡 机构交易透视:**\n{sigs_fmt}{news_fmt}\n\n"
                 f"**💰 绝对风控界限:**\n"
                 f"- 💵 现价: `{r['curr_close']:.2f}`\n"
@@ -1111,15 +1133,15 @@ def run_tech_matrix() -> None:
         
         final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
                         "\n\n---\n\n".join(txts) + \
-                        f"\n\n*(防穿越净化: 系统已搭载 Purged Walk-Forward 交叉验证机制，严防信息泄露，锁定最优迭代边界。)*"
+                        f"\n\n*(双脑回归跃迁: 系统已正式搭载 LGBM Ranker (排序截面) 与 Quantile Regressor (分位数极端动能) 双核引擎！)*"
         
-        send_alert("量化诸神之战 (Purged防穿越版)", final_content)
+        send_alert("量化诸神之战 (双脑回归版)", final_content)
         
         with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
             log_entry = {
                 "date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), 
-                "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports],
-                "shadow_pool": [{"symbol": r["symbol"], "score": r["score"], "factors": r.get("factors", []), "ml_features": r.get("ml_features", [])} for r in final_shadow_pool]
+                "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports],
+                "shadow_pool": [{"symbol": r["symbol"], "score": r["score"], "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0)} for r in final_shadow_pool]
             }
             f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
     else:
@@ -1143,7 +1165,8 @@ def run_backtest_engine() -> None:
                         if shadows: daily_trades.extend(shadows)
                         
                         for p in daily_trades:
-                            trades.append({'date': log['date'], 'symbol': p['symbol'], 'signals': p.get('signals', []), 'factors': p.get('factors', []), 'ml_features': p.get('ml_features', []), 'tp': p.get('tp', float('inf')), 'sl': p.get('sl', 0)})
+                            # 💡 读取日志时安全提取 ai_prob，这代表模型当时的真实想法 (Out-of-sample)
+                            trades.append({'date': log['date'], 'symbol': p['symbol'], 'signals': p.get('signals', []), 'factors': p.get('factors', []), 'ml_features': p.get('ml_features', []), 'ai_prob': p.get('ai_prob', 0.0), 'tp': p.get('tp', float('inf')), 'sl': p.get('sl', 0)})
                     except: pass
         except Exception as e:
             logger.debug(f"读取日志分片 {lf} 失败: {e}")
@@ -1209,14 +1232,6 @@ def run_backtest_engine() -> None:
     
     ai_filtered_wins, ai_filtered_total = 0, 0
     mae_mfe_records = {'T+1': [], 'T+3': [], 'T+5': []}
-    
-    clf_model = None
-    if os.path.exists(Config.MODEL_FILE):
-        try:
-            import pickle
-            with open(Config.MODEL_FILE, 'rb') as f:
-                clf_model = pickle.load(f)
-        except Exception: pass
     
     for t in trades:
         sym, r_dt = t['symbol'], t['date']
@@ -1305,6 +1320,12 @@ def run_backtest_engine() -> None:
                         for f_name in factor_list:
                             factor_rets.setdefault(f"[{f_name}]", []).append(ret)
                             
+                        # 💡 真实样本外 (Out-of-Sample) 的 AI 性能过滤：完全依赖日志中记录的历史 prob 值
+                        ai_prob = t.get('ai_prob', 0.0)
+                        if ai_prob >= 0.50:  
+                            ai_filtered_total += 1
+                            if ret > 0: ai_filtered_wins += 1
+                            
                         ml_feats = t.get('ml_features', [])
                         if ml_feats and len(ml_feats) == len(Config.ALL_FACTORS):
                             trades_with_ret.append({
@@ -1312,24 +1333,17 @@ def run_backtest_engine() -> None:
                                 'ml_features': ml_feats,
                                 'ret': ret
                             })
-                            
-                            if clf_model and hasattr(clf_model, 'predict'):
-                                try:
-                                    score = clf_model.predict([ml_feats])[0]
-                                    if score > 0: 
-                                        ai_filtered_total += 1
-                                        if ret > 0: ai_filtered_wins += 1
-                                except Exception: pass
     
     feature_importances_dict = {}
     trade_df = pd.DataFrame(trades_with_ret)
     if len(trade_df) >= 30:
         try:
-            from lightgbm import LGBMRanker, early_stopping
+            from lightgbm import LGBMRanker, LGBMRegressor, early_stopping
             import pickle
             
             trade_df = trade_df.sort_values('date')
             
+            # 构建 Ranker 专属的截面 Relevance (0-4档)
             relevance_list = []
             for date, group in trade_df.groupby('date', sort=False):
                 if len(group) < 3:
@@ -1342,68 +1356,96 @@ def run_backtest_engine() -> None:
             trade_df['relevance'] = pd.concat(relevance_list)
             
             X_train = np.vstack(trade_df['ml_features'].values)
-            y_train = trade_df['relevance'].values
+            y_train_rank = trade_df['relevance'].values
+            
+            # 🚀 构建 Quantile Regressor 专属的连续绝对收益标签！
+            y_train_reg = trade_df['ret'].values 
             groups = trade_df.groupby('date', sort=False).size().values
             
-            base_lgbm_params = dict(
-                objective="lambdarank",
-                metric="ndcg",
-                learning_rate=0.05,
-                max_depth=5,
-                random_state=42,
-                n_estimators=150
+            # 🧠 左脑：LightGBM Ranker (截面逻辑排序)
+            ranker_params = dict(
+                objective="lambdarank", metric="ndcg", learning_rate=0.05,
+                max_depth=5, random_state=42, n_estimators=150
+            )
+            
+            # 🧠 右脑：LightGBM Quantile Regressor (90%分位数绝对暴涨预测)
+            regressor_params = dict(
+                objective="quantile", alpha=0.9, metric="quantile", learning_rate=0.05,
+                max_depth=5, random_state=42, n_estimators=150
             )
             
             unique_dates = trade_df['date'].unique()
-            # 🚀 时间序列交叉验证 (Purged Walk-Forward CV) 核心逻辑：
-            # 针对 GitHub Actions 短时间重训的特性，采用单折验证动态寻找 Early Stopping
             if len(unique_dates) > 30:
-                # 划分 80% 训练集, 20% 验证集
                 val_size = max(1, int(len(unique_dates) * 0.2))
                 train_dates = unique_dates[:-val_size]
                 val_dates = unique_dates[-val_size:]
                 
-                # 🚀 Purge 净化：强行剔除训练集末尾 5 个交易日，切断 T+5 标签重叠导致的未来函数泄露！
                 purge_days = 5
                 train_dates = train_dates[:-purge_days] if len(train_dates) > purge_days else train_dates
                 
                 train_mask = trade_df['date'].isin(train_dates)
                 val_mask = trade_df['date'].isin(val_dates)
                 
-                X_train_cv, y_train_cv = X_train[train_mask], y_train[train_mask]
+                X_train_cv = X_train[train_mask]
+                y_train_cv_rank, y_train_cv_reg = y_train_rank[train_mask], y_train_reg[train_mask]
                 groups_train_cv = trade_df[train_mask].groupby('date', sort=False).size().values
                 
-                X_val_cv, y_val_cv = X_train[val_mask], y_train[val_mask]
+                X_val_cv = X_train[val_mask]
+                y_val_cv_rank, y_val_cv_reg = y_train_rank[val_mask], y_train_reg[val_mask]
                 groups_val_cv = trade_df[val_mask].groupby('date', sort=False).size().values
                 
-                clf_cv = LGBMRanker(**base_lgbm_params)
-                # 💡 使用被 Purge 洗净的验证集进行 Early Stopping，防范过拟合
-                clf_cv.fit(
-                    X_train_cv, y_train_cv, group=groups_train_cv,
-                    eval_set=[(X_val_cv, y_val_cv)], eval_group=[groups_val_cv],
+                # 训练与验证左脑 (Ranker)
+                clf_rank_cv = LGBMRanker(**ranker_params)
+                clf_rank_cv.fit(
+                    X_train_cv, y_train_cv_rank, group=groups_train_cv,
+                    eval_set=[(X_val_cv, y_val_cv_rank)], eval_group=[groups_val_cv],
                     callbacks=[early_stopping(stopping_rounds=20, verbose=False)]
                 )
+                best_iters_rank = clf_rank_cv.best_iteration_ if clf_rank_cv.best_iteration_ else 100
                 
-                best_iters = clf_cv.best_iteration_ if clf_cv.best_iteration_ else 100
-                logger.info(f"🛡️ Purged CV 防穿越净化完成：验证集防过拟合最佳树迭代次数为 {best_iters} 棵。")
+                # 训练与验证右脑 (Quantile Regressor)
+                clf_reg_cv = LGBMRegressor(**regressor_params)
+                clf_reg_cv.fit(
+                    X_train_cv, y_train_cv_reg,
+                    eval_set=[(X_val_cv, y_val_cv_reg)],
+                    callbacks=[early_stopping(stopping_rounds=20, verbose=False)]
+                )
+                best_iters_reg = clf_reg_cv.best_iteration_ if clf_reg_cv.best_iteration_ else 100
                 
-                # 将最佳参数带回全量数据重新拟合
-                clf = LGBMRanker(**base_lgbm_params)
-                clf.set_params(n_estimators=best_iters)
-                clf.fit(X_train, y_train, group=groups)
+                logger.info(f"🛡️ Purged CV 净化完成：左脑排序迭代 {best_iters_rank}，右脑分位数回归迭代 {best_iters_reg}。")
+                
+                # 携带抗过拟合的最优参数，重组全量记忆！
+                clf_rank = LGBMRanker(**{**ranker_params, 'n_estimators': best_iters_rank})
+                clf_rank.fit(X_train, y_train_rank, group=groups)
+                
+                clf_reg = LGBMRegressor(**{**regressor_params, 'n_estimators': best_iters_reg})
+                clf_reg.fit(X_train, y_train_reg)
             else:
-                # 数据不足 30 天，暂时保守拟合
-                clf = LGBMRanker(**base_lgbm_params)
-                clf.fit(X_train, y_train, group=groups)
+                clf_rank = LGBMRanker(**ranker_params)
+                clf_rank.fit(X_train, y_train_rank, group=groups)
+                
+                clf_reg = LGBMRegressor(**regressor_params)
+                clf_reg.fit(X_train, y_train_reg)
             
+            # 💡 将双脑模型打包成字典落盘
+            clf_model = {'ranker': clf_rank, 'regressor': clf_reg, 'n_features_in_': len(Config.ALL_FACTORS)}
             with open(Config.MODEL_FILE, 'wb') as f:
-                pickle.dump(clf, f)
-            logger.info(f"🧠 【排序学习跃迁】搭载 Purged Walk-Forward 的全息排序模型已重训落盘。")
+                pickle.dump(clf_model, f)
+            logger.info(f"🧠 【双脑协同回归】搭载 LTR 排序与 Quantile 回归的全息双核模型已重训落盘。")
             
-            if hasattr(clf, 'feature_importances_'):
-                importances = clf.feature_importances_
-                for factor, imp in zip(Config.ALL_FACTORS, importances):
+            # 整合左右脑的 XAI 特征重要性
+            if hasattr(clf_rank, 'feature_importances_') and hasattr(clf_reg, 'feature_importances_'):
+                imp_rank = clf_rank.feature_importances_
+                imp_reg = clf_reg.feature_importances_
+                
+                imp_rank_norm = imp_rank / (np.sum(imp_rank) + 1e-10)
+                imp_reg_norm = imp_reg / (np.sum(imp_reg) + 1e-10)
+                
+                # 双脑混合重要度
+                combined_importances = (imp_rank_norm + imp_reg_norm) / 2.0
+                for factor, imp in zip(Config.ALL_FACTORS, combined_importances):
                     feature_importances_dict[factor] = float(imp)
+                    
         except ImportError:
             logger.warning("未检测到 lightgbm 环境，已跳过 Ranker 训练。请确保在 requirements.txt 中添加了 lightgbm。")
         except Exception as e:
@@ -1470,14 +1512,14 @@ def run_backtest_engine() -> None:
             
     with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: json.dump({"overall": res, "factors": f_res, "xai_importances": feature_importances_dict}, f, indent=4)
     
-    report_md = [f"# 📈 自动量化战报与 AI 透视\n**更新:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n## ⚔️ 核心表现评估\n| 周期 | 原始胜率 | ⚡LTR截面过滤 | 均收益 | 盈亏比 | Sharpe | 胜单平均抗压(MAE) | 笔数 |\n|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"]
+    report_md = [f"# 📈 自动量化战报与 AI 透视\n**更新:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n## ⚔️ 核心表现评估\n| 周期 | 原始胜率 | ⚡双脑联合过滤 | 均收益 | 盈亏比 | Sharpe | 胜单平均抗压(MAE) | 笔数 |\n|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"]
     for p in ['T+1', 'T+3', 'T+5']:
         d = res.get(p, {'win_rate':0,'avg_ret':0,'profit_factor':0,'sharpe':0,'avg_win_mae':0,'max_cons_loss':0,'total_trades':0})
         ai_str = f"**{d.get('ai_win_rate', 0.0)*100:.1f}%**" if 'ai_win_rate' in d else "-"
         report_md.append(f"| {p} | {d['win_rate']*100:.1f}% | {ai_str} | {d['avg_ret']*100:+.2f}% | {d['profit_factor']:.2f} | {d['sharpe']:.2f} | {d['avg_win_mae']*100:.1f}% | {d['total_trades']} |")
     
     if feature_importances_dict:
-        report_md.append("\n## 🧠 XAI (解释性人工智能) - 驱动当期市场的核心因子权重\n| 因子特征 | AI 分配重要性 (Feature Importance) |\n|:---|:---:|")
+        report_md.append("\n## 🧠 XAI (解释性人工智能) - 驱动当期市场的核心因子权重\n| 因子特征 | AI 分配重要性 (双脑联合) |\n|:---|:---:|")
         sorted_xai = sorted(feature_importances_dict.items(), key=lambda x: x[1], reverse=True)
         for tag, imp in sorted_xai: 
             report_md.append(f"| {tag} | {imp*100:.1f}% |")
@@ -1491,21 +1533,21 @@ def run_backtest_engine() -> None:
 
     alert_lines = ["### 📊 **机构级回测报表 (含 MAE/MFE 归因分析)**"]
     for p, d in res.items(): 
-        ai_text = f" | ⚡LTR截面过滤: **{d['ai_win_rate']*100:.1f}%**" if 'ai_win_rate' in d else ""
+        ai_text = f" | ⚡双脑联合过滤: **{d['ai_win_rate']*100:.1f}%**" if 'ai_win_rate' in d else ""
         alert_lines.append(f"- **{p}:** 原始胜率 {d['win_rate']*100:.1f}%{ai_text} | 盈亏比 {d['profit_factor']:.2f} | 获利单抗压(MAE) {d['avg_win_mae']*100:.1f}%")
     
     if feature_importances_dict:
-        alert_lines.extend(["", "---", "", "### 🧠 **XAI 市场驱动因子 (LightGBM Ranker)**"])
+        alert_lines.extend(["", "---", "", "### 🧠 **XAI 市场驱动因子 (LGBM 排序+回归双脑)**"])
         sorted_xai = sorted(feature_importances_dict.items(), key=lambda x: x[1], reverse=True)
         for idx, (tag, imp) in enumerate(sorted_xai[:3]):
             icon = ['🔥','🔥','🔥'][idx]
             alert_lines.append(f"- {icon} **{tag}**: 贡献度 {imp*100:.1f}%")
             
-    send_alert("策略终极回测战报 (Purged CV版)", "\n".join(alert_lines))
+    send_alert("策略终极回测战报 (双脑回归版)", "\n".join(alert_lines))
 
 if __name__ == "__main__":
     validate_config()
     m = sys.argv[1] if len(sys.argv) > 1 else "matrix"
     if m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "防穿越武装完毕！系统已搭载 Purged Walk-Forward 切割器，验证集将前置剥离最后5天以阻断未来函数，锁定真实最优参数。")
+    elif m == "test": send_alert("连通性测试", "双脑回归跃迁完成！系统已由【LightGBM Ranker (处理截面排序)】与【Quantile Regressor (瞄准极端上行)】接管，彻底补齐量化最后拼图。")
