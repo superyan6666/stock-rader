@@ -178,10 +178,57 @@ def check_earnings_risk(symbol: str) -> bool:
     except Exception: pass
     return False
 
+def fetch_tradingview_screener(max_tickers=150) -> list:
+    """👁️ 天眼：秒级扫描全美股 8000+ 标的，抓取相对成交量异动最猛的股票"""
+    logger.info("📡 启动天眼 (TradingView Scanner) 进行全市场广度雷达扫描...")
+    try:
+        url = "https://scanner.tradingview.com/america/scan"
+        payload = {
+            "filter": [
+                {"left": "type", "operation": "in_range", "right": ["stock"]},
+                {"left": "subtype", "operation": "in_range", "right": ["common"]},
+                {"left": "exchange", "operation": "in_range", "right": ["AMEX", "NASDAQ", "NYSE"]},
+                {"left": "close", "operation": "greater", "right": 10},
+                {"left": "average_volume_10d_calc", "operation": "greater", "right": 2000000}
+            ],
+            "options": {"lang": "en"},
+            "markets": ["america"],
+            "symbols": {"query": {"types": []}, "tickers": []},
+            "columns": ["name", "close", "volume", "RelativeVolume10CG"],
+            "sort": {"sortBy": "RelativeVolume10CG", "sortOrder": "desc"},
+            "range": [0, max_tickers]
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Content-Type": "application/json"
+        }
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            tickers = []
+            for item in data.get('data', []):
+                raw_ticker = item['d'][0]
+                # TV 返回格式多为 "NASDAQ:AAPL"，提取纯 Ticker
+                ticker = raw_ticker.split(':')[1] if ':' in raw_ticker else raw_ticker
+                tickers.append(ticker)
+            
+            # 过滤掉带点和过长的异常标的，适配 yfinance 格式 (如 BRK.B -> BRK-B)
+            valid_tickers = [t.replace('.', '-') for t in tickers if len(t) <= 5]
+            logger.info(f"👁️ 天眼锁定: 成功从全市场捕获 {len(valid_tickers)} 只极致异动标的。")
+            return valid_tickers
+    except Exception as e:
+        logger.warning(f"⚠️ 天眼扫描受阻: {e}")
+    return []
+
 def get_filtered_watchlist(max_stocks: int = 120) -> list:
-    logger.info(">>> 漏斗过滤：从多维度数据源拉取名单 (含纳指与中盘)...")
+    logger.info(">>> 漏斗过滤：从多维度数据源拉取名单 (含天眼雷达与纳指中盘)...")
     tickers = set(Config.CORE_WATCHLIST)
     
+    # 🚀 Phase 1 跃迁：接入 TradingView 天眼雷达
+    tv_tickers = fetch_tradingview_screener(150)
+    if tv_tickers:
+        tickers.update(tv_tickers)
+        
     if os.path.exists(Config.CACHE_FILE):
         try:
             mtime = os.path.getmtime(Config.CACHE_FILE)
@@ -1200,4 +1247,61 @@ def run_backtest_engine() -> None:
             
         res[p] = res_data
 
-    f
+    f_res = {}
+    for t, r in factor_rets.items():
+        if len(r) >= 2:
+            ret_arr = np.array(r)
+            win_returns = ret_arr[ret_arr > 0]
+            loss_returns = ret_arr[ret_arr < 0]
+            sum_wins = np.sum(win_returns) if len(win_returns) > 0 else 0.0
+            sum_losses = abs(np.sum(loss_returns)) if len(loss_returns) > 0 else 1e-6
+            pf = sum_wins / sum_losses if sum_losses > 0 else 99.0
+            
+            f_res[t] = {
+                'win_rate': len(win_returns)/len(r), 
+                'avg_ret': sum(r)/len(r), 
+                'count': len(r),
+                'profit_factor': pf
+            }
+            
+    with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: json.dump({"overall": res, "factors": f_res, "xai_importances": feature_importances_dict}, f, indent=4)
+    
+    report_md = [f"# 📈 自动量化战报与 AI 透视\n**更新:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n## ⚔️ 核心表现评估\n| 周期 | 原始胜率 | ⚡双脑AI过滤 | 均收益 | 盈亏比 | Sharpe | 胜单平均抗压(MAE) | 笔数 |\n|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"]
+    for p in ['T+1', 'T+3', 'T+5']:
+        d = res.get(p, {'win_rate':0,'avg_ret':0,'profit_factor':0,'sharpe':0,'avg_win_mae':0,'max_cons_loss':0,'total_trades':0})
+        ai_str = f"**{d.get('ai_win_rate', 0.0)*100:.1f}%**" if 'ai_win_rate' in d else "-"
+        report_md.append(f"| {p} | {d['win_rate']*100:.1f}% | {ai_str} | {d['avg_ret']*100:+.2f}% | {d['profit_factor']:.2f} | {d['sharpe']:.2f} | {d['avg_win_mae']*100:.1f}% | {d['total_trades']} |")
+    
+    if feature_importances_dict:
+        report_md.append("\n## 🧠 XAI (解释性人工智能) - 驱动当期市场的核心因子权重\n| 因子特征 | AI 分配重要性 (Feature Importance) |\n|:---|:---:|")
+        sorted_xai = sorted(feature_importances_dict.items(), key=lambda x: x[1], reverse=True)
+        for tag, imp in sorted_xai: 
+            report_md.append(f"| {tag} | {imp*100:.1f}% |")
+
+    if f_res:
+        report_md.append(f"\n## 🧬 终极 {len(Config.ALL_FACTORS)} 维世界线因子群 (T+3)\n| 因子 | 胜率 | 盈亏比 | 触发次数 |\n|:---|:---:|:---:|:---:|")
+        sorted_f = sorted(f_res.items(), key=lambda x: x[1]['win_rate'], reverse=True)
+        for tag, d in sorted_f: report_md.append(f"| {tag} | {d['win_rate']*100:.1f}% | {d['profit_factor']:.2f} | {d['count']} |")
+    
+    with open(Config.REPORT_FILE, 'w', encoding='utf-8') as f: f.write('\n'.join(report_md))
+
+    alert_lines = ["### 📊 **机构级回测报表 (含 MAE/MFE 归因分析)**"]
+    for p, d in res.items(): 
+        ai_text = f" | ⚡双脑AI过滤: **{d['ai_win_rate']*100:.1f}%**" if 'ai_win_rate' in d else ""
+        alert_lines.append(f"- **{p}:** 原始胜率 {d['win_rate']*100:.1f}%{ai_text} | 盈亏比 {d['profit_factor']:.2f} | 获利单抗压(MAE) {d['avg_win_mae']*100:.1f}%")
+    
+    if feature_importances_dict:
+        alert_lines.extend(["", "---", "", "### 🧠 **XAI 市场驱动因子 (Random Forest 提纯)**"])
+        sorted_xai = sorted(feature_importances_dict.items(), key=lambda x: x[1], reverse=True)
+        for idx, (tag, imp) in enumerate(sorted_xai[:3]):
+            icon = ['🔥','🔥','🔥'][idx]
+            alert_lines.append(f"- {icon} **{tag}**: 贡献度 {imp*100:.1f}%")
+            
+    send_alert("策略终极回测战报 (24维赛博飞升版)", "\n".join(alert_lines))
+
+if __name__ == "__main__":
+    validate_config()
+    m = sys.argv[1] if len(sys.argv) > 1 else "matrix"
+    if m == "matrix": run_tech_matrix()
+    elif m == "backtest": run_backtest_engine()
+    elif m == "test": send_alert("连通性测试", "赛博飞升完成！24维神级矩阵接入，傅里叶周期与量子概率云已开启绝对感知。")
