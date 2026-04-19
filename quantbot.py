@@ -74,6 +74,7 @@ class Config:
     
     DATA_DIR: str = ".quantbot_data"
     EXT_CACHE_FILE: str = os.path.join(DATA_DIR, "daily_ext_cache.json")
+    MODEL_VERSION: str = "1.0" 
 
     # 🚀 因子生命周期管理：按成熟度与来源严格划分，根除僵尸因子
     CORE_FACTORS = [
@@ -110,14 +111,17 @@ class Config:
     class Params:
         MAX_WORKERS = 8
         MIN_SCORE_THRESHOLD = 8
-        BASE_MAX_RISK = 0.015       # 单笔最大本金风险暴露上限
-        CROWDING_PENALTY = 0.75     # 拥挤度惩罚乘数
-        CROWDING_MIN_STOCKS = 2     # 触发拥挤惩罚的同板块最低个股数
+        BASE_MAX_RISK = 0.015       
+        CROWDING_PENALTY = 0.75     
+        CROWDING_MIN_STOCKS = 2     
+        
+        # 🚀 系统调度与通知参数
+        ALERT_COOLDOWN_HOURS = 24.0 # 默认告警冷却时间，使用滑动窗口避免同一标的被高频轰炸
         
         # 🚀 回测与实盘仿真交易参数
-        SLIPPAGE = 0.003            # 滑点比例 (默认 0.3%)
-        COMMISSION = 0.0005         # 单边交易手续费 (默认万分之五)
-        MIN_T_STAT = 1.0            # 因子大逃杀最低 T-Stat 绝对值存活线 (确保动态保留显著因子)
+        SLIPPAGE = 0.003            
+        COMMISSION = 0.0005         
+        MIN_T_STAT = 1.0            
 
         # 另类数据与情绪极值阈值
         PCR_BEAR = 1.5           
@@ -146,7 +150,6 @@ class Config:
 
         @classmethod
         def load_overrides(cls):
-            """从环境变量或本地 JSON 动态重写配置参数"""
             if os.path.exists(Config.CUSTOM_CONFIG_FILE):
                 try:
                     with open(Config.CUSTOM_CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -195,7 +198,8 @@ def validate_config():
         with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: f.write("{}")
     if not os.path.exists(Config.ALERT_CACHE_FILE):
         with open(Config.ALERT_CACHE_FILE, 'w', encoding='utf-8') as f: 
-            json.dump({"date": "", "matrix": []}, f)
+            # 🚀 升级结构：为了支持时间戳滑动窗口，将 matrix 和 shadow_pool 转为字典结构
+            json.dump({"matrix": {}, "shadow_pool": {}}, f)
             
     if not os.path.exists(Config.DATA_DIR):
         os.makedirs(Config.DATA_DIR, exist_ok=True)
@@ -233,9 +237,15 @@ def _init_ext_cache():
 def _save_ext_cache():
     with _DAILY_EXT_LOCK:
         try:
-            with open(Config.EXT_CACHE_FILE, 'w', encoding='utf-8') as f:
+            # 🚀 健壮性修复：使用原子写入保护另类数据 JSON，防断电/并发损坏
+            temp_ext = f"{Config.EXT_CACHE_FILE}.{threading.get_ident()}.tmp"
+            with open(temp_ext, 'w', encoding='utf-8') as f:
                 json.dump(_DAILY_EXT_CACHE, f)
-        except Exception: pass
+            os.replace(temp_ext, Config.EXT_CACHE_FILE)
+        except Exception: 
+            try:
+                if os.path.exists(temp_ext): os.remove(temp_ext)
+            except Exception: pass
 
 @dataclass
 class MarketContext:
@@ -255,6 +265,12 @@ class MarketContext:
     total_market_exposure: float
     health_score: float
     pain_warning: str
+    
+    # 🚀 补防漏洞：纳入实时算出的宏观数据特征，确保推理与回测同维穿透
+    credit_spread_mom: float = 0.0
+    vix_term_structure: float = 1.0
+    market_pcr: float = 1.0
+    
     dynamic_min_score: float = 8.0
     global_wsb_data: dict = field(default_factory=dict)
     meta_weights: dict = field(default_factory=dict)
@@ -314,6 +330,7 @@ def check_macd_cross(curr: pd.Series, prev: pd.Series) -> bool:
 def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 5, auto_adjust: bool = True, fast_mode: bool = False) -> pd.DataFrame:
     cache_key = f"{symbol}_{interval}"
     cache_file = os.path.join(Config.DATA_DIR, f"{cache_key}.pkl")
+    archive_dir = os.path.join(Config.DATA_DIR, "archive", symbol)
     
     with _KLINE_LOCK:
         if cache_key in _KLINE_CACHE:
@@ -379,15 +396,48 @@ def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retr
                     df = new_df
                     
                 df = df[~df.index.duplicated(keep='last')]
-                if len(df) > 750: df = df.iloc[-750:] 
+                
+                # 🚀 长期演进引擎：冷热数据分离与月度自动冷归档 (Monthly Archiving)
+                hot_cache_limit = 750
+                if len(df) > hot_cache_limit:
+                    # 提取即将被丢弃的远古冷数据
+                    df_to_archive = df.iloc[:-hot_cache_limit]
+                    
+                    try:
+                        os.makedirs(archive_dir, exist_ok=True)
+                        # 按 "YYYY_MM" 将冷数据切块沉淀
+                        for (year, month), group in df_to_archive.groupby([df_to_archive.index.year, df_to_archive.index.month]):
+                            arch_file = os.path.join(archive_dir, f"{year}_{month:02d}_{interval}.pkl")
+                            
+                            if os.path.exists(arch_file):
+                                old_arch = pd.read_pickle(arch_file)
+                                combined_arch = pd.concat([old_arch, group])
+                                combined_arch = combined_arch[~combined_arch.index.duplicated(keep='last')]
+                            else:
+                                combined_arch = group
+                                
+                            # 原子写入归档库
+                            tmp_arch = f"{arch_file}.{threading.get_ident()}.tmp"
+                            combined_arch.to_pickle(tmp_arch)
+                            os.replace(tmp_arch, arch_file)
+                    except Exception as e:
+                        logger.debug(f"[{symbol}] 冷数据归档执行受阻: {e}")
+                
+                    # 热缓存瘦身：仅保留最近 750 根供机器学习快速推理
+                    df = df.iloc[-hot_cache_limit:] 
                 
                 with _KLINE_LOCK:
                     _KLINE_CACHE[cache_key] = df.copy()
                     
                 try:
-                    df.to_pickle(cache_file)
+                    temp_cache_file = f"{cache_file}.{threading.get_ident()}.tmp"
+                    df.to_pickle(temp_cache_file)
+                    os.replace(temp_cache_file, cache_file)
                 except Exception as e:
-                    logger.debug(f"[{symbol}] 本地持久化写入失败: {e}")
+                    logger.debug(f"[{symbol}] 本地持久化原子写入失败: {e}")
+                    try:
+                        if os.path.exists(temp_cache_file): os.remove(temp_cache_file)
+                    except Exception: pass
                         
                 return df
         except Exception as e:
@@ -437,9 +487,15 @@ def fetch_global_wsb_data() -> Dict[str, float]:
         for d in sorted_dates[:-5]: del history[d]
         
     try:
-        with open(cache_file, "w", encoding="utf-8") as f:
+        # 🚀 健壮性修复：WSB 历史舆情阵列的原子写入
+        temp_wsb = f"{cache_file}.{threading.get_ident()}.tmp"
+        with open(temp_wsb, "w", encoding="utf-8") as f:
             json.dump(history, f)
-    except Exception: pass
+        os.replace(temp_wsb, cache_file)
+    except Exception: 
+        try:
+            if os.path.exists(temp_wsb): os.remove(temp_wsb)
+        except Exception: pass
     
     wsb_accel_dict = {}
     dates = sorted(history.keys())
@@ -729,9 +785,15 @@ def get_filtered_watchlist(max_stocks: int = 150) -> list:
         
         if len(available_tickers) > 200:
             try:
-                with open(Config.CACHE_FILE, "w", encoding="utf-8") as f:
+                # 🚀 健壮性修复：全局海选缓存的原子写入
+                temp_cache = f"{Config.CACHE_FILE}.{threading.get_ident()}.tmp"
+                with open(temp_cache, "w", encoding="utf-8") as f:
                     json.dump(list(available_tickers), f)
-            except Exception: pass
+                os.replace(temp_cache, Config.CACHE_FILE)
+            except Exception: 
+                try:
+                    if os.path.exists(temp_cache): os.remove(temp_cache)
+                except Exception: pass
 
         closes = close_df.dropna(axis=1, how='all').ffill().iloc[-1]
         volumes = volume_df.dropna(axis=1, how='all').mean()
@@ -759,6 +821,52 @@ def load_strategy_performance_tag() -> str:
     except Exception: pass
     return ""
 
+# 🚀 健壮性防线：秒级时间戳冷却机制与安全的原子写入
+def get_alert_cache() -> dict:
+    cache_data = {"matrix": {}, "shadow_pool": {}}
+    try:
+        if os.path.exists(Config.ALERT_CACHE_FILE):
+            with open(Config.ALERT_CACHE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data.get("matrix"), dict):
+                    cache_data = data
+    except Exception: pass
+    return cache_data
+
+def is_alerted(sym: str) -> bool:
+    cache = get_alert_cache()
+    matrix_cache = cache.get("matrix", {})
+    if sym in matrix_cache:
+        last_ts = matrix_cache[sym]
+        # 🚀 使用滑动时间窗 (Rolling Window) 判断冷却期，支持精细到小时级别的控制
+        if time.time() - last_ts < getattr(Config.Params, 'ALERT_COOLDOWN_HOURS', 24.0) * 3600:
+            return True
+    return False
+
+def set_alerted(sym: str, is_shadow: bool = False, shadow_data: dict = None) -> None:
+    cache = get_alert_cache()
+    now_ts = time.time()
+    
+    if not is_shadow:
+        cache.setdefault("matrix", {})[sym] = now_ts
+    else:
+        shadow_pool = cache.setdefault("shadow_pool", {})
+        if shadow_data:
+            shadow_data['_ts'] = now_ts
+            shadow_pool[sym] = shadow_data
+        else:
+            shadow_pool[sym] = {"_ts": now_ts}
+            
+    try:
+        temp_file = f"{Config.ALERT_CACHE_FILE}.{threading.get_ident()}.tmp"
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(cache, f)
+        os.replace(temp_file, Config.ALERT_CACHE_FILE)
+    except Exception: 
+        try:
+            if os.path.exists(temp_file): os.remove(temp_file)
+        except Exception: pass
+
 def send_alert(title: str, content: str) -> None:
     if not content.strip(): return
     formatted_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
@@ -774,14 +882,15 @@ def send_alert(title: str, content: str) -> None:
                 "text": f"## 🤖 【{Config.DINGTALK_KEYWORD}】{title}\n\n{content}\n\n---\n*⏱️ {formatted_time}*"
             }
         }
+        
+        # 🚀 消除 Lambda 语法隐患，使用独立安全的发送函数
+        def _send_webhook(url_str, p_data):
+            try:
+                requests.post(url_str, json=p_data, headers=req_headers, timeout=10)
+            except Exception: pass
+            
         for url in [u.strip() for u in Config.WEBHOOK_URL.split(',') if u.strip()]:
-            threading.Thread(
-                target=lambda u=url, p=payload: [
-                    requests.post(u, json=p, headers=req_headers, timeout=10) 
-                    try: pass except Exception: pass
-                ], 
-                daemon=False
-            ).start()
+            threading.Thread(target=_send_webhook, args=(url, payload), daemon=False).start()
                 
     if Config.TELEGRAM_BOT_TOKEN and Config.TELEGRAM_CHAT_ID:
         html_title = title.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
@@ -794,17 +903,33 @@ def send_alert(title: str, content: str) -> None:
         
         tg_text = f"🤖 <b>【量化监控】{html_title}</b>\n\n{html_content}\n\n⏱️ <i>{formatted_time}</i>"
         
-        threading.Thread(
-            target=lambda: [
-                requests.post(
-                    f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage",
-                    json={"chat_id": Config.TELEGRAM_CHAT_ID, "text": tg_text, "parse_mode": "HTML", "disable_web_page_preview": True},
-                    headers=req_headers, timeout=10
-                )
-                try: pass except Exception: pass
-            ],
-            daemon=False
-        ).start()
+        # 🚀 健壮性优化 8: Telegram 4096 字符红线防御与安全切片
+        def _send_tg_chunks():
+            chunks = []
+            curr_chunk = ""
+            # 按段落切分，确保不会粗暴切断 HTML 标签
+            for paragraph in tg_text.split('\n\n'):
+                if len(curr_chunk) + len(paragraph) + 2 > 4000:
+                    chunks.append(curr_chunk)
+                    curr_chunk = paragraph
+                else:
+                    curr_chunk = curr_chunk + "\n\n" + paragraph if curr_chunk else paragraph
+            if curr_chunk:
+                chunks.append(curr_chunk)
+                
+            for i, chunk in enumerate(chunks):
+                if i > 0:
+                    chunk = f"<i>(接上文 {i+1}/{len(chunks)})</i>\n\n" + chunk
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage",
+                        json={"chat_id": Config.TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "HTML", "disable_web_page_preview": True},
+                        headers=req_headers, timeout=10
+                    )
+                    time.sleep(1.5)  # 严格遵守 TG API 的防轰炸限流规则
+                except Exception: pass
+                
+        threading.Thread(target=_send_tg_chunks, daemon=False).start()
 
 # ================= 3. 大盘感知与指标模块 =================
 def get_vix_level(qqq_df_for_shadow: pd.DataFrame = None) -> Tuple[float, str]:
@@ -925,7 +1050,9 @@ def _robust_fft_ensemble(close_prices: np.ndarray, base_length=120, ensemble_cou
     return float(sum(votes) / len(votes))
 
 def _robust_hurst(close_prices: np.ndarray, min_window=30, n_bootstrap=100) -> Tuple[float, float, bool]:
-    log_ret = np.diff(np.log(close_prices[-121:])) if len(close_prices) > 120 else np.diff(np.log(close_prices))
+    # 🚀 健壮性与数学严谨性修复：添加 np.maximum 保护，彻底断绝价格为 0 或数据异常带来的 log(0) -> -inf 毒药传递
+    safe_prices = np.maximum(close_prices, 1e-10)
+    log_ret = np.diff(np.log(safe_prices[-121:])) if len(safe_prices) > 120 else np.diff(np.log(safe_prices))
     
     if len(log_ret) <= min_window:
         return 0.5, 0.0, False
@@ -1129,17 +1256,31 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _extract_complex_features(stock: StockData, ctx: MarketContext) -> ComplexFeatures:
+    target_dt = None
+    if stock.curr.name is not None:
+        try:
+            target_dt = pd.to_datetime(stock.curr.name)
+            if target_dt.tzinfo is None: target_dt = target_dt.tz_localize('UTC')
+            else: target_dt = target_dt.tz_convert('UTC')
+        except Exception: pass
+
+    aligned_w = stock.df_w
+    if target_dt is not None and not aligned_w.empty:
+        w_tz = aligned_w.copy()
+        w_tz.index = w_tz.index.tz_localize('UTC') if w_tz.index.tzinfo is None else w_tz.index.tz_convert('UTC')
+        aligned_w = w_tz[w_tz.index <= target_dt + pd.Timedelta(days=7)] 
+
     weekly_bullish = False
     weekly_macd_res = 0.0
-    if not stock.df_w.empty and len(stock.df_w) >= 40:
-        sma40_w = stock.df_w['Close'].rolling(40).mean().iloc[-1]
-        if stock.df_w['Close'].iloc[-1] > sma40_w:
-            stock.df_w['EMA_10'] = stock.df_w['Close'].ewm(span=10, adjust=False).mean()
-            stock.df_w['EMA_30'] = stock.df_w['Close'].ewm(span=30, adjust=False).mean()
-            weekly_bullish = (stock.df_w['Close'].iloc[-1] > stock.df_w['EMA_10'].iloc[-1]) and (stock.df_w['EMA_10'].iloc[-1] > stock.df_w['EMA_30'].iloc[-1])
+    if not aligned_w.empty and len(aligned_w) >= 40:
+        sma40_w = aligned_w['Close'].rolling(40).mean().iloc[-1]
+        if aligned_w['Close'].iloc[-1] > sma40_w:
+            aligned_w['EMA_10'] = aligned_w['Close'].ewm(span=10, adjust=False).mean()
+            aligned_w['EMA_30'] = aligned_w['Close'].ewm(span=30, adjust=False).mean()
+            weekly_bullish = (aligned_w['Close'].iloc[-1] > aligned_w['EMA_10'].iloc[-1]) and (aligned_w['EMA_10'].iloc[-1] > aligned_w['EMA_30'].iloc[-1])
             
-        ema12_w = stock.df_w['Close'].ewm(span=12, adjust=False).mean()
-        ema26_w = stock.df_w['Close'].ewm(span=26, adjust=False).mean()
+        ema12_w = aligned_w['Close'].ewm(span=12, adjust=False).mean()
+        ema26_w = aligned_w['Close'].ewm(span=26, adjust=False).mean()
         macd_w = ema12_w - ema26_w
         signal_w = macd_w.ewm(span=9, adjust=False).mean()
         hist_w = macd_w - signal_w
@@ -1190,15 +1331,28 @@ def _extract_complex_features(stock: StockData, ctx: MarketContext) -> ComplexFe
     fft_ensemble_score = _robust_fft_ensemble(stock.df['Close'].values, base_length=120, ensemble_count=7)
     hurst_med, hurst_iqr, hurst_reliable = _robust_hurst(stock.df['Close'].values)
     
+    aligned_m = stock.df_m
+    if target_dt is not None and not aligned_m.empty:
+        m_tz = aligned_m.copy()
+        m_tz.index = m_tz.index.tz_localize('UTC') if m_tz.index.tzinfo is None else m_tz.index.tz_convert('UTC')
+        aligned_m = m_tz[m_tz.index <= target_dt + pd.Timedelta(days=31)] 
+        
     monthly_inst_flow = 0.0
-    if not stock.df_m.empty and len(stock.df_m) >= 3:
-        m_flow = (stock.df_m['Close'] - stock.df_m['Open']) / (stock.df_m['High'] - stock.df_m['Low'] + 1e-10) * stock.df_m['Volume']
+    if not aligned_m.empty and len(aligned_m) >= 3:
+        m_flow = (aligned_m['Close'] - aligned_m['Open']) / (aligned_m['High'] - aligned_m['Low'] + 1e-10) * aligned_m['Volume']
         if m_flow.iloc[-1] > 0 and m_flow.iloc[-2] > 0 and m_flow.iloc[-3] > 0:
             monthly_inst_flow = 1.0
 
     rsi_60m_bounce = 0.0
-    if not stock.df_60m.empty and len(stock.df_60m) >= 15:
-        delta = stock.df_60m['Close'].diff()
+    aligned_60m = stock.df_60m
+    if target_dt is not None and not aligned_60m.empty:
+        m60_tz = aligned_60m.copy()
+        m60_tz.index = m60_tz.index.tz_localize('UTC') if m60_tz.index.tzinfo is None else m60_tz.index.tz_convert('UTC')
+        end_of_day = target_dt.replace(hour=23, minute=59, second=59)
+        aligned_60m = m60_tz[m60_tz.index <= end_of_day]
+
+    if not aligned_60m.empty and len(aligned_60m) >= 15:
+        delta = aligned_60m['Close'].diff()
         up = delta.where(delta > 0, 0).ewm(span=14, adjust=False).mean()
         down = -delta.where(delta < 0, 0).ewm(span=14, adjust=False).mean()
         rs = up / (down + 1e-10)
@@ -1575,7 +1729,8 @@ def _calculate_position_size(stock: StockData, ctx: MarketContext, ai_prob: floa
 
 # ================= 5. 投资组合优化与路由管线 (Pipeline Architecture) =================
 
-def _apply_kelly_cluster_optimization(reports: List[dict], price_history_dict: dict, total_exposure: float) -> List[dict]:
+# 🚀 架构升维：将上下文 ctx 传入优化器，实现风险偏好的动态宏观映射
+def _apply_kelly_cluster_optimization(reports: List[dict], price_history_dict: dict, total_exposure: float, ctx: MarketContext) -> List[dict]:
     reports.sort(key=lambda x: (x["score"], x["ai_prob"]), reverse=True)
     candidate_pool = reports[:15]
     
@@ -1608,8 +1763,14 @@ def _apply_kelly_cluster_optimization(reports: List[dict], price_history_dict: d
         scores = np.array([r['score'] for r in candidate_pool])
         norm_scores = scores / (np.max(scores) + 1e-10)
         
+        # 🚀 动态风险厌恶引擎 (Dynamic Risk Aversion)
+        # ctx.health_score 的范围大致在 -2.2(极端末日) 到 +0.9(狂暴牛市)
+        # 当 health_score 为 0.9 时，惩罚系数降至 ~2.3，优化器偏好高动能高波动；
+        # 当 health_score 为 -2.2 时，惩罚系数飙升至 11.6，优化器强制转向低 Beta 避险资产。
+        risk_aversion = max(2.0, 5.0 - ctx.health_score * 3.0)
+        
         def objective(w):
-            utility = np.dot(w, norm_scores) - 5.0 * np.dot(w, cvars) 
+            utility = np.dot(w, norm_scores) - risk_aversion * np.dot(w, cvars) 
             return -utility
             
         sectors = np.array([r['sector'] for r in candidate_pool])
@@ -1684,9 +1845,9 @@ def _generate_and_send_matrix_report(final_reports: List[dict], final_shadow_poo
     final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
                     "\n\n---\n\n".join(txts) + \
                     meta_desc + \
-                    f"\n\n*(底层防弹重构: 强类型映射已开启，推送线程池已无阻塞分离，保障实盘平滑飞行！)*"
+                    f"\n\n*(防范特征错位: 已引入严格的训练-推理对齐机制，确保宏观因子正确穿透至元学习器！)*"
     
-    send_alert("量化诸神之战 (极速异步防御版)", final_content)
+    send_alert("量化诸神之战 (防特征错位版)", final_content)
 
     try:
         with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
@@ -1694,7 +1855,9 @@ def _generate_and_send_matrix_report(final_reports: List[dict], final_shadow_poo
                 "date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), 
                 "macro_meta": {
                     "vix": ctx.vix_current,
-                    "vix_term_structure": ctx.vix_current / max(1.0, safe_get_history("^VIX3M", "5d", "1d", fast_mode=True)['Close'].iloc[-1] if not safe_get_history("^VIX3M", "5d", "1d", fast_mode=True).empty else ctx.vix_current),
+                    "credit_spread_mom": ctx.credit_spread_mom, 
+                    "vix_term_structure": ctx.vix_term_structure,
+                    "market_pcr": ctx.market_pcr 
                 },
                 "top_picks": [{"symbol": r.get("symbol"), "score": r.get("score"), "signals": r.get("signals"), "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports],
                 "shadow_pool": [{"symbol": r.get("symbol"), "score": r.get("score"), "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0)} for r in final_shadow_pool]
@@ -1742,10 +1905,25 @@ def _build_market_context() -> MarketContext:
     
     vix3m_df = safe_get_history("^VIX3M", "5d", "1d", fast_mode=True)
     vix_inv = False
+    vix_term_structure = 1.0
     if not vix3m_df.empty and vix > 0:
-        if (vix / vix3m_df['Close'].iloc[-1]) > 1.05:
-            vix_inv = True
-            vix_desc += "\n- 🚨 **VIX曲面倒挂**: 近端恐慌碾压远期！"
+        vix3m_val = vix3m_df['Close'].iloc[-1]
+        if vix3m_val > 0:
+            vix_term_structure = vix / vix3m_val
+            if vix_term_structure > 1.05:
+                vix_inv = True
+                vix_desc += "\n- 🚨 **VIX曲面倒挂**: 近端恐慌碾压远期！"
+            
+    hyg_df = safe_get_history("HYG", "1mo", "1d", fast_mode=True)
+    ief_df = safe_get_history("IEF", "1mo", "1d", fast_mode=True)
+    credit_spread_mom = 0.0
+    if not hyg_df.empty and not ief_df.empty:
+        ratio = hyg_df['Close'] / ief_df['Close']
+        if len(ratio) >= 10:
+            credit_spread_mom = (ratio.iloc[-1] / ratio.iloc[-10]) - 1.0
+            
+    spy_pcr, _, _, _ = safe_get_sentiment_data("SPY")
+    market_pcr = spy_pcr if spy_pcr > 0 else 1.0
             
     total_market_exposure = 1.0
     if vix_inv: total_market_exposure *= 0.5
@@ -1771,7 +1949,10 @@ def _build_market_context() -> MarketContext:
         macro_gravity=macro_gravity, is_credit_risk_high=is_credit_risk_high, vix_inv=vix_inv, 
         qqq_df=qqq_df, macro_data=macro_data, total_market_exposure=total_market_exposure,
         health_score=health_score, pain_warning=pain_warning, global_wsb_data=global_wsb_data,
-        meta_weights=meta_weights
+        meta_weights=meta_weights,
+        credit_spread_mom=float(credit_spread_mom),      # 🚀 补防漏洞：将实时宏观特征写入 Context
+        vix_term_structure=float(vix_term_structure),
+        market_pcr=float(market_pcr)
     )
     
     valid_sector_data, black_hole_sectors = {}, []
@@ -1850,14 +2031,25 @@ def _scan_universe_concurrently(ctx: MarketContext) -> Tuple[List[dict], dict]:
             logger.debug(f"[{sym}] 特征提取/打分计算底层抛错: {e}")
             return None
 
+    # 🚀 健壮性防线：对并发提交实施分批缓冲 (Batch Chunking)
+    # 防止一次性塞入过大任务队列导致 OS 文件描述符耗尽或触发底层 API 恐慌性断连
+    chunk_size = 20
     with concurrent.futures.ThreadPoolExecutor(max_workers=Config.Params.MAX_WORKERS) as executor:
-        futures = {executor.submit(_process_single_symbol, sym): sym for sym in ctx.active_pool}
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
-            if res:
-                sym, report_data, price_hist = res
-                raw_reports.append(report_data)
-                price_history_dict[sym] = price_hist
+        for i in range(0, len(ctx.active_pool), chunk_size):
+            chunk = ctx.active_pool[i:i + chunk_size]
+            futures = {executor.submit(_process_single_symbol, sym): sym for sym in chunk}
+            
+            # 使用 as_completed 阻塞等待当前批次收尾，再进入下一个循环
+            for future in concurrent.futures.as_completed(futures):
+                res = future.result()
+                if res:
+                    sym, report_data, price_hist = res
+                    raw_reports.append(report_data)
+                    price_history_dict[sym] = price_hist
+            
+            # 批次之间进行微秒级降温，给予操作系统 I/O 调度与 API 连接池喘息释放的空间
+            if i + chunk_size < len(ctx.active_pool):
+                time.sleep(random.uniform(0.5, 1.5))
 
     return raw_reports, price_history_dict
 
@@ -1871,6 +2063,12 @@ def _apply_ai_inference(raw_reports: List[dict], ctx: MarketContext) -> List[dic
         except Exception: pass
 
     if clf_model and raw_reports:
+        model_ver = clf_model.get('version')
+        if model_ver != Config.MODEL_VERSION:
+            logger.warning(f"⚠️ 检测到模型基因库版本过期或不匹配 (文件版本:{model_ver} vs 当前系统:{Config.MODEL_VERSION})！已触发防弹降级至 0.52，请尽快执行一次 backtest 以重组大脑！")
+            for r in raw_reports: r['ai_prob'] = 0.52
+            return raw_reports
+            
         X_df = pd.DataFrame([r['ml_features'] for r in raw_reports], columns=Config.ALL_FACTORS).fillna(0.0)
         
         if isinstance(clf_model, dict) and 'active_factors' in clf_model:
@@ -1898,8 +2096,13 @@ def _apply_ai_inference(raw_reports: List[dict], ctx: MarketContext) -> List[dic
                         prob_B = base_B.predict_proba(X_active_df[active_B].values)[:, 1]
                         
                         vix_batch = np.full(len(raw_reports), ctx.vix_current / 20.0)
+                        
+                        # 🚀 补防漏洞：将实时抽取的宏观特征注入 Meta Learner 矩阵，杜绝 Training-Serving Skew
                         if hasattr(meta_clf, 'coef_') and meta_clf.coef_.shape[1] >= 6:
-                            X_meta = np.column_stack([prob_A, prob_B, vix_batch, np.zeros(len(raw_reports)), np.zeros(len(raw_reports)), np.zeros(len(raw_reports))])
+                            cred_batch = np.full(len(raw_reports), ctx.credit_spread_mom)
+                            term_batch = np.full(len(raw_reports), ctx.vix_term_structure - 1.0)
+                            pcr_batch = np.full(len(raw_reports), ctx.market_pcr - 1.0)
+                            X_meta = np.column_stack([prob_A, prob_B, vix_batch, cred_batch, term_batch, pcr_batch])
                         else:
                             X_meta = np.column_stack([prob_A, prob_B, vix_batch])
                         
@@ -1909,6 +2112,7 @@ def _apply_ai_inference(raw_reports: List[dict], ctx: MarketContext) -> List[dic
                 else:
                     probs = np.full(len(raw_reports), 0.52)
             else:
+                logger.warning(f"🚨 致命特征错位：当前特征矩阵缺失模型所需的活跃因子 {missing}，已触发防弹降级！")
                 probs = np.full(len(raw_reports), 0.52)
         elif hasattr(clf_model, 'predict_proba'): 
             try:
@@ -1984,7 +2188,8 @@ def run_tech_matrix() -> None:
                     pen = max(0.6, min(0.9, Config.Params.CROWDING_PENALTY * (1.0 + ctx.health_score * 0.3)))
                     for s in stks[1:]: s["score"] = int(s["score"] * pen)
 
-        final_reports = _apply_kelly_cluster_optimization(reports, price_history_dict, ctx.total_market_exposure)
+        # 🚀 传入 ctx 激活多维度阵型的自适应 CVaR 惩罚
+        final_reports = _apply_kelly_cluster_optimization(reports, price_history_dict, ctx.total_market_exposure, ctx)
         
         for r in final_reports: set_alerted(r["symbol"])
         
@@ -2005,12 +2210,12 @@ def run_tech_matrix() -> None:
                 "date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), 
                 "macro_meta": {
                     "vix": ctx.vix_current,
-                    "credit_spread_mom": 0.0, # Placeholder compatible format
-                    "vix_term_structure": ctx.vix_current / max(1.0, safe_get_history("^VIX3M", "5d", "1d", fast_mode=True)['Close'].iloc[-1] if not safe_get_history("^VIX3M", "5d", "1d", fast_mode=True).empty else ctx.vix_current),
-                    "market_pcr": 1.0 # Placeholder
+                    "credit_spread_mom": ctx.credit_spread_mom, 
+                    "vix_term_structure": ctx.vix_term_structure,
+                    "market_pcr": ctx.market_pcr 
                 },
-                "top_picks": [{"symbol": r.get("symbol"), "score": r.get("score"), "signals": r.get("signals"), "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0), "tp": r.get("tp"), "sl": r.get("sl")} for r in (final_reports if reports and all_raw_scores else [])],
-                "shadow_pool": [{"symbol": r.get("symbol"), "score": r.get("score"), "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0)} for r in (final_shadow_pool if reports and all_raw_scores else [])]
+                "top_picks": [{"symbol": r.get("symbol"), "score": r.get("score"), "signals": r.get("signals"), "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports],
+                "shadow_pool": [{"symbol": r.get("symbol"), "score": r.get("score"), "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0)} for r in final_shadow_pool]
             }
             f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
     except Exception as e:
@@ -2286,14 +2491,12 @@ def run_backtest_engine() -> None:
                     
                 factor_ic_report[f] = {'mean_ic': mean_ic, 'ir': ir, 't_stat': t_stat}
                 
-                # 🚀 大逃杀：保留具有统计显著性的因子，抛弃生硬的排位筛选
                 if abs(t_stat) > Config.Params.MIN_T_STAT:
                     active_candidates.append((f, abs(t_stat)))
             
             active_candidates.sort(key=lambda x: x[1], reverse=True)
             active_factors_list = [x[0] for x in active_candidates]
             
-            # 若小样本或极端行情导致全军覆没，强行提拔表现最好的 5 个因子保底
             if len(active_factors_list) < 5:
                 fallback_candidates = sorted(factor_ic_report.items(), key=lambda x: abs(x[1]['t_stat']), reverse=True)
                 active_factors_list = [x[0] for x in fallback_candidates[:5]]
@@ -2367,6 +2570,7 @@ def run_backtest_engine() -> None:
             final_base_B = LGBMClassifier(**lgbm_params).fit(X_B, y_all_class) if can_train_B else None
             
             clf_model = {
+                'version': Config.MODEL_VERSION, 
                 'active_factors': active_factors_list,
                 'active_A': active_A,
                 'active_B': active_B,
@@ -2722,4 +2926,4 @@ if __name__ == "__main__":
     if m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
     elif m == "stress": run_synthetic_stress_test()
-    elif m == "test": send_alert("连通性测试", "系统重构完成！实盘滑点已参数化，代谢大逃杀已升级为 T-Stat 自适应动态边界，告别固定数量的僵尸因子！")
+    elif m == "test": send_alert("连通性测试", "全维宏观 Meta 跃迁完成！系统已通过 L1 正则化，开启了包括信用利差、PCR 与 VIX 曲线在内的 6 维上帝视野。")
