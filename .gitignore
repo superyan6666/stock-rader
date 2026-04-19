@@ -1,0 +1,15 @@
+.quantbot_data/
+*.tmp
+
+pycache/
+*.py[cod]
+*$py.class
+
+venv/
+env/
+.env
+
+quantbot_config.json
+.env.local
+
+backtest_log_*.jsonl
