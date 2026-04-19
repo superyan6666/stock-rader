@@ -25,7 +25,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("QuantBot")
 
-# 统一全局网络指纹，防止反爬虫封锁
 _GLOBAL_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -78,13 +77,27 @@ class Config:
     ALERT_CACHE_FILE: str = "alert_history.json"
     MODEL_FILE: str = "scoring_model.pkl"
     
-    # 🪒 31 维全息张量：引入交互特征(Interaction)与滞后特征(Lag)
+    # 🪒 33 维全息张量大一统
     ALL_FACTORS = [
         "米奈尔维尼", "强相对强度", "MACD金叉", "TTM Squeeze ON", "一目多头", "强势回踩", "机构控盘(CMF)",
         "突破缺口", "VWAP突破", "AVWAP突破", "SMC失衡区", "流动性扫盘", "聪明钱抢筹", "巨量滞涨", "放量长阳", "口袋支点", 
         "VCP收缩", "筹码峰突破", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘", "威科夫弹簧(Spring)", 
         "跨时空共振(周线)", "CVD筹码净流入", "独立Alpha(脱钩)", "NR7极窄突破", "VPT量价共振",
-        "带量金叉(交互)", "量价吸筹(交互)", "近3日突破(滞后)", "近3日巨量(滞后)"
+        "带量金叉(交互)", "量价吸筹(交互)", "近3日突破(滞后)", "近3日巨量(滞后)",
+        "稳健赫斯特(Hurst)", "FFT相位斜率(动能)"
+    ]
+
+    # 🧬 分层集成：基学习器特征分组 (Group A: 传统动能 / Group B: 高级微观与数学)
+    GROUP_A_FACTORS = [
+        "米奈尔维尼", "强相对强度", "MACD金叉", "TTM Squeeze ON", "一目多头", "强势回踩", "机构控盘(CMF)",
+        "突破缺口", "VWAP突破", "巨量滞涨", "放量长阳", "口袋支点", "VCP收缩", "筹码峰突破", 
+        "跨时空共振(周线)", "独立Alpha(脱钩)", "近3日突破(滞后)", "近3日巨量(滞后)", "带量金叉(交互)"
+    ]
+    
+    GROUP_B_FACTORS = [
+        "AVWAP突破", "SMC失衡区", "流动性扫盘", "聪明钱抢筹", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘", 
+        "威科夫弹簧(Spring)", "CVD筹码净流入", "NR7极窄突破", "VPT量价共振", "量价吸筹(交互)", 
+        "稳健赫斯特(Hurst)", "FFT相位斜率(动能)"
     ]
 
     @classmethod
@@ -113,14 +126,22 @@ def validate_config():
             
     logger.info("✅ 环境与占位文件校验通过")
 
+_KLINE_CACHE = {}
+
 # ================= 2. 数据工具模块 =================
 def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 5, auto_adjust: bool = True, fast_mode: bool = False) -> pd.DataFrame:
+    cache_key = f"{symbol}_{period}_{interval}"
+    if cache_key in _KLINE_CACHE:
+        return _KLINE_CACHE[cache_key].copy()
+        
     for attempt in range(retries):
         try:
             sleep_sec = random.uniform(0.1, 0.3) if fast_mode else random.uniform(1.5, 3.0)
             time.sleep(sleep_sec)
             df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=auto_adjust, timeout=15)
-            if not df.empty: return df
+            if not df.empty: 
+                _KLINE_CACHE[cache_key] = df.copy()
+                return df
         except Exception as e:
             logger.warning(f"[{symbol}] 尝试 {attempt+1} 失败: {e}")
             if attempt == retries - 1: return pd.DataFrame()
@@ -142,7 +163,8 @@ def get_latest_news(symbol: str) -> str:
                 else:
                     sentiment = "⚪ [中性]"
                 return f"{sentiment} {title} ({publisher})"
-    except Exception: pass
+    except Exception as e: 
+        logger.debug(f"[{symbol}] 新闻抓取跳过: {e}")
     return ""
 
 def check_earnings_risk(symbol: str) -> bool:
@@ -156,7 +178,8 @@ def check_earnings_risk(symbol: str) -> bool:
                     if d_val:
                         delta = (d_val - datetime.now(timezone.utc).date()).days
                         if 0 <= delta <= 5: return True
-        except Exception: pass
+        except Exception as e: 
+            logger.debug(f"[{symbol}] 财报解析途径1异常: {e}")
         
         try:
             cal = tk.calendar
@@ -174,8 +197,10 @@ def check_earnings_risk(symbol: str) -> bool:
                         if hasattr(ed, 'date'):
                             delta = (ed.date() - datetime.now(timezone.utc).date()).days
                             if 0 <= delta <= 5: return True
-        except Exception: pass
-    except Exception: pass
+        except Exception as e: 
+            logger.debug(f"[{symbol}] 财报解析途径2异常: {e}")
+    except Exception as e: 
+        logger.debug(f"[{symbol}] 财报风险探测整体异常: {e}")
     return False
 
 def fetch_tradingview_screener(max_tickers=150) -> list:
@@ -198,7 +223,6 @@ def fetch_tradingview_screener(max_tickers=150) -> list:
             "sort": {"sortBy": "RelativeVolume10CG", "sortOrder": "desc"},
             "range": [0, max_tickers]
         }
-        # 统一继承全指全局网络指纹配置
         headers = _GLOBAL_HEADERS.copy()
         headers["Content-Type"] = "application/json"
         
@@ -299,7 +323,7 @@ def load_strategy_performance_tag() -> str:
                 t3 = stats_data.get("overall", {}).get("T+3") if "overall" in stats_data else stats_data.get("T+3")
                 if t3 and t3.get('total_trades', 0) > 0:
                     pf_str = f" | 盈亏比 {t3.get('profit_factor', 0.0):.2f}" if 'profit_factor' in t3 else ""
-                    ai_wr_str = f" | ⚡LGBM双脑过滤 {t3['ai_win_rate']:.1%}" if 'ai_win_rate' in t3 else ""
+                    ai_wr_str = f" | ⚡LGBM分层元学习胜率 {t3['ai_win_rate']:.1%}" if 'ai_win_rate' in t3 else ""
                     return f"**📈 策略基底验证 (T+3):** 原始胜率 {t3['win_rate']:.1%}{ai_wr_str}{pf_str}"
     except Exception: pass
     return ""
@@ -308,7 +332,6 @@ def send_alert(title: str, content: str) -> None:
     if not content.strip(): return
     formatted_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     
-    # Webhook 防御头文件
     req_headers = _GLOBAL_HEADERS.copy()
     req_headers["Content-Type"] = "application/json"
     
@@ -428,6 +451,50 @@ def get_market_regime(active_pool: List[str] = None) -> Tuple[str, str, pd.DataF
         else: 
             return "range", f"⚖️ 熊市底部震荡{breadth_desc}{credit_desc}{gravity_desc}", df, credit_risk_alert, macro_gravity
 
+def _vectorized_rolling_fft_phase(close_arr: np.ndarray, window: int = 60) -> np.ndarray:
+    n = len(close_arr)
+    res = np.zeros(n)
+    if n < window: return res
+    from numpy.lib.stride_tricks import sliding_window_view
+    windows = sliding_window_view(close_arr, window_shape=window)
+    hamming = np.hamming(window)
+    means = np.mean(windows, axis=1, keepdims=True)
+    detrended = (windows - means) * hamming
+    fft_res = np.fft.rfft(detrended, axis=1)
+    freqs = np.fft.rfftfreq(window)
+    valid_mask = (freqs > 1/60.0) & (freqs < 1/4.0)
+    if not np.any(valid_mask): return res
+    valid_fft = fft_res[:, valid_mask]
+    valid_freqs = freqs[valid_mask]
+    peak_idx = np.argmax(np.abs(valid_fft), axis=1)
+    dom_freqs = valid_freqs[peak_idx]
+    peak_phases = np.angle(valid_fft[np.arange(len(valid_fft)), peak_idx])
+    wave_vals = np.cos(2 * np.pi * dom_freqs * (window - 1) + peak_phases)
+    res[window-1:] = wave_vals
+    return res
+
+def _robust_hurst(high: np.ndarray, low: np.ndarray, close: np.ndarray, window=100, sub_window=30, n_samples=50) -> Tuple[float, float]:
+    if len(close) < window: return 0.5, 1.0 
+    h, l, c = high[-window:], low[-window:], close[-window:]
+    c_shift = np.roll(c, 1)
+    c_shift[0] = c[0]
+    tr = np.maximum(h - l, np.maximum(abs(h - c_shift), abs(l - c_shift)))
+    
+    np.random.seed(42)
+    starts = np.random.randint(0, window - sub_window, size=n_samples)
+    hursts = []
+    for s in starts:
+        sub_tr = tr[s:s+sub_window]
+        sub_h = h[s:s+sub_window]
+        sub_l = l[s:s+sub_window]
+        tr_sum = np.sum(sub_tr) + 1e-10
+        hl_range = np.max(sub_h) - np.min(sub_l) + 1e-10
+        fdi = 1.5 - (np.log10(tr_sum) - np.log10(hl_range)) / np.log10(sub_window)
+        hursts.append(2.0 - fdi)
+        
+    hursts = np.array(hursts)
+    return float(np.median(hursts)), float(np.percentile(hursts, 75) - np.percentile(hursts, 25))
+
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_index()
     
@@ -461,7 +528,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['SenkouB'] = ((df['High'].rolling(52).max() + df['Low'].rolling(52).min()) / 2).shift(26)
     df['Above_Cloud'] = (df['Close'] > df[['SenkouA', 'SenkouB']].max(axis=1)).astype(int)
     
-    # 🚀 性能淬火：SuperTrend 脱离慢速的 Pandas 数组索引，提纯循环体执行速度
     hl2 = (df['High'].values + df['Low'].values) / 2.0
     atr10 = df['TR'].rolling(window=10).mean().values
     ub = hl2 + 3 * atr10
@@ -531,13 +597,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['Range_60'] = df['High'].rolling(60).max() - df['Low'].rolling(60).min()
     df['Range_20'] = df['High'].rolling(20).max() - df['Low'].rolling(20).min()
     
-    delta = df['Close'].diff()
-    up = delta.where(delta > 0, 0).ewm(span=14, adjust=False).mean()
-    down = -delta.where(delta < 0, 0).ewm(span=14, adjust=False).mean()
-    rs = up / (down + 1e-10)
-    df['RSI'] = 100 - (100 / (1 + rs))
     df['Price_High_20'] = df['High'].rolling(20).max()
-    
     df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
 
     intra_strength = (df['Close'] - df['Open']) / (df['High'] - df['Low'] + 1e-10)
@@ -553,15 +613,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df['Recent_Price_Surge_3d'] = (df['Close'] / df['Open'] - 1).rolling(3).max().shift(1) * 100
     df['Recent_Vol_Surge_3d'] = (df['Volume'] / df['Vol_MA20']).rolling(3).max().shift(1)
-
-    hist_vol_rolling = df['Volume'].shift(10).rolling(window=50, min_periods=10).quantile(0.8)
-    vol_10d_mean = df['Volume'].rolling(window=10, min_periods=1).mean()
-    vol_spike = (vol_10d_mean / (hist_vol_rolling + 1e-10)) > 2.5
-    price_spike = df['Close'].pct_change().abs().rolling(window=5, min_periods=1).max() > 0.08
-    df['Event_Risk'] = 0.0
-    df.loc[vol_spike, 'Event_Risk'] += 0.6
-    df.loc[price_spike, 'Event_Risk'] += 0.4
-    df['Event_Risk'] = df['Event_Risk'].clip(upper=1.0)
 
     return df
 
@@ -596,7 +647,7 @@ def set_alerted(sym: str, is_shadow: bool = False, shadow_data: dict = None) -> 
             json.dump(cache, f)
     except Exception: pass
 
-def _extract_complex_features(df: pd.DataFrame, df_w: pd.DataFrame) -> Tuple[bool, float, float, float]:
+def _extract_complex_features(df: pd.DataFrame, df_w: pd.DataFrame) -> Tuple[bool, float, float, float, float, float, float]:
     weekly_bullish = False
     if not df_w.empty and len(df_w) >= 40:
         sma40_w = df_w['Close'].rolling(40).mean().iloc[-1]
@@ -621,10 +672,15 @@ def _extract_complex_features(df: pd.DataFrame, df_w: pd.DataFrame) -> Tuple[boo
         counts, bins = np.histogram(df_60['Close'], bins=12, weights=df_60['Volume'])
         poc_price = (bins[np.argmax(counts)] + bins[np.argmax(counts)+1]) / 2.0
         
-    return weekly_bullish, fvg_lower, fvg_upper, poc_price
+    fft_wave = _vectorized_rolling_fft_phase(df['Close'].values, window=60)
+    fft_slope_curr = fft_wave[-1] - fft_wave[-4] if len(fft_wave) >= 4 else 0.0
+    hurst_med, hurst_iqr = _robust_hurst(df['High'].values, df['Low'].values, df['Close'].values)
+        
+    return weekly_bullish, fvg_lower, fvg_upper, poc_price, fft_slope_curr, hurst_med, hurst_iqr
 
 def _extract_ml_features(df: pd.DataFrame, curr: pd.Series, prev: pd.Series, qqq_df: pd.DataFrame,
-                         fvg_lower: float, poc_price: float, weekly_bullish: bool) -> List[float]:
+                         fvg_lower: float, poc_price: float, weekly_bullish: bool,
+                         fft_slope_curr: float, hurst_med: float, hurst_iqr: float) -> List[float]:
     def safe_div(num, den, cap=20.0):
         if pd.isna(num) or pd.isna(den) or den == 0: return 0.0
         return max(min(num / den, cap), -cap)
@@ -679,7 +735,9 @@ def _extract_ml_features(df: pd.DataFrame, curr: pd.Series, prev: pd.Series, qqq
         "带量金叉(交互)": macd_cross_strength * vol_surge_ratio,
         "量价吸筹(交互)": cmf_val * smf_val,
         "近3日突破(滞后)": curr['Recent_Price_Surge_3d'] if pd.notna(curr['Recent_Price_Surge_3d']) else 0.0,
-        "近3日巨量(滞后)": curr['Recent_Vol_Surge_3d'] if pd.notna(curr['Recent_Vol_Surge_3d']) else 0.0
+        "近3日巨量(滞后)": curr['Recent_Vol_Surge_3d'] if pd.notna(curr['Recent_Vol_Surge_3d']) else 0.0,
+        "稳健赫斯特(Hurst)": hurst_med if hurst_iqr < 0.1 else 0.5,
+        "FFT相位斜率(动能)": fft_slope_curr
     }
 
     raw_array = [feat_dict.get(f, 0.0) for f in Config.ALL_FACTORS]
@@ -687,16 +745,15 @@ def _extract_ml_features(df: pd.DataFrame, curr: pd.Series, prev: pd.Series, qqq
 
 def _evaluate_omni_matrix(df: pd.DataFrame, curr: pd.Series, prev: pd.Series, qqq_df: pd.DataFrame, is_vol: bool,
                           weekly_bullish: bool, fvg_lower: float, fvg_upper: float, poc_price: float,
-                          regime: str, w_mul: float, xai_weights: dict) -> Tuple[int, List[str], List[str]]:
+                          regime: str, w_mul: float, xai_weights: dict,
+                          fft_slope_curr: float, hurst_med: float, hurst_iqr: float) -> Tuple[int, List[str], List[str]]:
     
-    # 🧱 规则引擎闭包化抽象：解决大量臃肿的分支逻辑
     sig, factors, triggered = [], [], []
     def get_fw(tag_name: str) -> float: return xai_weights.get(tag_name, 1.0)
     def add_trigger(tag, text, pts, category):
         fw = get_fw(tag)
         if fw > 0: triggered.append((tag, text.format(fw=fw), pts * w_mul * fw, category))
 
-    # 计算触发条件所需的动态本地变量
     rs_20, pure_alpha = 0.0, 0.0
     if not qqq_df.empty:
         m_df = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, how='inner')
@@ -715,7 +772,6 @@ def _evaluate_omni_matrix(df: pd.DataFrame, curr: pd.Series, prev: pd.Series, qq
     lower_wick = curr['Open'] - curr['Low'] if curr['Close'] > curr['Open'] else curr['Close'] - curr['Low']
     upper_wick = curr['High'] - curr['Close'] if curr['Close'] > curr['Open'] else curr['High'] - curr['Open']
 
-    # --- 无条件与宽泛触发域 ---
     if pd.notna(curr['SMA_200']) and curr['Close'] > curr['SMA_50'] > curr['SMA_150'] > curr['SMA_200']:
         add_trigger("米奈尔维尼", "🏆 [主升趋势] 米奈尔维尼模板形成 (权:{fw:.2f}x)", 8, "TREND")
         
@@ -752,7 +808,6 @@ def _evaluate_omni_matrix(df: pd.DataFrame, curr: pd.Series, prev: pd.Series, qq
     if pd.notna(curr['Swing_Low_20']) and curr['Low'] < curr['Swing_Low_20'] and curr['Volume'] < curr['Vol_MA20'] * 0.8 and curr['Close'] > (curr['Low'] + tr_val * 0.5):
         add_trigger("威科夫弹簧(Spring)", "🏹 [威科夫测试] 跌破前低但抛压枯竭缩量，经典的Spring深蹲起爆 (权:{fw:.2f}x)", 18, "REVERSAL")
 
-    # --- 高敏感量能网 (条件隔离，提升代码可维护性与效率) ---
     if is_vol:
         if pure_alpha > 0.8:
             add_trigger("独立Alpha(脱钩)", "🪐 [独立Alpha] 强势剥离大盘Beta，爆发特质动能 (权:{fw:.2f}x)", 22, "TREND")
@@ -810,8 +865,13 @@ def _evaluate_omni_matrix(df: pd.DataFrame, curr: pd.Series, prev: pd.Series, qq
             
         if curr['CMF'] > 0.15 and curr['Smart_Money_Flow'] > 0.4:
             add_trigger("量价吸筹(交互)", "🏦 [交互共振] 蔡金资金流与微观聪明钱同向深度吸筹 (权:{fw:.2f}x)", 10, "QUANTUM")
+            
+        if hurst_med > 0.6 and hurst_iqr < 0.1:
+            add_trigger("稳健赫斯特(Hurst)", "⏳ [稳健记忆] 降噪 Hurst={fw:.2f} (IQR低)，呈现强抗噪趋势持续性 (权:{fw:.2f}x)", 15, "QUANTUM")
 
-    # === 执行最终得分统计与环境衰减惩罚 ===
+        if fft_slope_curr > 0:
+            add_trigger("FFT相位斜率(动能)", "🌊 [频域加速] FFT 剥离噪音后，主导周期相位呈现确定性向上动能 (权:{fw:.2f}x)", 15, "QUANTUM")
+
     score_raw = 0.0
     for tag, text, pts, category in triggered:
         adj_pts = pts
@@ -915,17 +975,76 @@ def _apply_markowitz_decorrelation(reports: List[dict], price_history_dict: dict
             final_reports = candidate_pool[:15]
     return final_reports
 
+def _generate_and_send_matrix_report(final_reports: List[dict], final_shadow_pool: List[dict], 
+                                     vix_desc: str, regime_desc: str, pain_warning: str, 
+                                     pruned_factors: list, dynamic_min_score: float,
+                                     meta_weights: dict) -> None:
+    txts = []
+    for idx, r in enumerate(final_reports):
+        icon = ['🥇', '🥈', '🥉'][idx] if idx < 3 else '🔸'
+        sigs_fmt = "\n".join([f"- {s}" for s in r["signals"]])
+        news_fmt = f"\n- 📰 {r['news']}" if r['news'] else ""
+        ai_display = f"🔥 **{r.get('ai_prob', 0):.1%}**" if r.get('ai_prob', 0) > 0.60 else f"{r.get('ai_prob', 0):.1%}"
+        
+        txts.append(
+            f"### {icon} **{r['symbol']}** | 🤖 分层元学习胜率: {ai_display} | 🌟 逻辑共振度: {r['score']}分\n"
+            f"**💡 机构交易透视:**\n{sigs_fmt}{news_fmt}\n\n"
+            f"**💰 绝对风控界限:**\n"
+            f"- 💵 现价: `{r['curr_close']:.2f}`\n"
+            f"- ⚖️ {r.get('pos_advice', '✅ 标准仓位')}\n"
+            f"- 🎯 建议止盈: **${r['tp']:.2f}**\n"
+            f"- 🛡️ 吊灯止损: **${r['sl']:.2f} (最高价回落保护)**\n"
+            f"- 📈 离场纪律: **跌破止损防线请无条件市价清仓！**"
+        )
+
+    perf = load_strategy_performance_tag()
+    pruned_desc = f"\n- ✂️ 神经突触修剪: 已成功忘却 **{len(pruned_factors)}** 个低效因子，达成绝对至简" if pruned_factors else ""
+    header = f"**📊 宏观引力与系统状态:**\n- {vix_desc}\n- {regime_desc}{pain_warning}{pruned_desc}\n- ⚔️ 今日截面淘汰线 (Top 15%): **{dynamic_min_score:.1f}分**"
+    
+    # 追加元学习器状态分析
+    meta_desc = ""
+    if meta_weights:
+        w_A = meta_weights.get('Group_A', 0)
+        w_B = meta_weights.get('Group_B', 0)
+        meta_desc = f"\n\n**🧠 Stacking Meta-Learner (元学习器) 状态:**\n- 传统动能组 (Group A) 决策权重: **{w_A*100:.1f}%**\n- 高级微观组 (Group B) 决策权重: **{w_B*100:.1f}%**"
+        if w_B < 0.05:
+            meta_desc += "\n- ⚠️ **警报**: 市场进入噪声期，高级微观因子组已大范围失效，被 L1 正则化自动屏蔽！"
+
+    final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
+                    "\n\n---\n\n".join(txts) + \
+                    meta_desc + \
+                    f"\n\n*(元学习跃迁: 顶层已搭载 L1 Logistic Meta-Learner，动态调节传统动能与微观数学的分层输出！)*"
+    
+    send_alert("量化诸神之战 (分层元学习版)", final_content)
+    
+    try:
+        with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
+            log_entry = {
+                "date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), 
+                # 记录当天的 VIX 数据，供周末元学习器时序交叉验证使用
+                "vix": float(vix_desc.split(":")[1].replace(")", "").strip()) if "VIX:" in vix_desc else 18.0,
+                "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports],
+                "shadow_pool": [{"symbol": r["symbol"], "score": r["score"], "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0)} for r in final_shadow_pool]
+            }
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.error(f"严重：写入矩阵回测日志时发生崩溃: {e}")
+
 def run_tech_matrix() -> None:
     max_risk = 0.015 
     pain_warning = ""
     try:
         if os.path.exists(Config.STATS_FILE):
             with open(Config.STATS_FILE, "r", encoding="utf-8") as f:
-                t3 = json.load(f).get('overall', {}).get('T+3', {})
+                stats_json = json.load(f)
+                t3 = stats_json.get('overall', {}).get('T+3', {})
                 if t3.get('max_cons_loss', 0) >= 4 or t3.get('profit_factor', 1.0) < 1.2:
                     max_risk = 0.0075  
                     pain_warning = "\n- 🩸 **痛觉神经激活**: 近期回测遭重挫，引擎已主动防守降杠杆！"
-    except Exception: pass
+                meta_weights = stats_json.get("meta_weights", {})
+    except Exception as e: 
+        logger.debug(f"加载性能统计感知痛觉失败: {e}")
+        meta_weights = {}
 
     active_pool = get_filtered_watchlist(max_stocks=150)
     regime, regime_desc, qqq_df, is_credit_risk_high, macro_gravity = get_market_regime(active_pool)
@@ -963,14 +1082,16 @@ def run_tech_matrix() -> None:
                             xai_weights[tag], pruned_factors.append(tag) = 0.0, tag
                         else:
                             xai_weights[tag] = max(0.5, min(3.0, float(imp) / avg_imp))
-    except Exception: pass
+    except Exception as e:
+        logger.debug(f"解析 XAI 特征权重分布失败: {e}")
         
     clf_model = None
     if os.path.exists(Config.MODEL_FILE):
         try:
             import pickle
             with open(Config.MODEL_FILE, 'rb') as f: clf_model = pickle.load(f)
-        except Exception: pass
+        except Exception as e:
+            logger.debug(f"载入双脑模型序列化权重失败: {e}")
 
     raw_reports = []
     price_history_dict = {} 
@@ -992,12 +1113,17 @@ def run_tech_matrix() -> None:
             price_history_dict[sym] = df['Close'].iloc[-60:]
             is_vol = (curr['Volume'] / curr['Vol_MA20'] > 1.5) and (curr['Close'] > curr['Open'])
             
-            weekly_bullish, fvg_lower, fvg_upper, poc_price = _extract_complex_features(df, df_w)
-            ml_features_array = _extract_ml_features(df, curr, prev, qqq_df, fvg_lower, poc_price, weekly_bullish)
+            weekly_bullish, fvg_lower, fvg_upper, poc_price, fft_slope_curr, hurst_med, hurst_iqr = _extract_complex_features(df, df_w)
+            
+            ml_features_array = _extract_ml_features(
+                df, curr, prev, qqq_df, fvg_lower, poc_price, weekly_bullish,
+                fft_slope_curr, hurst_med, hurst_iqr
+            )
             
             base_score, sig, factors = _evaluate_omni_matrix(
                 df, curr, prev, qqq_df, is_vol, weekly_bullish, fvg_lower, fvg_upper, 
-                poc_price, regime, w_mul, xai_weights
+                poc_price, regime, w_mul, xai_weights,
+                fft_slope_curr, hurst_med, hurst_iqr
             )
             
             total_score, is_bearish_div, sig = _apply_market_filters(
@@ -1010,45 +1136,46 @@ def run_tech_matrix() -> None:
                 "sig": sig, "factors": factors, "ml_features": ml_features_array, "is_untradeable": is_untradeable,
                 "sym_sec": sym_sec
             })
-        except Exception: pass
+        except Exception as e:
+            logger.debug(f"[{sym}] 特征提取/打分计算底层抛错: {e}")
 
-    # 🚀 双脑融合：LightGBM Ranker (左脑) + Quantile Regressor (右脑) 并发推理
+    # 🚀 分层集成 (Stacking Ensemble) 的 Meta-Learner 在线推理
     if clf_model and raw_reports:
         X_batch = np.array([r['ml_features'] for r in raw_reports])
         
-        if isinstance(clf_model, dict) and 'ranker' in clf_model and 'regressor' in clf_model:
-            ranker = clf_model['ranker']
-            regressor = clf_model['regressor']
+        # 兼容性检查：是否为包含基学习器与元学习器的新型复合对象
+        if isinstance(clf_model, dict) and 'base_A' in clf_model and 'base_B' in clf_model and 'meta' in clf_model:
+            base_A = clf_model['base_A']
+            base_B = clf_model['base_B']
+            meta_clf = clf_model['meta']
             
-            # 左脑：预测截面相对排序优势
-            rank_scores = ranker.predict(X_batch)
-            # 右脑：预测绝对 90% 分位数极限暴涨潜能
-            reg_scores = regressor.predict(X_batch)
+            # 特征切片隔离
+            idx_A = [Config.ALL_FACTORS.index(f) for f in Config.GROUP_A_FACTORS]
+            idx_B = [Config.ALL_FACTORS.index(f) for f in Config.GROUP_B_FACTORS]
+            X_A = X_batch[:, idx_A]
+            X_B = X_batch[:, idx_B]
             
-            if len(raw_reports) > 1:
-                r_z = (rank_scores - np.mean(rank_scores)) / (np.std(rank_scores) + 1e-10)
-                p_rank = 1 / (1 + np.exp(-r_z))
-                
-                reg_z = (reg_scores - np.mean(reg_scores)) / (np.std(reg_scores) + 1e-10)
-                p_reg = 1 / (1 + np.exp(-reg_z))
-            else:
-                p_rank = np.array([0.6])
-                p_reg = np.array([0.6])
-                
-            probs = 0.5 * p_rank + 0.5 * p_reg
-        elif hasattr(clf_model, 'predict_proba'): # Legacy fallbacks
+            # Base Model 推理：提取类概率
+            prob_A = base_A.predict_proba(X_A)[:, 1]
+            prob_B = base_B.predict_proba(X_B)[:, 1]
+            
+            # 组装 Meta-Level 张量：[prob_A, prob_B, VIX_Scalar]
+            # 这里统一用当前实时的 VIX 标量补齐张量形状
+            vix_batch = np.full(len(raw_reports), vix_scalar)
+            X_meta = np.column_stack([prob_A, prob_B, vix_batch])
+            
+            # Meta-Learner (L1 Logistic) 推理输出最终统御级胜率
+            probs = meta_clf.predict_proba(X_meta)[:, 1]
+            
+        elif hasattr(clf_model, 'predict_proba'): # Fallback
             try:
                 class_idx = np.where(clf_model.classes_ == 1)[0][0] if 1 in clf_model.classes_ else 0
                 probs = clf_model.predict_proba(X_batch)[:, class_idx]
-            except Exception:
+            except Exception as e:
+                logger.debug(f"旧版二分类模型推理时降级: {e}")
                 probs = np.full(len(raw_reports), 0.52)
         else:
-            raw_scores = clf_model.predict(X_batch)
-            if len(raw_scores) > 1:
-                z_scores = (raw_scores - np.mean(raw_scores)) / (np.std(raw_scores) + 1e-10)
-                probs = 1 / (1 + np.exp(-z_scores))
-            else:
-                probs = np.full(len(raw_reports), 0.6)
+            probs = np.full(len(raw_reports), 0.52)
                 
         for i, r in enumerate(raw_reports):
             r['ai_prob'] = float(probs[i])
@@ -1105,41 +1232,10 @@ def run_tech_matrix() -> None:
         
         for r in final_shadow_pool: set_alerted(r["symbol"], is_shadow=True, shadow_data=r)
             
-        txts = []
-        for idx, r in enumerate(final_reports):
-            icon = ['🥇', '🥈', '🥉'][idx] if idx < 3 else '🔸'
-            sigs_fmt = "\n".join([f"- {s}" for s in r["signals"]])
-            news_fmt = f"\n- 📰 {r['news']}" if r['news'] else ""
-            ai_display = f"🔥 **{r.get('ai_prob', 0):.1%}**" if r.get('ai_prob', 0) > 0.60 else f"{r.get('ai_prob', 0):.1%}"
-            
-            txts.append(
-                f"### {icon} **{r['symbol']}** | 🤖 双脑融合胜率: {ai_display} | 🌟 逻辑共振度: {r['score']}分\n"
-                f"**💡 机构交易透视:**\n{sigs_fmt}{news_fmt}\n\n"
-                f"**💰 绝对风控界限:**\n"
-                f"- 💵 现价: `{r['curr_close']:.2f}`\n"
-                f"- ⚖️ {r.get('pos_advice', '✅ 标准仓位')}\n"
-                f"- 🎯 建议止盈: **${r['tp']:.2f}**\n"
-                f"- 🛡️ 吊灯止损: **${r['sl']:.2f} (最高价回落保护)**\n"
-                f"- 📈 离场纪律: **跌破止损防线请无条件市价清仓！**"
-            )
-
-        perf = load_strategy_performance_tag()
-        pruned_desc = f"\n- ✂️ 神经突触修剪: 已成功忘却 **{len(pruned_factors)}** 个低效因子，达成绝对至简" if pruned_factors else ""
-        header = f"**📊 宏观引力与系统状态:**\n- {vix_desc}\n- {regime_desc}{pain_warning}{pruned_desc}\n- ⚔️ 今日截面淘汰线 (Top 15%): **{dynamic_min_score:.1f}分**"
-        
-        final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
-                        "\n\n---\n\n".join(txts) + \
-                        f"\n\n*(工程淬火: 核心执行流闭包化重构，剔除数组索引延迟，API网络层防屏蔽保护已统一部署！)*"
-        
-        send_alert("量化诸神之战 (极速工程版)", final_content)
-        
-        with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
-            log_entry = {
-                "date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), 
-                "top_picks": [{"symbol": r["symbol"], "score": r["score"], "signals": r["signals"], "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports],
-                "shadow_pool": [{"symbol": r["symbol"], "score": r["score"], "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0)} for r in final_shadow_pool]
-            }
-            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+        _generate_and_send_matrix_report(
+            final_reports, final_shadow_pool, vix_desc, regime_desc, 
+            pain_warning, pruned_factors, dynamic_min_score, meta_weights
+        )
     else:
         logger.info("📭 本次矩阵扫描无标的突破 Top 15% 截面排位，宁缺毋滥，保持静默。")
 
@@ -1161,8 +1257,8 @@ def run_backtest_engine() -> None:
                         if shadows: daily_trades.extend(shadows)
                         
                         for p in daily_trades:
-                            # 💡 读取日志时安全提取 ai_prob，这代表模型当时的真实想法 (Out-of-sample)
-                            trades.append({'date': log['date'], 'symbol': p['symbol'], 'signals': p.get('signals', []), 'factors': p.get('factors', []), 'ml_features': p.get('ml_features', []), 'ai_prob': p.get('ai_prob', 0.0), 'tp': p.get('tp', float('inf')), 'sl': p.get('sl', 0)})
+                            # 提取日志中的每日 VIX 用于后续 Meta Learner 训练环境感知
+                            trades.append({'date': log['date'], 'vix': log.get('vix', 18.0), 'symbol': p['symbol'], 'signals': p.get('signals', []), 'factors': p.get('factors', []), 'ml_features': p.get('ml_features', []), 'ai_prob': p.get('ai_prob', 0.0), 'tp': p.get('tp', float('inf')), 'sl': p.get('sl', 0)})
                     except Exception as e:
                         logger.debug(f"跳过损毁的 JSONL 日志行: {e}")
         except Exception as e:
@@ -1317,7 +1413,7 @@ def run_backtest_engine() -> None:
                         for f_name in factor_list:
                             factor_rets.setdefault(f"[{f_name}]", []).append(ret)
                             
-                        # 💡 真实样本外 (Out-of-Sample) 的 AI 性能过滤：完全依赖日志中记录的历史 prob 值
+                        # Out-of-Sample 真实胜率计算
                         ai_prob = t.get('ai_prob', 0.0)
                         if ai_prob >= 0.50:  
                             ai_filtered_total += 1
@@ -1327,134 +1423,106 @@ def run_backtest_engine() -> None:
                         if ml_feats and len(ml_feats) == len(Config.ALL_FACTORS):
                             trades_with_ret.append({
                                 'date': t['date'],
+                                'vix': t.get('vix', 18.0),
                                 'ml_features': ml_feats,
                                 'ret': ret
                             })
-                            
-                            if clf_model and hasattr(clf_model, 'predict'):
-                                try:
-                                    score = clf_model.predict([ml_feats])[0]
-                                    if score > 0: 
-                                        ai_filtered_total += 1
-                                        if ret > 0: ai_filtered_wins += 1
-                                except Exception as e: 
-                                    logger.debug(f"回测期间通过 LTR 评估命中率异常，已跳过: {e}")
     
     feature_importances_dict = {}
+    meta_weights_dict = {}
     trade_df = pd.DataFrame(trades_with_ret)
+    
     if len(trade_df) >= 30:
         try:
-            from lightgbm import LGBMRanker, LGBMRegressor, early_stopping
+            from lightgbm import LGBMClassifier
+            from sklearn.model_selection import TimeSeriesSplit
+            from sklearn.linear_model import LogisticRegression
             import pickle
             
             trade_df = trade_df.sort_values('date')
             
-            # 构建 Ranker 专属的截面 Relevance (0-4档)
-            relevance_list = []
-            for date, group in trade_df.groupby('date', sort=False):
-                if len(group) < 3:
-                    relevance_list.append(pd.Series(0, index=group.index))
-                else:
-                    try:
-                        relevance_list.append(pd.qcut(group['ret'], 5, labels=False, duplicates='drop'))
-                    except Exception as e:
-                        logger.debug(f"[{date}] NDCG 收益等级分箱失败，可能收益同质化过高，已默认为0档: {e}")
-                        relevance_list.append(pd.Series(0, index=group.index))
-            trade_df['relevance'] = pd.concat(relevance_list)
+            X_all = np.vstack(trade_df['ml_features'].values)
+            y_all = (trade_df['ret'] > 0.015).astype(int).values
+            vix_all = trade_df['vix'].values
             
-            X_train = np.vstack(trade_df['ml_features'].values)
-            y_train_rank = trade_df['relevance'].values
+            idx_A = [Config.ALL_FACTORS.index(f) for f in Config.GROUP_A_FACTORS]
+            idx_B = [Config.ALL_FACTORS.index(f) for f in Config.GROUP_B_FACTORS]
             
-            # 🚀 构建 Quantile Regressor 专属的连续绝对收益标签！
-            y_train_reg = trade_df['ret'].values 
-            groups = trade_df.groupby('date', sort=False).size().values
+            X_A = X_all[:, idx_A]
+            X_B = X_all[:, idx_B]
             
-            # 🧠 左脑：LightGBM Ranker (截面逻辑排序)
-            ranker_params = dict(
-                objective="lambdarank", metric="ndcg", learning_rate=0.05,
-                max_depth=5, random_state=42, n_estimators=150
-            )
+            # 🚀 第一阶段：使用 TimeSeriesSplit 交叉验证生成 OOF 预测，严防 Meta Learner 过拟合
+            tscv = TimeSeriesSplit(n_splits=3)
+            oof_pred_A = np.zeros(len(y_all))
+            oof_pred_B = np.zeros(len(y_all))
             
-            # 🧠 右脑：LightGBM Quantile Regressor (90%分位数绝对暴涨预测)
-            regressor_params = dict(
-                objective="quantile", alpha=0.9, metric="quantile", learning_rate=0.05,
-                max_depth=5, random_state=42, n_estimators=150
-            )
+            lgbm_params = dict(n_estimators=60, max_depth=3, learning_rate=0.05, class_weight='balanced', random_state=42)
             
-            unique_dates = trade_df['date'].unique()
-            if len(unique_dates) > 30:
-                val_size = max(1, int(len(unique_dates) * 0.2))
-                train_dates = unique_dates[:-val_size]
-                val_dates = unique_dates[-val_size:]
+            for train_idx, val_idx in tscv.split(X_A):
+                clf_A = LGBMClassifier(**lgbm_params)
+                clf_A.fit(X_A[train_idx], y_all[train_idx])
+                oof_pred_A[val_idx] = clf_A.predict_proba(X_A[val_idx])[:, 1]
                 
-                purge_days = 5
-                train_dates = train_dates[:-purge_days] if len(train_dates) > purge_days else train_dates
+                clf_B = LGBMClassifier(**lgbm_params)
+                clf_B.fit(X_B[train_idx], y_all[train_idx])
+                oof_pred_B[val_idx] = clf_B.predict_proba(X_B[val_idx])[:, 1]
                 
-                train_mask = trade_df['date'].isin(train_dates)
-                val_mask = trade_df['date'].isin(val_dates)
+            # 剔除第一个 Fold (因为没有 OOF 预测)
+            valid_meta_idx = np.where(oof_pred_A > 0)[0]
+            if len(valid_meta_idx) > 10:
+                X_meta_train = np.column_stack([
+                    oof_pred_A[valid_meta_idx], 
+                    oof_pred_B[valid_meta_idx], 
+                    vix_all[valid_meta_idx] / 20.0  # VIX 缩放处理，防止梯度爆炸
+                ])
+                y_meta_train = y_all[valid_meta_idx]
                 
-                X_train_cv = X_train[train_mask]
-                y_train_cv_rank, y_train_cv_reg = y_train_rank[train_mask], y_train_reg[train_mask]
-                groups_train_cv = trade_df[train_mask].groupby('date', sort=False).size().values
+                # 🚀 第二阶段：训练 L1 惩罚的 Meta Learner
+                # C 值越小正则化越强，强行将失效的因子组(通常是 Group B)压缩至 0
+                meta_clf = LogisticRegression(penalty='l1', solver='liblinear', C=1.0, class_weight='balanced', random_state=42)
+                meta_clf.fit(X_meta_train, y_meta_train)
                 
-                X_val_cv = X_train[val_mask]
-                y_val_cv_rank, y_val_cv_reg = y_train_rank[val_mask], y_train_reg[val_mask]
-                groups_val_cv = trade_df[val_mask].groupby('date', sort=False).size().values
+                w_A, w_B = meta_clf.coef_[0][0], meta_clf.coef_[0][1]
+                # 权重 Softmax 归一化以供展示
+                exp_wA, exp_wB = np.exp(w_A), np.exp(w_B)
+                meta_weights_dict['Group_A'] = exp_wA / (exp_wA + exp_wB)
+                meta_weights_dict['Group_B'] = exp_wB / (exp_wA + exp_wB)
                 
-                # 训练与验证左脑 (Ranker)
-                clf_rank_cv = LGBMRanker(**ranker_params)
-                clf_rank_cv.fit(
-                    X_train_cv, y_train_cv_rank, group=groups_train_cv,
-                    eval_set=[(X_val_cv, y_val_cv_rank)], eval_group=[groups_val_cv],
-                    callbacks=[early_stopping(stopping_rounds=20, verbose=False)]
-                )
-                best_iters_rank = clf_rank_cv.best_iteration_ if clf_rank_cv.best_iteration_ else 100
-                
-                # 训练与验证右脑 (Quantile Regressor)
-                clf_reg_cv = LGBMRegressor(**regressor_params)
-                clf_reg_cv.fit(
-                    X_train_cv, y_train_cv_reg,
-                    eval_set=[(X_val_cv, y_val_cv_reg)],
-                    callbacks=[early_stopping(stopping_rounds=20, verbose=False)]
-                )
-                best_iters_reg = clf_reg_cv.best_iteration_ if clf_reg_cv.best_iteration_ else 100
-                
-                logger.info(f"🛡️ Purged CV 净化完成：左脑排序迭代 {best_iters_rank}，右脑分位数回归迭代 {best_iters_reg}。")
-                
-                # 携带抗过拟合的最优参数，重组全量记忆！
-                clf_rank = LGBMRanker(**{**ranker_params, 'n_estimators': best_iters_rank})
-                clf_rank.fit(X_train, y_train_rank, group=groups)
-                
-                clf_reg = LGBMRegressor(**{**regressor_params, 'n_estimators': best_iters_reg})
-                clf_reg.fit(X_train, y_train_reg)
+                logger.info(f"🛡️ Meta Learner (L1 Logistic) 拟合完成。Group A 原始系数: {w_A:.3f}, Group B 原始系数: {w_B:.3f}")
+                if w_B == 0.0:
+                    logger.warning("🚨 警告：高级微观组 (Group B) 因近期毫无增益，已被 L1 正则化彻底屏蔽！")
             else:
-                clf_rank = LGBMRanker(**ranker_params)
-                clf_rank.fit(X_train, y_train_rank, group=groups)
-                
-                clf_reg = LGBMRegressor(**regressor_params)
-                clf_reg.fit(X_train, y_train_reg)
+                meta_clf = LogisticRegression(class_weight='balanced')
+                meta_clf.fit(np.column_stack([oof_pred_A, oof_pred_B, vix_all]), y_all)
+
+            # 🚀 第三阶段：用全量数据拟合最终供实盘使用的 Base Learners
+            final_base_A = LGBMClassifier(**lgbm_params).fit(X_A, y_all)
+            final_base_B = LGBMClassifier(**lgbm_params).fit(X_B, y_all)
             
-            # 💡 将双脑模型打包成字典落盘
-            clf_model = {'ranker': clf_rank, 'regressor': clf_reg, 'n_features_in_': len(Config.ALL_FACTORS)}
+            clf_model = {
+                'base_A': final_base_A, 
+                'base_B': final_base_B, 
+                'meta': meta_clf,
+                'n_features_in_': len(Config.ALL_FACTORS)
+            }
             with open(Config.MODEL_FILE, 'wb') as f:
                 pickle.dump(clf_model, f)
-            logger.info(f"🧠 【双脑协同回归】搭载 LTR 排序与 Quantile 回归的全息双核模型已重训落盘。")
+            logger.info(f"🧠 【分层元学习体系】搭载 Stacking Ensemble 与 L1 筛选的全息模型已落盘。")
             
-            # 整合左右脑的 XAI 特征重要性
-            if hasattr(clf_rank, 'feature_importances_') and hasattr(clf_reg, 'feature_importances_'):
-                imp_rank = clf_rank.feature_importances_
-                imp_reg = clf_reg.feature_importances_
+            if hasattr(final_base_A, 'feature_importances_') and hasattr(final_base_B, 'feature_importances_'):
+                imp_A = final_base_A.feature_importances_
+                imp_B = final_base_B.feature_importances_
                 
-                imp_rank_norm = imp_rank / (np.sum(imp_rank) + 1e-10)
-                imp_reg_norm = imp_reg / (np.sum(imp_reg) + 1e-10)
+                # 双脑混合重要度计算
+                combined_imp = np.zeros(len(Config.ALL_FACTORS))
+                combined_imp[idx_A] += imp_A / (np.sum(imp_A) + 1e-10) * meta_weights_dict.get('Group_A', 0.5)
+                combined_imp[idx_B] += imp_B / (np.sum(imp_B) + 1e-10) * meta_weights_dict.get('Group_B', 0.5)
                 
-                # 双脑混合重要度
-                combined_importances = (imp_rank_norm + imp_reg_norm) / 2.0
-                for factor, imp in zip(Config.ALL_FACTORS, combined_importances):
-                    feature_importances_dict[factor] = float(imp)
+                for i, factor in enumerate(Config.ALL_FACTORS):
+                    feature_importances_dict[factor] = float(combined_imp[i])
                     
         except ImportError:
-            logger.warning("未检测到 lightgbm 环境，已跳过 Ranker 训练。请确保在 requirements.txt 中添加了 lightgbm。")
+            logger.warning("未检测到 lightgbm 环境，已跳过 Stacking 训练。请确保在 requirements.txt 中添加了 lightgbm。")
         except Exception as e:
             logger.error(f"ML 模型训练受阻: {e}")
             
@@ -1517,16 +1585,16 @@ def run_backtest_engine() -> None:
                 'profit_factor': pf
             }
             
-    with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: json.dump({"overall": res, "factors": f_res, "xai_importances": feature_importances_dict}, f, indent=4)
+    with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: json.dump({"overall": res, "factors": f_res, "xai_importances": feature_importances_dict, "meta_weights": meta_weights_dict}, f, indent=4)
     
-    report_md = [f"# 📈 自动量化战报与 AI 透视\n**更新:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n## ⚔️ 核心表现评估\n| 周期 | 原始胜率 | ⚡双脑联合过滤 | 均收益 | 盈亏比 | Sharpe | 胜单平均抗压(MAE) | 笔数 |\n|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"]
+    report_md = [f"# 📈 自动量化战报与 AI 透视\n**更新:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n## ⚔️ 核心表现评估\n| 周期 | 原始胜率 | ⚡分层元学习过滤 | 均收益 | 盈亏比 | Sharpe | 胜单平均抗压(MAE) | 笔数 |\n|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"]
     for p in ['T+1', 'T+3', 'T+5']:
         d = res.get(p, {'win_rate':0,'avg_ret':0,'profit_factor':0,'sharpe':0,'avg_win_mae':0,'max_cons_loss':0,'total_trades':0})
         ai_str = f"**{d.get('ai_win_rate', 0.0)*100:.1f}%**" if 'ai_win_rate' in d else "-"
         report_md.append(f"| {p} | {d['win_rate']*100:.1f}% | {ai_str} | {d['avg_ret']*100:+.2f}% | {d['profit_factor']:.2f} | {d['sharpe']:.2f} | {d['avg_win_mae']*100:.1f}% | {d['total_trades']} |")
     
     if feature_importances_dict:
-        report_md.append("\n## 🧠 XAI (解释性人工智能) - 驱动当期市场的核心因子权重\n| 因子特征 | AI 分配重要性 (双脑联合) |\n|:---|:---:|")
+        report_md.append("\n## 🧠 XAI (解释性人工智能) - 驱动当期市场的核心因子权重\n| 因子特征 | AI 分配重要性 (元学习器赋权) |\n|:---|:---:|")
         sorted_xai = sorted(feature_importances_dict.items(), key=lambda x: x[1], reverse=True)
         for tag, imp in sorted_xai: 
             report_md.append(f"| {tag} | {imp*100:.1f}% |")
@@ -1540,21 +1608,30 @@ def run_backtest_engine() -> None:
 
     alert_lines = ["### 📊 **机构级回测报表 (含 MAE/MFE 归因分析)**"]
     for p, d in res.items(): 
-        ai_text = f" | ⚡双脑联合过滤: **{d['ai_win_rate']*100:.1f}%**" if 'ai_win_rate' in d else ""
+        ai_text = f" | ⚡分层元学习过滤: **{d['ai_win_rate']*100:.1f}%**" if 'ai_win_rate' in d else ""
         alert_lines.append(f"- **{p}:** 原始胜率 {d['win_rate']*100:.1f}%{ai_text} | 盈亏比 {d['profit_factor']:.2f} | 获利单抗压(MAE) {d['avg_win_mae']*100:.1f}%")
     
+    if meta_weights_dict:
+        w_A = meta_weights_dict.get('Group_A', 0)
+        w_B = meta_weights_dict.get('Group_B', 0)
+        alert_lines.extend(["", "---", "", "### ⚖️ **Stacking 元学习器 (Meta-Learner) 状态**"])
+        alert_lines.append(f"- 🟢 传统动能组 (Group A) 决策权重: **{w_A*100:.1f}%**")
+        alert_lines.append(f"- 🟣 高级微观组 (Group B) 决策权重: **{w_B*100:.1f}%**")
+        if w_B < 0.05:
+            alert_lines.append("- ⚠️ **警报**: 高级因子组因近期收益劣势，已被 L1 惩罚自动降权屏蔽！")
+
     if feature_importances_dict:
-        alert_lines.extend(["", "---", "", "### 🧠 **XAI 市场驱动因子 (LGBM 排序+回归双脑)**"])
+        alert_lines.extend(["", "---", "", "### 🧠 **XAI 市场驱动因子 (LGBM+Logistic 分层输出)**"])
         sorted_xai = sorted(feature_importances_dict.items(), key=lambda x: x[1], reverse=True)
         for idx, (tag, imp) in enumerate(sorted_xai[:3]):
             icon = ['🔥','🔥','🔥'][idx]
             alert_lines.append(f"- {icon} **{tag}**: 贡献度 {imp*100:.1f}%")
             
-    send_alert("策略终极回测战报 (双脑回归版)", "\n".join(alert_lines))
+    send_alert("策略终极回测战报 (分层元学习版)", "\n".join(alert_lines))
 
 if __name__ == "__main__":
     validate_config()
     m = sys.argv[1] if len(sys.argv) > 1 else "matrix"
     if m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
-    elif m == "test": send_alert("连通性测试", "全栈重构完毕！SuperTrend 脱离慢速沙盒，规则引擎已实现闭包降维化抽象，全局通信防屏蔽体系已统一部署！")
+    elif m == "test": send_alert("连通性测试", "分层集成跃迁完成！系统已通过 TimeSeriesSplit 分割，成功部署 L1 Logistic 元学习器，将彻底杜绝高级因子的过拟合与噪音干扰！")
