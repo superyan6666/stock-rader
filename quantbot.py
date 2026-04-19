@@ -958,12 +958,12 @@ def _extract_ml_features(df: pd.DataFrame, curr: pd.Series, prev: pd.Series, qqq
     rs_20, pure_alpha = 0.0, 0.0
     if not qqq_df.empty:
         m_df = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, how='inner')
-        if len(m_df) >= 40:
+        if len(m_df) >= 60:
             qqq_ret = max(m_df['Close_y'].iloc[-1] / m_df['Close_y'].iloc[-20], 0.5)
             rs_20 = (m_df['Close_x'].iloc[-1] / m_df['Close_x'].iloc[-20]) / qqq_ret
             ret_stock = m_df['Close_x'].pct_change().dropna()
             ret_qqq = m_df['Close_y'].pct_change().dropna()
-            cov_matrix = np.cov(ret_stock.iloc[-20:], ret_qqq.iloc[-20:])
+            cov_matrix = np.cov(ret_stock.iloc[-60:], ret_qqq.iloc[-60:])
             beta = cov_matrix[0,1] / (cov_matrix[1,1] + 1e-10) if cov_matrix[1,1] > 0 else 1.0
             pure_alpha = (ret_stock.iloc[-5:].mean() - beta * ret_qqq.iloc[-5:].mean()) * 252
 
@@ -977,7 +977,7 @@ def _extract_ml_features(df: pd.DataFrame, curr: pd.Series, prev: pd.Series, qqq
     hurst_score = max(0.0, min(1.0, (hurst_med - 0.5) * 2.0)) if (hurst_reliable and hurst_med > 0.65) else 0.0
 
     feat_dict = {
-        "米奈尔维尼": safe_div(curr['Close'] - curr['SMA_200'], curr['SMA_200']),
+        "米奈尔维尼": safe_div(curr['SMA_50'] - curr['SMA_200'], curr['SMA_200']),
         "强相对强度": rs_20,
         "MACD金叉": macd_cross_strength,
         "TTM Squeeze ON": safe_div((curr['KC_Upper'] - curr['KC_Lower']) - (curr['BB_Upper'] - curr['BB_Lower']), curr['Close'] * 0.01),
@@ -1052,10 +1052,10 @@ def _evaluate_omni_matrix(df: pd.DataFrame, curr: pd.Series, prev: pd.Series, qq
     rs_20, pure_alpha = 0.0, 0.0
     if not qqq_df.empty:
         m_df = pd.merge(df[['Close']], qqq_df[['Close']], left_index=True, right_index=True, how='inner')
-        if len(m_df) >= 40:
+        if len(m_df) >= 60:
             rs_20 = (m_df['Close_x'].iloc[-1]/m_df['Close_x'].iloc[-20]) / max(m_df['Close_y'].iloc[-1]/m_df['Close_y'].iloc[-20], 0.5)
             ret_stock, ret_qqq = m_df['Close_x'].pct_change().dropna(), m_df['Close_y'].pct_change().dropna()
-            cov_mat = np.cov(ret_stock.iloc[-20:], ret_qqq.iloc[-20:])
+            cov_mat = np.cov(ret_stock.iloc[-60:], ret_qqq.iloc[-60:])
             beta = cov_mat[0,1] / (cov_mat[1,1] + 1e-10) if cov_mat[1,1] > 0 else 1.0
             pure_alpha = (ret_stock.iloc[-5:].mean() - beta * ret_qqq.iloc[-5:].mean()) * 252
 
@@ -1068,14 +1068,22 @@ def _evaluate_omni_matrix(df: pd.DataFrame, curr: pd.Series, prev: pd.Series, qq
     upper_wick = curr['High'] - curr['Close'] if curr['Close'] > curr['Open'] else curr['High'] - curr['Open']
 
     if pd.notna(curr['SMA_200']) and curr['Close'] > curr['SMA_50'] > curr['SMA_150'] > curr['SMA_200']:
-        add_trigger("米奈尔维尼", "🏆 [主升趋势] 米奈尔维尼模板形成 (权:{fw:.2f}x)", 8, "TREND")
+        minervini_str = (curr['SMA_50'] - curr['SMA_200']) / curr['SMA_200']
+        pts = 8 + int(minervini_str * 20)
+        add_trigger("米奈尔维尼", f"🏆 [主升趋势] 米奈尔维尼模板形成 (强度:{minervini_str*100:.1f}% 权:{{fw:.2f}}x)", pts, "TREND")
         
-    if rs_20 > 1.08: 
-        add_trigger("强相对强度", "⚡ [相对强度] 近20日动能大幅跑赢纳指 (权:{fw:.2f}x)", 7 if is_vol else 4, "TREND")
+    if rs_20 > 0: 
+        dynamic_rs_thresh = 1.0 + (curr['ATR'] / curr['Close']) * 2.0
+        if rs_20 > dynamic_rs_thresh:
+            pts = 7 if is_vol else 4
+            add_trigger("强相对强度", f"⚡ [相对强度] 动能超越动态阈值 (阈值:{dynamic_rs_thresh:.2f} 权:{{fw:.2f}}x)", pts, "TREND")
     
     if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
-        add_trigger("MACD金叉", "🔥 [经典动能] MACD水上金叉起爆 (权:{fw:.2f}x)", 10, "TREND")
-        
+        is_above_zero = curr['MACD'] > 0
+        pts = 12 if is_above_zero else 8
+        desc = "水上金叉" if is_above_zero else "水下金叉"
+        add_trigger("MACD金叉", f"🔥 [经典动能] MACD{desc}起爆 (权:{{fw:.2f}}x)", pts, "TREND")
+
     if (curr['BB_Upper'] - curr['BB_Lower']) < (curr['KC_Upper'] - curr['KC_Lower']): 
         add_trigger("TTM Squeeze ON", "📦 [波动压缩] TTM Squeeze 挤流状态激活 (权:{fw:.2f}x)", 8, "VOLATILITY")
 
@@ -1159,7 +1167,7 @@ def _evaluate_omni_matrix(df: pd.DataFrame, curr: pd.Series, prev: pd.Series, qq
             add_trigger("VPT量价共振", "📈 [量价归一] VPT Z-Score突破且动能加速，真实买盘绝对共振 (权:{fw:.2f}x)", 10, "TREND")
 
         if prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']:
-            add_trigger("带量金叉(交互)", "🔥 [交互共振] MACD水上金叉与成交量激增产生乘数效应 (权:{fw:.2f}x)", 12, "TREND")
+            add_trigger("带量金叉(交互)", "🔥 [交互共振] MACD金叉与成交量激增产生乘数效应 (权:{fw:.2f}x)", 12, "TREND")
             
         if curr['CMF'] > 0.15 and curr['Smart_Money_Flow'] > 0.4:
             add_trigger("量价吸筹(交互)", "🏦 [交互共振] 蔡金资金流与微观聪明钱同向深度吸筹 (权:{fw:.2f}x)", 10, "QUANTUM")
@@ -1456,7 +1464,6 @@ def run_tech_matrix() -> None:
     
     vix_current = float(vix_desc.split(":")[1].replace(")", "").strip()) if "VIX:" in vix_desc else 18.0
     
-    # 🚀 计算全维度宏观张量 (Macro State Tensor)
     vix3m_df = safe_get_history("^VIX3M", "5d", "1d", fast_mode=True)
     vix_inv = False
     vix_term_structure = 1.0
@@ -1468,7 +1475,6 @@ def run_tech_matrix() -> None:
                 vix_inv = True
                 vix_desc += "\n- 🚨 **VIX曲面倒挂**: 近端恐慌(VIX)碾压远期(VIX3M)，全市场防线已强制极致收缩！"
             
-    # 计算信用利差真实动能 (Credit Spread Momentum)
     hyg_df = safe_get_history("HYG", "1mo", "1d", fast_mode=True)
     ief_df = safe_get_history("IEF", "1mo", "1d", fast_mode=True)
     credit_spread_mom = 0.0
@@ -1477,7 +1483,6 @@ def run_tech_matrix() -> None:
         if len(ratio) >= 10:
             credit_spread_mom = (ratio.iloc[-1] / ratio.iloc[-10]) - 1.0
             
-    # 获取大盘级期权避险情绪 (Market Put/Call Ratio via SPY)
     spy_pcr, _, _, _ = safe_get_sentiment_data("SPY")
     market_pcr = spy_pcr if spy_pcr > 0 else 1.0
             
@@ -1654,7 +1659,6 @@ def run_tech_matrix() -> None:
                     term_batch = np.full(len(raw_reports), vix_term_structure - 1.0)
                     pcr_batch = np.full(len(raw_reports), market_pcr - 1.0)
                     
-                    # 🚀 防弹后向兼容机制：老版本 3维 vs 新版本 6维 全息宏观状态张量
                     if hasattr(meta_clf, 'coef_') and meta_clf.coef_.shape[1] == 6:
                         X_meta = np.column_stack([prob_A, prob_B, vix_batch, cred_batch, term_batch, pcr_batch])
                     else:
@@ -1737,7 +1741,6 @@ def run_tech_matrix() -> None:
     else:
         logger.info("📭 本次矩阵扫描无标的突破 Top 15% 截面排位，宁缺毋滥，保持静默。")
 
-    # 🚀 将宏观引力张量压入缓存日志，供周五深夜重组
     try:
         with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
             log_entry = {
@@ -1775,7 +1778,6 @@ def run_backtest_engine() -> None:
                         macro = log.get('macro_meta', {})
                         
                         for p in daily_trades:
-                            # 🚀 解析与兼容历史宏观张量记录
                             trades.append({
                                 'date': log['date'], 
                                 'vix': macro.get('vix', log.get('vix', 18.0)), 
@@ -2041,7 +2043,6 @@ def run_backtest_engine() -> None:
             
             y_all_class = (y_all_cont > 0.015).astype(int)
             
-            # 🚀 6 维宏观状态张量构建
             vix_all = trade_df['vix'].values / 20.0
             cred_all = trade_df['cred'].values
             term_all = trade_df['term'].values - 1.0
@@ -2073,7 +2074,6 @@ def run_backtest_engine() -> None:
                 
             valid_meta_idx = np.where(oof_pred_A > 0)[0]
             if len(valid_meta_idx) > 10:
-                # 🧠 L1 正则化 Logistic 将在 6 维宏观天眼下自动选择非噪声特征
                 X_meta_train = np.column_stack([
                     oof_pred_A[valid_meta_idx], 
                     oof_pred_B[valid_meta_idx], 
