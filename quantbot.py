@@ -114,6 +114,11 @@ class Config:
         CROWDING_PENALTY = 0.75     # 拥挤度惩罚乘数
         CROWDING_MIN_STOCKS = 2     # 触发拥挤惩罚的同板块最低个股数
         
+        # 🚀 回测与实盘仿真交易参数
+        SLIPPAGE = 0.003            # 滑点比例 (默认 0.3%)
+        COMMISSION = 0.0005         # 单边交易手续费 (默认万分之五)
+        MIN_T_STAT = 1.0            # 因子大逃杀最低 T-Stat 绝对值存活线 (确保动态保留显著因子)
+
         # 另类数据与情绪极值阈值
         PCR_BEAR = 1.5           
         PCR_BULL = 0.5           
@@ -149,7 +154,6 @@ class Config:
                         for k, v in custom_cfg.items():
                             if hasattr(cls, k):
                                 orig_val = getattr(cls, k)
-                                # 🚀 强类型防御：利用反射检测原属性类型，强行转换 JSON 传入的值
                                 if isinstance(orig_val, bool):
                                     if isinstance(v, str):
                                         cast_v = v.lower() in ['true', '1', 'yes', 't']
@@ -762,7 +766,6 @@ def send_alert(title: str, content: str) -> None:
     req_headers = _GLOBAL_HEADERS.copy()
     req_headers["Content-Type"] = "application/json"
     
-    # 🚀 并发防堵塞：采用纯净的独立 Thread 抛出 HTTP POST，脱离主线程生命周期束缚
     if Config.WEBHOOK_URL:
         payload = {
             "msgtype": "markdown", 
@@ -2113,8 +2116,8 @@ def run_backtest_engine() -> None:
         logger.error(f"回测拉取数据失败: {e}")
         return
     
-    SLIPPAGE = 0.003    
-    COMMISSION = 0.0005 
+    SLIPPAGE = Config.Params.SLIPPAGE
+    COMMISSION = Config.Params.COMMISSION
     
     stats_period, factor_rets = {'T+1': [], 'T+3': [], 'T+5': []}, {}
     trades_with_ret = []
@@ -2283,23 +2286,26 @@ def run_backtest_engine() -> None:
                     
                 factor_ic_report[f] = {'mean_ic': mean_ic, 'ir': ir, 't_stat': t_stat}
                 
-                if abs(t_stat) > 0.5:
+                # 🚀 大逃杀：保留具有统计显著性的因子，抛弃生硬的排位筛选
+                if abs(t_stat) > Config.Params.MIN_T_STAT:
                     active_candidates.append((f, abs(t_stat)))
             
             active_candidates.sort(key=lambda x: x[1], reverse=True)
-            top_25_factors = [x[0] for x in active_candidates[:25]]
+            active_factors_list = [x[0] for x in active_candidates]
             
-            if len(top_25_factors) < 5:
-                top_25_factors = Config.ALL_FACTORS[:25]
+            # 若小样本或极端行情导致全军覆没，强行提拔表现最好的 5 个因子保底
+            if len(active_factors_list) < 5:
+                fallback_candidates = sorted(factor_ic_report.items(), key=lambda x: abs(x[1]['t_stat']), reverse=True)
+                active_factors_list = [x[0] for x in fallback_candidates[:5]]
                 
-            logger.info(f"🧬 代谢淘汰完毕，25 个高 T-stat 因子已入列。被淘汰打入冷宫因子数：{len(Config.ALL_FACTORS) - len(top_25_factors)}")
+            logger.info(f"🧬 代谢淘汰完毕，{len(active_factors_list)} 个高 T-stat 因子已入列。被淘汰打入冷宫因子数：{len(Config.ALL_FACTORS) - len(active_factors_list)}")
             
             scaler = RobustScaler()
-            X_all_active_scaled = scaler.fit_transform(X_all_df[top_25_factors])
-            X_scaled_df = pd.DataFrame(X_all_active_scaled, columns=top_25_factors)
+            X_all_active_scaled = scaler.fit_transform(X_all_df[active_factors_list])
+            X_scaled_df = pd.DataFrame(X_all_active_scaled, columns=active_factors_list)
             
-            active_A = [f for f in top_25_factors if f in Config.GROUP_A_FACTORS]
-            active_B = [f for f in top_25_factors if f in Config.GROUP_B_FACTORS]
+            active_A = [f for f in active_factors_list if f in Config.GROUP_A_FACTORS]
+            active_B = [f for f in active_factors_list if f in Config.GROUP_B_FACTORS]
             
             X_A = X_scaled_df[active_A].values if active_A else np.zeros((len(X_scaled_df), 0))
             X_B = X_scaled_df[active_B].values if active_B else np.zeros((len(X_scaled_df), 0))
@@ -2361,18 +2367,18 @@ def run_backtest_engine() -> None:
             final_base_B = LGBMClassifier(**lgbm_params).fit(X_B, y_all_class) if can_train_B else None
             
             clf_model = {
-                'active_factors': top_25_factors,
+                'active_factors': active_factors_list,
                 'active_A': active_A,
                 'active_B': active_B,
                 'scaler': scaler,
                 'base_A': final_base_A, 
                 'base_B': final_base_B, 
                 'meta': meta_clf,
-                'n_features_in_': len(top_25_factors)
+                'n_features_in_': len(active_factors_list)
             }
             with open(Config.MODEL_FILE, 'wb') as f:
                 pickle.dump(clf_model, f)
-            logger.info(f"🧠 【动态代谢体系】25维优胜张量已封装进 6维全息宏观感知的 Stacking Ensemble 模型落盘。")
+            logger.info(f"🧠 【动态代谢体系】{len(active_factors_list)}维优胜张量已封装进 6维全息宏观感知的 Stacking Ensemble 模型落盘。")
             
             combined_imp = np.zeros(len(Config.ALL_FACTORS))
             if final_base_A and hasattr(final_base_A, 'feature_importances_'):
@@ -2495,11 +2501,13 @@ def run_backtest_engine() -> None:
         report_md.append(f"| {p} | {d['win_rate']*100:.1f}% | {ai_str} | {d['avg_ret']*100:+.2f}% | {d['profit_factor']:.2f} | {d['sharpe']:.2f} | {d['avg_win_mae']*100:.1f}% | {d['total_trades']} |")
     
     if factor_ic_report:
-        report_md.append("\n## 🧬 因子动物园 Rank IC 淘汰赛排行榜 (Top 10)\n*展示最具未来收益解释度的因子，T-stat 低于 1.5 且排名靠后的因子已自动打入冷宫。*\n| 因子特征 | 均值 IC | T-Statistic (绝对值) | 状态 |\n|:---|:---:|:---:|:---:|")
+        report_md.append("\n## 🧬 因子动物园 Rank IC 淘汰赛排行榜 (Top 10)\n*展示最具未来收益解释度的因子，T-stat 低于 1.0 且排名靠后的因子已自动打入冷宫。*\n| 因子特征 | 均值 IC | T-Statistic (绝对值) | 状态 |\n|:---|:---:|:---:|:---:|")
         sorted_ic = sorted(factor_ic_report.items(), key=lambda x: abs(x[1]['t_stat']), reverse=True)
-        top_25_names = [x[0] for x in sorted_ic[:25]]
+        active_names = [x[0] for x in sorted_ic if abs(x[1]['t_stat']) > Config.Params.MIN_T_STAT]
+        if len(active_names) < 5:
+            active_names = [x[0] for x in sorted_ic[:5]]
         for tag, data in sorted_ic[:10]: 
-            status = "🟢 激活" if tag in top_25_names else "🧊 冷宫"
+            status = "🟢 激活" if tag in active_names else "🧊 冷宫"
             report_md.append(f"| {tag} | {data['mean_ic']:.4f} | {abs(data['t_stat']):.2f} | {status} |")
 
     if feature_importances_dict:
@@ -2535,7 +2543,7 @@ def run_backtest_engine() -> None:
         alert_lines.extend(["", "---", "", "### 🧬 **因子 Rank IC 排行榜 (Top 3)**"])
         for f, data in top_3:
             alert_lines.append(f"- 🏆 **{f}**: T-stat {abs(data['t_stat']):.2f}")
-        alert_lines.append(f"*(共有 {len(Config.ALL_FACTORS)-25} 个因子在本次淘汰赛中被降级退役打入冷宫)*")
+        alert_lines.append(f"*(共有 {len(Config.ALL_FACTORS)-len(active_names)} 个因子在本次淘汰赛中被降级退役打入冷宫)*")
 
     if meta_weights_dict:
         w_A = meta_weights_dict.get('Group_A', 0)
@@ -2714,4 +2722,4 @@ if __name__ == "__main__":
     if m == "matrix": run_tech_matrix()
     elif m == "backtest": run_backtest_engine()
     elif m == "stress": run_synthetic_stress_test()
-    elif m == "test": send_alert("连通性测试", "全维宏观 Meta 跃迁完成！系统已通过 L1 正则化，开启了包括信用利差、PCR 与 VIX 曲线在内的 6 维上帝视野。")
+    elif m == "test": send_alert("连通性测试", "系统重构完成！实盘滑点已参数化，代谢大逃杀已升级为 T-Stat 自适应动态边界，告别固定数量的僵尸因子！")
