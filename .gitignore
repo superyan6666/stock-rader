@@ -1,7 +1,7 @@
 .quantbot_data/
 *.tmp
 
-__pycache__/
+pycache/
 *.py[cod]
 *$py.class
 
