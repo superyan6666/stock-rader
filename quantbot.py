@@ -95,7 +95,7 @@ class Config:
     CORE_FACTORS = [
         "米奈尔维尼", "强相对强度", "MACD金叉", "TTM Squeeze ON", "一目多头", "强势回踩", "机构控盘(CMF)",
         "突破缺口", "VWAP突破", "AVWAP突破", "SMC失衡区", "流动性扫盘", "聪明钱抢筹", "巨量滞涨", "放量长阳", "口袋支点", 
-        "VCP收缩", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘", "威科夫弹簧(Spring)", "跨时空共振(周线)"
+        "VCP收缩", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘", "跨时空共振(周线)"
     ]
     
     ADVANCED_MATH_FACTORS = [
@@ -1021,25 +1021,6 @@ def _robust_hurst(close_prices: np.ndarray, min_window=30, n_bootstrap=100) -> T
     is_reliable = bool((h_iqr < 0.15) and (abs(h_median - 0.5) > 0.1))
     return h_median, h_iqr, is_reliable
 
-def _compute_advanced_composite(stock: StockData, cf: ComplexFeatures, ctx: MarketContext) -> Tuple[float, dict]:
-    fft_score = cf.fft_ensemble_score * 0.5 
-    hurst_score = max(0.0, min(1.0, (cf.hurst_med - 0.5) * 2.0)) if (cf.hurst_reliable and cf.hurst_med > 0.65) else 0.0
-    vpt_score = (1.0 / (1.0 + np.exp(-stock.curr['VPT_ZScore']))) if stock.curr['VPT_Accel'] > 0 else 0.0
-    cvd_score = float(stock.curr['CVD_Trend'] * (0.3 if stock.curr['CVD_Divergence'] == 1 else 1.0))
-    kde_score = cf.kde_breakout_score
-    
-    w_fft = max(0.1, ctx.xai_weights.get("FFT多窗共振(动能)", 1.0))
-    w_hurst = max(0.1, ctx.xai_weights.get("稳健赫斯特(Hurst)", 1.0))
-    w_vpt = max(0.1, ctx.xai_weights.get("VPT量价共振", 1.0))
-    w_cvd = max(0.1, ctx.xai_weights.get("CVD筹码净流入", 1.0))
-    w_kde = max(0.1, ctx.xai_weights.get("量子概率云(KDE)", 1.0))
-    
-    total_w = w_fft + w_hurst + w_vpt + w_cvd + w_kde
-    composite = (fft_score * w_fft + hurst_score * w_hurst + vpt_score * w_vpt + cvd_score * w_cvd + kde_score * w_kde) / total_w
-    
-    details = {'FFT': fft_score, 'Hurst': hurst_score, 'VPT': vpt_score, 'CVD': cvd_score, 'KDE': kde_score}
-    return composite, details
-
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_index()
     df['Close'], df['Volume'] = df['Close'].ffill(), df['Volume'].ffill()
@@ -1424,7 +1405,6 @@ def _extract_ml_features(stock: StockData, ctx: MarketContext, cf: ComplexFeatur
         "特性改变(ChoCh)": safe_div(stock.curr['Close'] - stock.swing_high_10, stock.swing_high_10 * 0.01),
         "订单块(OB)": safe_div(stock.curr['Close'] - stock.curr['OB_Low'], stock.curr['OB_High'] - stock.curr['OB_Low'] + 1e-10) if pd.notna(stock.curr['OB_High']) else 0.0,
         "AMD操盘": safe_div(min(stock.curr['Open'], stock.curr['Close']) - stock.curr['Low'], stock.curr['TR'] + 1e-10),
-        "威科夫弹簧(Spring)": safe_div(stock.curr['Swing_Low_20'] - stock.curr['Low'], stock.curr['Low'] * 0.01) if pd.notna(stock.curr['Swing_Low_20']) else 0.0,
         "跨时空共振(周线)": 1.0 if cf.weekly_bullish else 0.0,
         "CVD筹码净流入": float(stock.curr['CVD_Trend'] * (0.3 if stock.curr['CVD_Divergence'] == 1 else 1.0)),
         "独立Alpha(脱钩)": cf.pure_alpha,
