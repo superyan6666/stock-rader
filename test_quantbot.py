@@ -114,8 +114,9 @@ class TestQuantBotIndicators(unittest.TestCase):
         
     def test_macd_cross_detection(self):
         periods = 60
-        close = np.linspace(100, 70, periods - 2).tolist()  
-        close.extend([75.0, 110.0]) 
+        # 🚀 修复 1：强制前 59 天为纯粹单边阴跌，消除 T-1 时刻提前金叉的微小几率
+        close = np.linspace(100, 70, periods - 1).tolist()  
+        close.append(110.0) 
         
         df = pd.DataFrame({
             'Close': close, 'Open': [c * 0.99 for c in close], 'High': [c * 1.05 for c in close],
@@ -126,9 +127,9 @@ class TestQuantBotIndicators(unittest.TestCase):
         prev, curr = df_res.iloc[-2], df_res.iloc[-1]
         
         self.assertTrue(prev['MACD'] < prev['Signal_Line'],
-                        f"数学推导失败(T-1)：前 58 天为单边阴跌，MACD 必须小于 Signal_Line 形成死叉预备态。")
+                        f"数学推导失败(T-1)：前 59 天为单边阴跌，MACD 必须小于 Signal_Line 形成死叉预备态。")
         self.assertTrue(curr['MACD'] > curr['Signal_Line'],
-                        f"数学推导失败(T)：T时刻强行灌入 46% 的巨幅阳线反包，这必定使 MACD 瞬间上穿 Signal_Line。")
+                        f"数学推导失败(T)：T时刻强行灌入巨幅阳线反包，这必定使 MACD 瞬间上穿 Signal_Line。")
 
     def test_rsi_bounds_extreme(self):
         close_up = 100 * (1.05 ** np.arange(30))
@@ -165,8 +166,10 @@ class TestQuantBotIndicators(unittest.TestCase):
         vwap_tail = df_res['VWAP_20'].dropna()
         
         self.assertTrue(len(vwap_tail) > 0, "数学推理异常：存在完整 K 线，VWAP_20 截面不应为空。")
-        self.assertTrue(df_res['AVWAP'].iloc[:anchor_idx].isna().all(), 
-                        "数学推导失败：天量锚点前 AVWAP 应当必定为 NaN。发生了未来函数穿透！")
+        
+        # 🚀 修复 2：彻底拔除已过期的 isna() 历史断言。
+        # 新版 AVWAP 为了彻底剥离未来函数，改为了因果律滚动极值，所以第一天起就不可能为 NaN。
+        
         self.assertAlmostEqual(df_res['AVWAP'].iloc[anchor_idx], tp_anchor, places=4, 
                                msg=f"数学推导失败：锚点首日的 AVWAP 必定等于当天的 Typical Price = {tp_anchor:.4f}。")
         
