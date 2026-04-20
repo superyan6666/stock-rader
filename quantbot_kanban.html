@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QuantBot 3.0 Command Center</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
+        body {
+            font-family: 'JetBrains Mono', monospace;
+            background-color: #0f172a; /* Slate 900 */
+            color: #e2e8f0; /* Slate 200 */
+            /* 适配 Notion 的暗黑模式内嵌 */
+            margin: 0;
+            padding: 1rem;
+        }
+        .kanban-col {
+            background: linear-gradient(145deg, #1e293b, #0f172a);
+            border: 1px solid #334155;
+            min-height: 80vh;
+        }
+        .kanban-card {
+            background-color: #1e293b;
+            border-left: 4px solid transparent;
+            transition: all 0.3s ease;
+        }
+        .kanban-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
+            background-color: #2dd4bf0a; /* Emerald tint hover */
+        }
+        /* 优先级边框色 */
+        .priority-high { border-left-color: #ef4444; } /* Red 500 */
+        .priority-med { border-left-color: #f59e0b; } /* Amber 500 */
+        .priority-low { border-left-color: #10b981; } /* Emerald 500 */
+        
+        .tag {
+            font-size: 0.65rem;
+            padding: 0.15rem 0.4rem;
+            border-radius: 9999px;
+            background-color: #334155;
+            color: #94a3b8;
+            font-weight: bold;
+            letter-spacing: 0.05em;
+        }
+        .scroll-hide::-webkit-scrollbar {
+            display: none;
+        }
+        .scroll-hide {
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+    </style>
+</head>
+<body class="scroll-hide">
+
+    <!-- Header区 -->
+    <header class="mb-6 border-b border-slate-700 pb-4">
+        <div class="flex justify-between items-end">
+            <div>
+                <h1 class="text-2xl md:text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-sky-400 to-indigo-400">
+                    🤖 QuantBot 3.0 (The Singularity Edition)
+                </h1>
+                <p class="text-slate-400 mt-1 text-sm flex items-center">
+                    <span class="w-2 h-2 rounded-full bg-emerald-500 mr-2 animate-pulse"></span>
+                    系统状态: 实盘网关接入与右脑唤醒阶段
+                </p>
+            </div>
+            <div class="text-right hidden md:block">
+                <p class="text-xs text-slate-500">最近同步时间</p>
+                <p class="text-sm font-bold text-slate-300 font-mono">2026-04-19 21:00 UTC</p>
+            </div>
+        </div>
+    </header>
+
+    <!-- 核心铁律备忘录 (可折叠样式) -->
+    <div class="mb-6 bg-slate-800/50 border border-rose-900/30 rounded-lg p-3 text-xs">
+        <h3 class="text-rose-400 font-bold mb-2">🛡️ 架构师备忘录与铁律防线 (Iron Laws Checkpoint)</h3>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-slate-400 font-mono">
+            <div><span class="text-emerald-400">1.</span> 内存隔离 `.copy(deep=True)`</div>
+            <div><span class="text-emerald-400">2.</span> 防爆除数 `+ 1e-10`</div>
+            <div><span class="text-emerald-400">3.</span> 并发写入 `os.replace` 原子性</div>
+            <div><span class="text-emerald-400">4.</span> 时序验证 `Purge` 净化期截断</div>
+        </div>
+    </div>
+
+    <!-- 看板主矩阵 -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+        
+        <!-- Column 1: 需求储备池 -->
+        <div class="kanban-col rounded-xl p-4">
+            <h2 class="text-md font-bold mb-4 flex items-center text-slate-300 border-b border-slate-700 pb-2">
+                🧊 需求储备池 (Backlog)
+                <span class="ml-auto bg-slate-700 text-xs px-2 py-1 rounded-full">2</span>
+            </h2>
+            <div class="space-y-4">
+                
+                <!-- Card -->
+                <div class="kanban-card p-4 rounded-lg shadow-lg priority-med">
+                    <div class="flex justify-between items-start mb-2">
+                        <span class="text-amber-400 text-xs font-bold">🟡 Medium Priority</span>
+                    </div>
+                    <h3 class="text-sm font-bold text-slate-200 mb-1">FRED 美联储流动性接口接入</h3>
+                    <p class="text-xs text-slate-400 leading-relaxed mb-3">抓取逆回购 (RRP) 与超额准备金数据，构建基于流动性潮汐的宏观引力场风控底座。</p>
+                    <div class="flex gap-1 flex-wrap">
+                        <span class="tag">#Macro</span>
+                        <span class="tag">#Data</span>
+                    </div>
+                </div>
+
+                <!-- Card -->
+                <div class="kanban-card p-4 rounded-lg shadow-lg priority-high">
+                    <div class="flex justify-between items-start mb-2">
+                        <span class="text-rose-400 text-xs font-bold animate-pulse">🔴 High Priority</span>
+                    </div>
+                    <h3 class="text-sm font-bold text-slate-200 mb-1">RL Execution Agent (强化学习微操)</h3>
+                    <p class="text-xs text-slate-400 leading-relaxed mb-3">引入 PPO 算法取代传统 VWAP，根据 L2 盘口动态拆单，降低大资金建仓的市场冲击成本。</p>
+                    <div class="flex gap-1 flex-wrap">
+                        <span class="tag">#RL</span>
+                        <span class="tag">#Execution</span>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+        <!-- Column 2: 正在推进 -->
+        <div class="kanban-col rounded-xl p-4 border border-sky-900/50 relative overflow-hidden">
+            <!-- 激活状态的背景光晕 -->
+            <div class="absolute -top-10 -right-10 w-32 h-32 bg-sky-500/10 rounded-full blur-3xl"></div>
+            
+            <h2 class="text-md font-bold mb-4 flex items-center text-sky-400 border-b border-sky-900/50 pb-2 relative z-10">
+                🔥 正在推进 (In Progress)
+                <span class="ml-auto bg-sky-900/50 text-xs px-2 py-1 rounded-full text-sky-300">2</span>
+            </h2>
+            <div class="space-y-4 relative z-10">
+                
+                <!-- Card -->
+                <div class="kanban-card p-4 rounded-lg shadow-lg priority-high border border-slate-600">
+                    <div class="flex justify-between items-start mb-2">
+                        <span class="text-rose-400 text-xs font-bold flex items-center">
+                            <span class="w-1.5 h-1.5 bg-rose-500 rounded-full mr-1 animate-ping"></span>🔴 High
+                        </span>
+                    </div>
+                    <h3 class="text-sm font-bold text-white mb-1">Quant Transformer 深度学习右脑唤醒</h3>
+                    <p class="text-xs text-slate-400 leading-relaxed mb-3">激活 `quant_transformer.py`。摄入 60x49 张量，利用多头自注意力机制蒸馏出 16 维纯净 Alpha 向量，馈送至 LightGBM Stacking 顶层。</p>
+                    <div class="flex gap-1 flex-wrap">
+                        <span class="tag bg-sky-900/50 text-sky-300">#DeepLearning</span>
+                        <span class="tag bg-indigo-900/50 text-indigo-300">#Alpha</span>
+                    </div>
+                </div>
+
+                <!-- Card -->
+                <div class="kanban-card p-4 rounded-lg shadow-lg priority-high border border-slate-600">
+                    <div class="flex justify-between items-start mb-2">
+                        <span class="text-rose-400 text-xs font-bold">🔴 High</span>
+                    </div>
+                    <h3 class="text-sm font-bold text-white mb-1">Execution Gateway 真实券商 API 联调</h3>
+                    <p class="text-xs text-slate-400 leading-relaxed mb-3">在 `execution_gateway.py` 中将 `MockAlpacaGateway` 替换为真实的 REST/WebSocket API，验证实盘挂单与滑点捕获。</p>
+                    <div class="flex gap-1 flex-wrap">
+                        <span class="tag bg-amber-900/50 text-amber-300">#Gateway</span>
+                        <span class="tag">#Infra</span>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+        <!-- Column 3: 已落盘封装 -->
+        <div class="kanban-col rounded-xl p-4 opacity-90">
+            <h2 class="text-md font-bold mb-4 flex items-center text-emerald-400 border-b border-emerald-900/30 pb-2">
+                ✅ 已落盘封装 (Completed)
+                <span class="ml-auto bg-emerald-900/30 text-xs px-2 py-1 rounded-full text-emerald-300">3</span>
+            </h2>
+            <div class="space-y-4 opacity-70 hover:opacity-100 transition-opacity">
+                
+                <!-- Card -->
+                <div class="kanban-card p-4 rounded-lg shadow-lg priority-low">
+                    <div class="flex justify-between items-start mb-1">
+                        <span class="text-emerald-500 text-[10px] font-mono">阶段 3.0 初期</span>
+                        <span class="text-emerald-500 text-xs">✓</span>
+                    </div>
+                    <h3 class="text-sm font-bold text-slate-300 mb-1 line-through decoration-slate-500">SQLite WAL 异步 IPC 枢纽</h3>
+                    <p class="text-xs text-slate-500 leading-relaxed mb-2">已彻底解耦主脑与网关。主脑执行 INSERT 指令，网关轮询，保障断电崩溃后的最终一致性。</p>
+                    <div class="flex gap-1 flex-wrap">
+                        <span class="tag">#DB</span><span class="tag">#IPC</span>
+                    </div>
+                </div>
+
+                <!-- Card -->
+                <div class="kanban-card p-4 rounded-lg shadow-lg priority-low">
+                    <div class="flex justify-between items-start mb-1">
+                        <span class="text-emerald-500 text-[10px] font-mono">阶段 3.0 初期</span>
+                        <span class="text-emerald-500 text-xs">✓</span>
+                    </div>
+                    <h3 class="text-sm font-bold text-slate-300 mb-1 line-through decoration-slate-500">FSM 订单状态机与致命防爆墙</h3>
+                    <p class="text-xs text-slate-500 leading-relaxed mb-2">实现 PENDING->FILLED 跃迁，加入胖手指拦截与 TCA 滑点 1e-10 数学防御。</p>
+                    <div class="flex gap-1 flex-wrap">
+                        <span class="tag">#Risk</span><span class="tag">#FSM</span>
+                    </div>
+                </div>
+
+                <!-- Card -->
+                <div class="kanban-card p-4 rounded-lg shadow-lg priority-low">
+                    <div class="flex justify-between items-start mb-1">
+                        <span class="text-emerald-500 text-[10px] font-mono">阶段 2.0 末期</span>
+                        <span class="text-emerald-500 text-xs">✓</span>
+                    </div>
+                    <h3 class="text-sm font-bold text-slate-300 mb-1 line-through decoration-slate-500">Kelly-CVaR 动态凸优化器</h3>
+                    <p class="text-xs text-slate-500 leading-relaxed mb-2">基于协方差收缩与 95% 在险价值计算，输出资金分配反脆弱阵型。</p>
+                    <div class="flex gap-1 flex-wrap">
+                        <span class="tag">#Math</span><span class="tag">#Portfolio</span>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+    </div>
+
+</body>
+</html>
