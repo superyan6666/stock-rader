@@ -1,3 +1,4 @@
+# 存储路径: execution_gateway.py
 import sqlite3
 import json
 import time
@@ -10,6 +11,10 @@ import numpy as np
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+
+def datetime_to_str():
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
 # ================= 1. 全局配置与铁律防线 =================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [Gateway] %(levelname)s - %(message)s')
@@ -292,10 +297,6 @@ class ExecutionEngine:
         except KeyboardInterrupt:
             logger.info("🛑 收到停机指令，网关安全下线。")
             self.is_running = False
-
-def datetime_to_str():
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
 if __name__ == "__main__":
     # 单机测试入口
