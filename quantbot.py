@@ -2128,7 +2128,40 @@ def run_tech_matrix() -> None:
     # 第四阶段：左脑 Meta-Learner (LightGBM) 二次复核胜率
     raw_reports = _apply_ai_inference(raw_reports, ctx)
     
-    # 后续的风险平价、Kelly资金分配、IPC 路由保持原样不变...
+    # 🚀 修复 3：补全由批量处理拆分导致的 reports 队列构建与目标权重解算循环
+    reports, background_pool, all_raw_scores = [], [], []
+    for r in raw_reports:
+        if r['total_score'] > 0: all_raw_scores.append(r['total_score'])
+        
+        # 将张量送入凯利仓位计算器，计算建议止盈、吊灯止损与最优敞口
+        tp_val, sl_val, kelly_fraction, basic_advice = _calculate_position_size(
+            StockData(r['sym'], pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), r['curr'], r['prev'], False, 0.0), 
+            ctx, r['ai_prob'], r['is_bearish_div'], r['black_swan_risk']
+        )
+
+        stock_data_pack = {
+            "symbol": r['sym'], "score": r['total_score'], "ai_prob": r['ai_prob'], "signals": r['sig'][:8], 
+            "factors": r['factors'], "ml_features": r['ml_features'],
+            "curr_close": float(r['curr']['Close']), "tp": float(tp_val), "sl": float(sl_val), 
+            "news": r['news'], "sector": r['sym_sec'], "pos_advice": basic_advice,
+            "kelly_fraction": kelly_fraction
+        }
+
+        # 剥离低分无效标的，防范垃圾交易标的污染 Kelly 优化阵列
+        if not r['is_untradeable'] and r['total_score'] > 0 and kelly_fraction > 0:
+            if check_earnings_risk(r['sym']):
+                r['sig'].append("💣 [财报雷区] 近5日发财报,风险极高")
+                r['total_score'] = int(r['total_score'] * 0.5)
+                stock_data_pack["score"] = r['total_score']
+            reports.append(stock_data_pack)
+        else:
+            background_pool.append(stock_data_pack)
+
+    if reports and all_raw_scores:
+        # 动态自适应水位线：取当天全市场排名前 15% 的高分王者
+        ctx.dynamic_min_score = max(Config.Params.MIN_SCORE_THRESHOLD, np.percentile(all_raw_scores, 85))
+        reports = [r for r in reports if r['score'] >= ctx.dynamic_min_score]
+        
         groups = defaultdict(list)
         for r in reports: groups[r["sector"]].append(r)
         for sec, stks in groups.items():
@@ -2353,6 +2386,7 @@ def run_backtest_engine() -> None:
                                     transformer_Y.append(ret if d == 3 else 0.0) 
                         except Exception: pass
                     
+                    # 🚀 修复 4：通过严格的空间强制对齐，确保归因与收益记录绝对隶属于 exit_revenue is not None 代码块之下
                     trade_mfe = (max_high_during_trade - entry_cost) / entry_cost
                     trade_mae = (min_low_during_trade - entry_cost) / entry_cost
                     mae_mfe_records[f'T+{d}'].append({'ret': ret, 'mfe': trade_mfe, 'mae': trade_mae})
