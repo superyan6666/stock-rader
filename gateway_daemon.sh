@@ -2,7 +2,7 @@
 # 🚀 QuantBot 3.0 Execution Gateway Daemon
 # 严格的进程生命周期管理，确保网关成为“不死鸟”
 
-GATEWAY_SCRIPT="execution_gateway.py"
+GATEWAY_SCRIPT="quant_engine.py gateway"
 LOG_FILE="gateway_stdout.log"
 
 echo "[$(date +'%Y-%m-%d %H:%M:%S')] 🛡️ 启动 QuantBot 实盘执行网关守护进程..."
