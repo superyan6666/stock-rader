@@ -16,7 +16,7 @@ import uuid        # 🚀 新增: 用于生成不可重复的订单 OID
 import scipy.stats as stats
 import concurrent.futures
 import threading
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from scipy.optimize import minimize
@@ -86,6 +86,15 @@ class Config:
     EXT_CACHE_FILE: str = os.path.join(DATA_DIR, "daily_ext_cache.json")
     ORDER_DB_PATH: str = os.path.join(DATA_DIR, "order_state.db") # 🚀 新增: 执行网关账本路径
     MODEL_VERSION: str = "1.0" 
+
+    # 🚀 修复 6：补充核心底仓股票池与板块拥挤度排除名单 (防止 get_filtered_watchlist 抛出 AttributeError)
+    CORE_WATCHLIST: list = [
+        "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO", "AMD", "QCOM",
+        "JPM", "V", "MA", "UNH", "JNJ", "XOM", "PG", "HD", "COST", "ABBV",
+        "CRM", "NFLX", "ADBE", "NOW", "UBER", "INTU", "IBM", "ISRG", "SYK",
+        "SPY", "QQQ", "IWM", "DIA"
+    ]
+    CROWDING_EXCLUDE_SECTORS: list = [INDEX_ETF] # 宽基指数不计入板块拥挤度惩罚
 
     # 🚀 因子生命周期管理：按成熟度与来源严格划分，根除僵尸因子
     CORE_FACTORS = [
@@ -1199,7 +1208,6 @@ def _get_transformer_seq(df_ind: pd.DataFrame, end_idx: int = -1) -> np.ndarray:
     seq = np.zeros((60, 49), dtype=np.float32)
     
     # 🚀 响应架构加固：采用显式索引映射解耦硬编码，彻底消灭因子乱序与静默越界风险
-    # 严格映射 49 维无量纲物理特征 (通过除以 Close 或 SMA 消除绝对股价影响)
     feature_mapping = [
         (0, df['RSI'].values / 100.0),
         (1, df['MACD'].values / c),
@@ -1252,7 +1260,6 @@ def _get_transformer_seq(df_ind: pd.DataFrame, end_idx: int = -1) -> np.ndarray:
         (48, (df['Close'].values - df['Open'].values) / (df['High'].values - df['Low'].values + 1e-10))
     ]
     
-    # 🚀 刚性边界校验：确保映射字典的长度精确等于 49
     assert len(feature_mapping) == 49, f"特征维度映射崩塌：期望配置 49 维输入，实际捕获到 {len(feature_mapping)} 维！"
     
     for idx, vals in feature_mapping:
@@ -1404,7 +1411,7 @@ def _extract_complex_features(stock: StockData, ctx: MarketContext) -> ComplexFe
         dxy_corr=float(dxy_corr), vrp=float(vrp), rs_20=float(rs_20), pure_alpha=float(pure_alpha)
     )
 
-def _extract_ml_features(stock: StockData, ctx: MarketContext, cf: ComplexFeatures, alt: AltData) -> dict:
+def _extract_ml_features(stock: StockData, ctx: MarketContext, cf: ComplexFeatures, alt: AltData, alpha_vec: np.ndarray = None) -> dict:
     macd_cross_strength = safe_div(stock.curr['MACD'] - stock.curr['Signal_Line'], abs(stock.curr['Close']) * 0.01)
     vol_surge_ratio = safe_div(stock.curr['Volume'], stock.curr['Vol_MA20'], cap=50.0)
     cmf_val = stock.curr['CMF']
@@ -1451,16 +1458,10 @@ def _extract_ml_features(stock: StockData, ctx: MarketContext, cf: ComplexFeatur
         "大盘Beta(宏观调整)": cf.beta_60d,
         "利率敏感度(TLT相关性)": cf.tlt_corr,
         "汇率传导(DXY相关性)": cf.dxy_corr,
-def _extract_ml_features(stock: StockData, ctx: MarketContext, cf: ComplexFeatures, alt: AltData, alpha_vec: np.ndarray = None) -> dict:
-    macd_cross_strength = safe_div(stock.curr['MACD'] - stock.curr['Signal_Line'], abs(stock.curr['Close']) * 0.01)
-    vol_surge_ratio = safe_div(stock.curr['Volume'], stock.curr['Vol_MA20'], cap=50.0)
-    cmf_val = stock.curr['CMF']
-    smf_val = stock.curr['Smart_Money_Flow']
-    hurst_score = max(0.0, min(1.0, (cf.hurst_med - 0.5) * 2.0)) if (cf.hurst_reliable and cf.hurst_med > Config.Params.HURST_RELIABLE) else 0.0
-
-    feat_dict = {
-        "米奈尔维尼": safe_div(stock.curr['SMA_50'] - stock.curr['SMA_200'], stock.curr['SMA_200']),
-        # ... 保持其他因子映射不变 ...
+        "Amihud非流动性(冲击成本)": stock.curr['Amihud'] if pd.notna(stock.curr['Amihud']) else 0.0,
+        "52周高点距离(动能延续)": stock.curr['Dist_52W_High'] if pd.notna(stock.curr['Dist_52W_High']) else 0.0,
+        "波动率风险溢价(VRP)": cf.vrp,
+        "期权PutCall情绪(PCR)": alt.pcr,
         "隐含波动率偏度(IV Skew)": alt.iv_skew,
         "做空兴趣突变(轧空)": alt.short_change if alt.short_float > Config.Params.SHORT_SQZ_FLT else 0.0,
         "内部人集群净买入(Insider)": alt.insider_net_buy,
@@ -1469,7 +1470,6 @@ def _extract_ml_features(stock: StockData, ctx: MarketContext, cf: ComplexFeatur
         "散户热度加速度(WSB_Accel)": alt.wsb_accel
     }
 
-    # 🚀 响应 DS 架构优化：直接接收 Batch 推理产生的 Alpha 向量，杜绝反复调用模型
     if alpha_vec is not None and len(alpha_vec) == 16:
         for i, val in enumerate(alpha_vec):
             feat_dict[f"Alpha_T{i+1:02d}"] = float(val)
@@ -1480,53 +1480,8 @@ def _extract_ml_features(stock: StockData, ctx: MarketContext, cf: ComplexFeatur
 
 def _evaluate_omni_matrix(stock: StockData, ctx: MarketContext, cf: ComplexFeatures, alt: AltData) -> Tuple[int, List[str], List[str], bool]:
     triggered_list, factors_list = [], []
-# 🚀 响应 DS 架构优化：第一阶段 - 高并发执行 I/O (下载) 与计算 CPU 密集型指标
-def _prepare_universe_data(ctx: MarketContext) -> Tuple[List[dict], dict]:
-    """并发准备全市场特征基底（未融合深度学习前的形态）"""
-    active_pool = get_filtered_watchlist(max_stocks=200)
-    prepared_data = []
-    price_history_dict = {}
-    
-    def _worker(sym: str) -> Optional[dict]:
-        df = safe_get_history(sym, "1y", "1d", fast_mode=True)
-        if df.empty or len(df) < 120: return None
-        
-        df_w = df.resample('W').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
-        df_m = df.resample('M').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
-        df_60m = pd.DataFrame() 
-        
-        df_ind = calculate_indicators(df)
-        curr, prev = df_ind.iloc[-1], df_ind.iloc[-2]
-        
-        is_vol = curr['Volume'] > curr['Vol_MA20'] * 1.5
-        swing_high_10 = df_ind['High'].iloc[-11:-1].max() if len(df_ind) >= 11 else curr['High']
-        
-        stock = StockData(sym, df_ind, df_w, df_m, df_60m, curr, prev, is_vol, swing_high_10)
-        
-        pcr, iv_skew, sc, sf = safe_get_sentiment_data(sym)
-        inb, am, nlp, news = safe_get_alt_data(sym)
-        alt = AltData(pcr, iv_skew, sc, sf, inb, am, nlp, 0.0)
-        
-        cf = _extract_complex_features(stock, ctx)
-        seq = _get_transformer_seq(df_ind) # 切出时序张量备用
-        
-        return {
-            'sym': sym, 'stock': stock, 'alt': alt, 'cf': cf, 'seq': seq,
-            'curr': curr, 'prev': prev, 'news': news,
-            'close_history': df['Close'].tail(60).values
-        }
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=Config.Params.MAX_WORKERS) as executor:
-        futures = [executor.submit(_worker, sym) for sym in active_pool]
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
-            if res:
-                prepared_data.append(res)
-                price_history_dict[res['sym']] = res['close_history']
-                
-    return prepared_data, price_history_dict
-
     theme_scores = {'TREND': 0.0, 'VOLATILITY': 0.0, 'REVERSAL': 0.0, 'QUANTUM': 0.0}
+    black_swan_risk = False
     
     def get_fw(tag_name: str) -> float: return ctx.xai_weights.get(tag_name, 1.0)
     
@@ -1765,11 +1720,88 @@ def _apply_market_filters(curr: pd.Series, prev: pd.Series, sym: str, base_score
         
     return total_score, is_bearish_div, sig
 
-# 🚀 修复 DS 指出：还原被意外折叠的核心并发扫描与 AI 推理函数
-def _scan_universe_concurrently(ctx: MarketContext) -> Tuple[List[dict], dict]:
-    """并发扫描全市场标的，执行特征清洗与指标运算"""
+def _build_market_context() -> MarketContext:
+    """构建全局宏观市场感知雷达与 AI 权重参数上下文"""
+    logger.info("🌐 正在构建宏观市场感知雷达 (Market Context)...")
+
+    qqq_df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", fast_mode=True)
+    spy_df = safe_get_history("SPY", period="1y", interval="1d", fast_mode=True)
+    tlt_df = safe_get_history("TLT", period="1y", interval="1d", fast_mode=True)
+    dxy_df = safe_get_history("DX-Y.NYB", period="1y", interval="1d", fast_mode=True)
+
+    macro_data = {'spy': spy_df, 'tlt': tlt_df, 'dxy': dxy_df}
+
+    vix_current, vix_desc = get_vix_level(qqq_df)
+    vix_scalar = 1.0 if vix_current < 20 else (20.0 / vix_current)
+    vix_inv = vix_current > 30
+
+    active_pool = get_filtered_watchlist(max_stocks=100)
+    regime, regime_desc, _, is_credit_risk_high, macro_gravity = get_market_regime(active_pool)
+
+    xai_weights = {}
+    meta_weights = {}
+    health_score = 1.0
+    pain_warning = ""
+    
+    try:
+        if os.path.exists(Config.STATS_FILE):
+            with open(Config.STATS_FILE, "r", encoding="utf-8") as f:
+                stats_data = json.load(f)
+                xai_data = stats_data.get("xai_importances", {})
+                if xai_data:
+                    avg_imp = 1.0 / len(Config.ALL_FACTORS)
+                    for tag, imp in xai_data.items():
+                        xai_weights[tag] = 0.0 if imp < avg_imp * 0.25 else max(0.5, min(3.0, float(imp) / avg_imp))
+                meta_weights = stats_data.get("meta_weights", {})
+                t3_stats = stats_data.get("overall", {}).get("T+3", {})
+                max_cons_loss = t3_stats.get("max_cons_loss", 0)
+                if max_cons_loss >= 4:
+                    health_score = 0.5
+                    pain_warning = f" | 🩸 痛觉激活: 历史探测到 {max_cons_loss} 连亏，系统强制降杠杆防守"
+    except Exception: pass
+
+    w_mul = 1.0
+    max_risk = Config.Params.BASE_MAX_RISK
+    if regime in ["bear", "hidden_bear"]:
+        w_mul = 0.6
+        max_risk *= 0.6
+    elif regime in ["bull", "rebound"]:
+        w_mul = 1.2
+        max_risk *= 1.2
+
+    if macro_gravity:
+        w_mul *= 0.5
+        max_risk *= 0.5
+    if is_credit_risk_high:
+        w_mul *= 0.7
+
+    w_mul *= health_score
+    max_risk *= health_score
+
+    total_market_exposure = 1.0
+    if vix_current > 25: total_market_exposure = 0.6
+    if vix_current > 35: total_market_exposure = 0.3
+    if macro_gravity: total_market_exposure = min(total_market_exposure, 0.5)
+
+    wsb_data = fetch_global_wsb_data()
+
+    ctx = MarketContext(
+        regime=regime, regime_desc=regime_desc, w_mul=w_mul, xai_weights=xai_weights,
+        vix_current=vix_current, vix_desc=vix_desc, vix_scalar=vix_scalar, max_risk=max_risk,
+        macro_gravity=macro_gravity, is_credit_risk_high=is_credit_risk_high, vix_inv=vix_inv,
+        qqq_df=qqq_df, macro_data=macro_data, total_market_exposure=total_market_exposure,
+        health_score=health_score, pain_warning=pain_warning,
+        credit_spread_mom=0.0, vix_term_structure=1.0, market_pcr=1.0,
+        dynamic_min_score=Config.Params.MIN_SCORE_THRESHOLD,
+        global_wsb_data=wsb_data, meta_weights=meta_weights
+    )
+    logger.info(f"✅ 宏观上下文雷达构建完毕: Regime={regime.upper()} | 敞口上限={total_market_exposure*100:.0f}% | VIX={vix_current:.1f}")
+    return ctx
+
+def _prepare_universe_data(ctx: MarketContext) -> Tuple[List[dict], dict]:
+    """并发准备全市场特征基底（未融合深度学习前的形态）"""
     active_pool = get_filtered_watchlist(max_stocks=200)
-    raw_reports = []
+    prepared_data = []
     price_history_dict = {}
     
     def _worker(sym: str) -> Optional[dict]:
@@ -1793,17 +1825,12 @@ def _scan_universe_concurrently(ctx: MarketContext) -> Tuple[List[dict], dict]:
         alt = AltData(pcr, iv_skew, sc, sf, inb, am, nlp, 0.0)
         
         cf = _extract_complex_features(stock, ctx)
-        ml_features = _extract_ml_features(stock, ctx, cf, alt)
-        
-        base_score, sig, factors, black_swan = _evaluate_omni_matrix(stock, ctx, cf, alt)
-        score, is_bearish_div, sig = _apply_market_filters(curr, prev, sym, base_score, sig, [], [], [])
+        seq = _get_transformer_seq(df_ind) # 切出时序张量备用
         
         return {
-            'sym': sym, 'curr': curr, 'prev': prev, 'score': score, 'sig': sig, 
-            'factors': factors, 'ml_features': ml_features, 'news': news,
-            'sym_sec': Config.get_sector_etf(sym), 'is_bearish_div': is_bearish_div,
-            'black_swan_risk': black_swan, 'total_score': score, 'is_untradeable': False,
-            'ai_prob': 0.0, 'close_history': df['Close'].tail(60).values
+            'sym': sym, 'stock': stock, 'alt': alt, 'cf': cf, 'seq': seq,
+            'curr': curr, 'prev': prev, 'news': news,
+            'close_history': df['Close'].tail(60).values
         }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=Config.Params.MAX_WORKERS) as executor:
@@ -1811,10 +1838,10 @@ def _scan_universe_concurrently(ctx: MarketContext) -> Tuple[List[dict], dict]:
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
             if res:
-                raw_reports.append(res)
+                prepared_data.append(res)
                 price_history_dict[res['sym']] = res['close_history']
                 
-    return raw_reports, price_history_dict
+    return prepared_data, price_history_dict
 
 def _apply_ai_inference(raw_reports: List[dict], ctx: MarketContext) -> List[dict]:
     """将全息矩阵送入 LightGBM + Meta Learner 进行胜率映射"""
@@ -2128,7 +2155,7 @@ def run_tech_matrix() -> None:
     # 第四阶段：左脑 Meta-Learner (LightGBM) 二次复核胜率
     raw_reports = _apply_ai_inference(raw_reports, ctx)
     
-    # 🚀 修复 3：补全由批量处理拆分导致的 reports 队列构建与目标权重解算循环
+    # 拆分导致的 reports 队列构建与目标权重解算循环
     reports, background_pool, all_raw_scores = [], [], []
     for r in raw_reports:
         if r['total_score'] > 0: all_raw_scores.append(r['total_score'])
@@ -2250,7 +2277,6 @@ def run_backtest_engine() -> None:
             chunk = syms[i:i + chunk_size]
             for attempt in range(3):
                 try:
-                    # 🚀 扩容拉取周期为 1y，保证能够抽出 60 天特征时序及 SMA_200 预热缓冲
                     chunk_df = yf.download(chunk, period="1y", progress=False, threads=False, timeout=15)
                     if not chunk_df.empty: 
                         if len(chunk) == 1 and not isinstance(chunk_df.columns, pd.MultiIndex):
@@ -2292,7 +2318,6 @@ def run_backtest_engine() -> None:
     ai_filtered_wins, ai_filtered_total = 0, 0
     mae_mfe_records = {'T+1': [], 'T+3': [], 'T+5': []}
     
-    # 🚀 右脑在线学习弹药库
     transformer_X, transformer_Y = [], []
     cached_inds = {}
     
@@ -2363,7 +2388,6 @@ def run_backtest_engine() -> None:
                     ret = (exit_revenue - entry_cost) / entry_cost
                     if gap_up > 0.03: ret *= 0.5
                     
-                    # 🚀 收集 Transformer 在线学习序列
                     if TRANSFORMER_AVAILABLE:
                         try:
                             if sym not in cached_inds:
@@ -2386,7 +2410,6 @@ def run_backtest_engine() -> None:
                                     transformer_Y.append(ret if d == 3 else 0.0) 
                         except Exception: pass
                     
-                    # 🚀 修复 4：通过严格的空间强制对齐，确保归因与收益记录绝对隶属于 exit_revenue is not None 代码块之下
                     trade_mfe = (max_high_during_trade - entry_cost) / entry_cost
                     trade_mae = (min_low_during_trade - entry_cost) / entry_cost
                     mae_mfe_records[f'T+{d}'].append({'ret': ret, 'mfe': trade_mfe, 'mae': trade_mae})
@@ -2670,7 +2693,11 @@ def run_backtest_engine() -> None:
             corr = data['corr_with_baseline']
             trig_rate = data['trigger_rate']
             if prem < 0: diag = "⚠️ 负溢价"
-    # 🚀 响应 DS 架构优化：主脑引擎剥离训练逻辑，只负责积攒时序样本并写入共享内存区 (Buffer)
+            elif corr > 0.6: diag = "⚖️ 高度耦合"
+            elif prem > 50 and corr < 0.4: diag = "💎 纯净 Alpha"
+            else: diag = "✅ 有效增益"
+            report_md.append(f"| {f} | {prem:+.1f} bps | {corr:.2f} | {trig_rate*100:.1f}% | {diag} |")
+
     if TRANSFORMER_AVAILABLE and len(transformer_X) >= 64:
         logger.info(f"🧠 [架构解耦] 已捕获 {len(transformer_X)} 笔三元组时序切片，正压入训练数据共享缓冲区...")
         try:
@@ -2679,7 +2706,6 @@ def run_backtest_engine() -> None:
             
             buf_path = os.path.join(Config.DATA_DIR, "training_buffer.npz")
             
-            # 若已有历史 buffer，追加合并 (使得模型能够学习更大周期的数据)
             if os.path.exists(buf_path):
                 try:
                     existing = np.load(buf_path)
@@ -2687,7 +2713,6 @@ def run_backtest_engine() -> None:
                     Y_arr = np.concatenate([existing['Y'], Y_arr])
                 except Exception: pass
                 
-            # 🚀 响应 DS 改进：先写入 .tmp 临时文件，再执行原子替换，彻底根绝读写并发冲突
             temp_buf_path = buf_path + ".tmp"
             np.savez(temp_buf_path, X=X_arr, Y=Y_arr)
             os.replace(temp_buf_path, buf_path)
