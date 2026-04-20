@@ -1,12 +1,12 @@
-# 存储路径: .github/workflows/main.yml
 name: Tickeron Pro AI Bot
 
 run-name: 🤖 QuantBot 运行状态 - ${{ github.event.inputs.run_mode || '自动调度 (Schedule)' }}
 
 on:
   schedule:
-    # 🚀 算力全量聚焦：矩阵每天仅 1 次，锁定美东 16:15 (收盘前45分钟)，日线多空博弈最真实的时刻
-    - cron: '15 20 * * 1-5'   
+    # 🚀 算力全量聚焦：矩阵每天仅 1 次。
+    # ⚠️ 响应夏冬令时陷阱：UTC 20:45 = 美东夏令时(EDT) 16:45 (盘后) / 美东冬令时(EST) 15:45 (尾盘)
+    - cron: '45 20 * * 1-5'   
     - cron: '0 23 * * 5'               # backtest 周五深夜
   workflow_dispatch:
     inputs:
@@ -29,7 +29,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write     
-    timeout-minutes: 45
+    # 🚀 放宽超时红线，给 CPU 深度学习代谢与全量回测留足时间
+    timeout-minutes: 120  
       
     steps:
       - name: 检出代码
@@ -48,22 +49,34 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
+      # 🚀 响应 DS 优化：滚动版本缓存 (基于 run_number)。
+      # 寻找历史最近的有效缓存，实现真正的跨容器增量拉取。
+      - name: 🗄️ 恢复历史行情数据缓存 (Restore)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .quantbot_data/*.pkl
+            .quantbot_data/archive/
+            .quantbot_data/tickers_cache.json
+          key: quantbot-market-data-${{ runner.os }}-${{ github.run_number }}
+          restore-keys: |
+            quantbot-market-data-${{ runner.os }}-
+
       - name: 安装组件
         run: |
           pip install -r requirements.txt
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: 🔍 代码质量检查 (Linting)
         run: |
           flake8 quantbot.py --count --select=E9,F63,F7,F82 --show-source --statistics
 
-      # 🚀 新增：CI/CD 自动化单元测试拦截网
       - name: 🛡️ 核心引擎测谎仪 (Unit Tests)
         run: |
           echo "启动物理边界与逻辑漂移测试..."
-          # 运行测试，一旦失败将直接熔断流水线，阻止带病代码执行
           python -m unittest test_quantbot.py -v
 
-      - name: 执行引擎
+      - name: ⚙️ 执行主脑引擎 (Data / Inference / Backtest)
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -84,6 +97,54 @@ jobs:
           echo "RUN_MODE=$MODE" >> $GITHUB_ENV
           python quantbot.py $MODE
 
+      # 🚀 响应 DS 优化：工业级强契约通信。基于 Exit Code 进行多维状态判决与容灾降级。
+      - name: 🧠 触发深度神经代谢 (MLOps Training)
+        if: env.RUN_MODE == 'backtest'
+        id: training
+        continue-on-error: true  # 容灾隔离：训练失败绝不导致整个 Pipeline 暴毙
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "启动 Transformer 右脑增量训练..."
+          
+          # 关闭 set -e 以免非 0 退出码直接阻断 Bash 流
+          set +e
+          python train_transformer.py --epochs 25 --batch_size 64 --lr 1e-4
+          TRAIN_EXIT=$?
+          set -e
+          
+          # 状态机路由
+          case $TRAIN_EXIT in
+            0)
+              echo "::notice title=MLOps 换代成功::隐空间权重已进化，准备接管下周实盘流。"
+              ;;
+            2)
+              echo "::warning title=MLOps 训练中断::清洗后有效样本不足，神经代谢节点已安全跳过本次更新。"
+              ;;
+            3)
+              echo "::warning title=MLOps 冠军拦截::新模型(Challenger)在验证集未能击败线上旧模型，已被物理销毁。"
+              ;;
+            *)
+              echo "::error title=MLOps 训练崩溃::神经代谢中枢发生代码级异常 (Exit Code: $TRAIN_EXIT)，请排查！"
+              exit 1
+              ;;
+          esac
+
+      - name: 📦 上传核心阵列制品 (Artifacts)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantbot-core-artifacts
+          path: |
+            .quantbot_data/transformer_production.pth
+            .quantbot_data/tca_history.jsonl
+            strategy_stats.json
+            backtest_report.md
+            trainer.log
+          retention-days: 30
+
       - name: 🚨 崩溃告警
         if: failure()
         env:
@@ -93,12 +154,25 @@ jobs:
           if [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=🚨 *QuantBot 严重崩溃*！测试未通过或运行异常，请立即检查 Actions 日志。" \
+              --data-urlencode "text=🚨 *QuantBot 严重崩溃*！测试未通过或流水线异常，请立即检查 Actions 日志。" \
               --data-urlencode "parse_mode=Markdown"
           fi
 
-      - name: 自动提交数据
+      - name: 🔄 自动提交同步
         if: env.RUN_MODE == 'matrix' || env.RUN_MODE == 'backtest'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "📝 自动同步量化数据记录与AI模型"
+          commit_message: "📝 MLOps: 自动同步特征矩阵与 Transformer 隐空间权重"
+          add_options: '-f'
+          file_pattern: '.quantbot_data/transformer_production.pth strategy_stats.json backtest_report.md alert_history.json'
+
+      # 🚀 响应 DS 优化：生成带有全新 run_number 的缓存。旧缓存会由 GitHub LRU 规则自动驱逐。
+      - name: 💾 增量保存行情数据缓存 (Save-Always)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .quantbot_data/*.pkl
+            .quantbot_data/archive/
+            .quantbot_data/tickers_cache.json
+          key: quantbot-market-data-${{ runner.os }}-${{ github.run_number }}
