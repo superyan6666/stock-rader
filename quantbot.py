@@ -11,8 +11,8 @@ import logging
 import re
 import json
 import warnings
-import sqlite3     # 🚀 新增: 用于连接执行网关状态账本
-import uuid        # 🚀 新增: 用于生成不可重复的订单 OID
+import sqlite3     
+import uuid        
 import scipy.stats as stats
 import concurrent.futures
 import threading
@@ -24,14 +24,12 @@ from sklearn.covariance import LedoitWolf
 from sklearn.preprocessing import RobustScaler
 from dataclasses import dataclass, field
 
-# 🚀 新增：导入深度学习右脑组件
 try:
     from quant_transformer import QuantAlphaTransformer, train_alpha_model
     TRANSFORMER_AVAILABLE = True
 except ImportError:
     TRANSFORMER_AVAILABLE = False
 
-# 🚀 性能优化：将高频使用的 gaussian_kde 提升至模块顶部，根除函数内的重复导入开销
 try:
     from scipy.stats import gaussian_kde
     KDE_AVAILABLE = True
@@ -56,7 +54,6 @@ _GLOBAL_HEADERS = {
 }
 
 class Config:
-    # 环境变量映射
     WEBHOOK_URL: str = os.environ.get('WEBHOOK_URL', '')
     TELEGRAM_BOT_TOKEN: str = os.environ.get('TELEGRAM_BOT_TOKEN', '')
     TELEGRAM_CHAT_ID: str = os.environ.get('TELEGRAM_CHAT_ID', '')
@@ -84,19 +81,17 @@ class Config:
     
     DATA_DIR: str = ".quantbot_data"
     EXT_CACHE_FILE: str = os.path.join(DATA_DIR, "daily_ext_cache.json")
-    ORDER_DB_PATH: str = os.path.join(DATA_DIR, "order_state.db") # 🚀 新增: 执行网关账本路径
+    ORDER_DB_PATH: str = os.path.join(DATA_DIR, "order_state.db") 
     MODEL_VERSION: str = "1.0" 
 
-    # 🚀 修复 6：补充核心底仓股票池与板块拥挤度排除名单 (防止 get_filtered_watchlist 抛出 AttributeError)
     CORE_WATCHLIST: list = [
         "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO", "AMD", "QCOM",
         "JPM", "V", "MA", "UNH", "JNJ", "XOM", "PG", "HD", "COST", "ABBV",
         "CRM", "NFLX", "ADBE", "NOW", "UBER", "INTU", "IBM", "ISRG", "SYK",
         "SPY", "QQQ", "IWM", "DIA"
     ]
-    CROWDING_EXCLUDE_SECTORS: list = [INDEX_ETF] # 宽基指数不计入板块拥挤度惩罚
+    CROWDING_EXCLUDE_SECTORS: list = [INDEX_ETF] 
 
-    # 🚀 因子生命周期管理：按成熟度与来源严格划分，根除僵尸因子
     CORE_FACTORS = [
         "米奈尔维尼", "强相对强度", "MACD金叉", "TTM Squeeze ON", "一目多头", "强势回踩", "机构控盘(CMF)",
         "突破缺口", "VWAP突破", "AVWAP突破", "SMC失衡区", "流动性扫盘", "聪明钱抢筹", "巨量滞涨", "放量长阳", "口袋支点", 
@@ -119,7 +114,6 @@ class Config:
         "内部人集群净买入(Insider)", "分析师修正动量(Analyst)", "舆情NLP情感极值(News_NLP)", "散户热度加速度(WSB_Accel)"
     ]
     
-    # 🚀 新增：右脑 Transformer 蒸馏出的 16 维隐空间 Alpha
     TRANSFORMER_FACTORS = [f"Alpha_T{i:02d}" for i in range(1, 17)]
 
     ALL_FACTORS = CORE_FACTORS + ADVANCED_MATH_FACTORS + INTERACTION_FACTORS + ALT_DATA_FACTORS + TRANSFORMER_FACTORS
@@ -127,24 +121,20 @@ class Config:
     GROUP_A_FACTORS = CORE_FACTORS + ["聪明钱月度净流入(月线)", "大盘Beta(宏观调整)", "利率敏感度(TLT相关性)", "汇率传导(DXY相关性)", "52周高点距离(动能延续)", "内部人集群净买入(Insider)", "分析师修正动量(Analyst)"] + [f for f in INTERACTION_FACTORS if "共振" in f or "滞后" in f]
     GROUP_B_FACTORS = ADVANCED_MATH_FACTORS + ALT_DATA_FACTORS + [f for f in CORE_FACTORS if "扫盘" in f or "失衡" in f or "抢筹" in f] + TRANSFORMER_FACTORS
 
-    # 🚀 配置文件中枢：所有魔法数字全部收敛至此
     class Params:
         MAX_WORKERS = 8
         MIN_SCORE_THRESHOLD = 8
         BASE_MAX_RISK = 0.015       
         CROWDING_PENALTY = 0.75     
         CROWDING_MIN_STOCKS = 2     
-        PORTFOLIO_VALUE = 100000.0  # 🚀 新增：实盘/仿真网关的初始资产包规模 ($100k)
+        PORTFOLIO_VALUE = 100000.0  
         
-        # 🚀 系统调度与通知参数
         ALERT_COOLDOWN_HOURS = 24.0 
         
-        # 🚀 回测与实盘仿真交易参数
         SLIPPAGE = 0.003            
         COMMISSION = 0.0005         
         MIN_T_STAT = 1.0            
 
-        # 另类数据与情绪极值阈值
         PCR_BEAR = 1.5           
         PCR_BULL = 0.5           
         IV_SKEW_BEAR = 0.08      
@@ -161,7 +151,6 @@ class Config:
         AMIHUD_ILLIQ = 0.5       
         DIST_52W = -0.05         
         
-        # 核心数学与量价特征阈值
         KDE_BREAKOUT = 0.5       
         HURST_RELIABLE = 0.65    
         FFT_RESONANCE = 0.71     
@@ -288,7 +277,7 @@ class MarketContext:
     dynamic_min_score: float = 8.0
     global_wsb_data: dict = field(default_factory=dict)
     meta_weights: dict = field(default_factory=dict)
-    transformer_model: 'Any' = None  # 🚀 新增：挂载深度学习右脑模型实例
+    transformer_model: 'Any' = None  
 
 @dataclass
 class StockData:
@@ -1143,16 +1132,13 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
     df['VWAP_20'] = (df['Typical_Price'] * df['Volume']).rolling(window=20).sum() / (df['Volume'].rolling(window=20).sum() + 1e-10)
     
-    # 🚀 修复 DS 指出的未来函数穿透 (Look-ahead Bias)：采用严格因果律 (Causal) 的向量化 AVWAP
-    # 原逻辑中 np.argmax 会扫描全局回测切片区间，导致引用“未来”的最大量日作为锚点
     df['Vol_Max_120'] = df['Volume'].rolling(window=120, min_periods=1).max()
     is_new_anchor = df['Volume'] >= df['Vol_Max_120']
-    anchor_groups = is_new_anchor.cumsum() # 每次创出 120 日天量，生成一个新的组 ID
+    anchor_groups = is_new_anchor.cumsum() 
     
     tp_vol = df['Typical_Price'] * df['Volume']
-    # 利用 groupby().cumsum() 实现遇天量自动重置的因果律 VWAP
     df['AVWAP'] = tp_vol.groupby(anchor_groups).cumsum() / (df['Volume'].groupby(anchor_groups).cumsum() + 1e-10)
-    df.drop(columns=['Vol_Max_120'], inplace=True) # 清理防御变量
+    df.drop(columns=['Vol_Max_120'], inplace=True) 
     
     down_vol = df['Volume'].where(df['Close'] < df['Close'].shift(), 0)
     df['Max_Down_Vol_10'] = down_vol.shift(1).rolling(10).max()
@@ -1197,7 +1183,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _get_transformer_seq(df_ind: pd.DataFrame, end_idx: int = -1) -> np.ndarray:
-    """🚀 新增：从全量指标 DataFrame 中精准切片 60 天 x 49 维的无量纲标准化序列"""
     if end_idx == -1: end_idx = len(df_ind)
     start_idx = end_idx - 60
     if start_idx < 0: return np.zeros((60, 49), dtype=np.float32)
@@ -1207,7 +1192,6 @@ def _get_transformer_seq(df_ind: pd.DataFrame, end_idx: int = -1) -> np.ndarray:
     
     seq = np.zeros((60, 49), dtype=np.float32)
     
-    # 🚀 响应架构加固：采用显式索引映射解耦硬编码，彻底消灭因子乱序与静默越界风险
     feature_mapping = [
         (0, df['RSI'].values / 100.0),
         (1, df['MACD'].values / c),
@@ -1825,7 +1809,7 @@ def _prepare_universe_data(ctx: MarketContext) -> Tuple[List[dict], dict]:
         alt = AltData(pcr, iv_skew, sc, sf, inb, am, nlp, 0.0)
         
         cf = _extract_complex_features(stock, ctx)
-        seq = _get_transformer_seq(df_ind) # 切出时序张量备用
+        seq = _get_transformer_seq(df_ind) 
         
         return {
             'sym': sym, 'stock': stock, 'alt': alt, 'cf': cf, 'seq': seq,
@@ -2041,7 +2025,6 @@ def _generate_and_send_matrix_report(final_reports: List[dict], final_shadow_poo
     except Exception as e:
         logger.error(f"严重：写入矩阵全息日志时发生崩溃: {e}")
 
-# 🚀 新增模块：打通主脑引擎与执行网关的 SQLite 路由链路
 def _route_orders_to_gateway(final_reports: List[dict], ctx: MarketContext) -> None:
     """阶段 6：将 Kelly-CVaR 优化的目标分配阵列转化为绝对交易股数，并异步推入执行网关的账本中。"""
     if not final_reports: return
@@ -2050,11 +2033,9 @@ def _route_orders_to_gateway(final_reports: List[dict], ctx: MarketContext) -> N
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     
     try:
-        # 强制使用 WAL 模式读写，确保量化引擎在写入订单时不会与网关的消费读取发生数据库死锁
         conn = sqlite3.connect(db_path, timeout=10.0)
         conn.execute('pragma journal_mode=wal')
         
-        # 极寒防守：确保目标账本表存在
         conn.execute('''
             CREATE TABLE IF NOT EXISTS orders (
                 client_oid TEXT PRIMARY KEY,
@@ -2078,16 +2059,12 @@ def _route_orders_to_gateway(final_reports: List[dict], ctx: MarketContext) -> N
             opt_weight = r.get('opt_weight', 0.0)
             if opt_weight <= 0.0: continue
             
-            # 绝对仓位计算 (资金敞口 * Kelly权重)
             alloc_usd = Config.Params.PORTFOLIO_VALUE * ctx.total_market_exposure * opt_weight
-            
-            # 使用 1e-10 物理防御除零异常
             safe_curr_close = max(r['curr_close'], 1e-10)
             qty = round(alloc_usd / safe_curr_close, 4)
             
             if qty > 0:
                 client_oid = f"QB_{uuid.uuid4().hex[:8]}"
-                # 状态设定为 PENDING_SUBMIT，通知独立网关进程执行
                 conn.execute('''
                     INSERT INTO orders (client_oid, symbol, side, qty, order_type, arrival_price, status)
                     VALUES (?, ?, 'BUY', ?, 'MKT', ?, 'PENDING_SUBMIT')
@@ -2117,18 +2094,16 @@ def run_tech_matrix() -> None:
             except Exception as e:
                 logger.error(f"⚠️ 右脑唤醒失败: {e}")
     
-    # 第一阶段：并发拉取全域市场数据与特征
     prepared_data, price_history_dict = _prepare_universe_data(ctx)
     if not prepared_data:
         logger.info("📭 扫描池为空，提前终止。")
         return
         
-    # 🚀 第二阶段：GPU Batch 批量推理 (核心性能跃迁)
     if getattr(ctx, 'transformer_model', None) is not None:
         try:
             logger.info(f"⚡ 启动 GPU 批量张量推流 (Batch Size: {len(prepared_data)})...")
-            seqs = np.array([d['seq'] for d in prepared_data]) # 合并为 (N, 60, 49) 的超级张量
-            alpha_vecs = ctx.transformer_model.extract_alpha(seqs) # O(1) 的超高速单次前向传播
+            seqs = np.array([d['seq'] for d in prepared_data]) 
+            alpha_vecs = ctx.transformer_model.extract_alpha(seqs) 
             for i, d in enumerate(prepared_data):
                 d['alpha_vec'] = alpha_vecs[i]
         except Exception as e:
@@ -2137,7 +2112,6 @@ def run_tech_matrix() -> None:
     else:
         for d in prepared_data: d['alpha_vec'] = np.zeros(16)
 
-    # 第三阶段：合并特征矩阵，调用军规逻辑评分
     raw_reports = []
     for d in prepared_data:
         ml_features = _extract_ml_features(d['stock'], ctx, d['cf'], d['alt'], d['alpha_vec'])
@@ -2152,15 +2126,12 @@ def run_tech_matrix() -> None:
             'ai_prob': 0.0
         })
 
-    # 第四阶段：左脑 Meta-Learner (LightGBM) 二次复核胜率
     raw_reports = _apply_ai_inference(raw_reports, ctx)
     
-    # 拆分导致的 reports 队列构建与目标权重解算循环
     reports, background_pool, all_raw_scores = [], [], []
     for r in raw_reports:
         if r['total_score'] > 0: all_raw_scores.append(r['total_score'])
         
-        # 将张量送入凯利仓位计算器，计算建议止盈、吊灯止损与最优敞口
         tp_val, sl_val, kelly_fraction, basic_advice = _calculate_position_size(
             StockData(r['sym'], pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), r['curr'], r['prev'], False, 0.0), 
             ctx, r['ai_prob'], r['is_bearish_div'], r['black_swan_risk']
@@ -2174,7 +2145,6 @@ def run_tech_matrix() -> None:
             "kelly_fraction": kelly_fraction
         }
 
-        # 剥离低分无效标的，防范垃圾交易标的污染 Kelly 优化阵列
         if not r['is_untradeable'] and r['total_score'] > 0 and kelly_fraction > 0:
             if check_earnings_risk(r['sym']):
                 r['sig'].append("💣 [财报雷区] 近5日发财报,风险极高")
@@ -2185,20 +2155,17 @@ def run_tech_matrix() -> None:
             background_pool.append(stock_data_pack)
 
     if reports and all_raw_scores:
-        # 动态自适应水位线：取当天全市场排名前 15% 的高分王者
         ctx.dynamic_min_score = max(Config.Params.MIN_SCORE_THRESHOLD, np.percentile(all_raw_scores, 85))
         reports = [r for r in reports if r['score'] >= ctx.dynamic_min_score]
         
         groups = defaultdict(list)
         for r in reports: groups[r["sector"]].append(r)
+        
+        # 🚀 修复隐患：移除对缺失的 valid_sector_data 的调用，仅保留基础的板块拥挤度惩罚防线
         for sec, stks in groups.items():
             if hasattr(Config, 'CROWDING_EXCLUDE_SECTORS') and sec not in Config.CROWDING_EXCLUDE_SECTORS and len(stks) >= Config.Params.CROWDING_MIN_STOCKS:
-                if ctx.valid_sector_data.get(sec, 0.0) > 0.04:
-                    for s in stks[1:]: 
-                        if "🚀 [板块主升豁免] 让利润奔跑" not in s["signals"]: s["signals"].append("🚀 [板块主升豁免] 让利润奔跑")
-                else:
-                    pen = max(0.6, min(0.9, Config.Params.CROWDING_PENALTY * (1.0 + ctx.health_score * 0.3)))
-                    for s in stks[1:]: s["score"] = int(s["score"] * pen)
+                pen = max(0.6, min(0.9, Config.Params.CROWDING_PENALTY * (1.0 + ctx.health_score * 0.3)))
+                for s in stks[1:]: s["score"] = int(s["score"] * pen)
 
         final_reports = _apply_kelly_cluster_optimization(reports, price_history_dict, ctx.total_market_exposure, ctx)
         
@@ -2213,7 +2180,6 @@ def run_tech_matrix() -> None:
             
         _generate_and_send_matrix_report(final_reports, final_shadow_pool, ctx)
         
-        # 🚀 新纪元对接：将 AI 阵型路由至实盘网关 SQLite IPC 队列
         _route_orders_to_gateway(final_reports, ctx)
         
     else:
