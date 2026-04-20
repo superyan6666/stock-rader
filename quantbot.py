@@ -1574,7 +1574,7 @@ def _evaluate_omni_matrix(stock: StockData, ctx: MarketContext, cf: ComplexFeatu
         if pd.notna(stock.curr['Swing_Low_20']) and stock.curr['Close'] < stock.curr['Swing_Low_20'] * 1.05:
             add_trigger("巨量滞涨", "🛑 [冰山吸筹] 底部巨量滞涨，极大概率为机构冰山挂单吸货 (权:{fw:.2f}x)", 12, "QUANTUM")
         elif stock.curr['Close'] > stock.swing_high_10 * 0.95:
-            sig.append("⚠️ [高位派发] 高位巨量滞涨，警惕机构冰山挂单出货 (已被系统降权)")
+            triggered_list.append("⚠️ [高位派发] 高位巨量滞涨，警惕机构冰山挂单出货 (已被系统降权)")
         
     if day_chg > max(3.0, atr_pct * 0.6) and stock.curr['Volume'] > stock.curr['Vol_MA20'] * 1.5:
         add_trigger("放量长阳", "⚡ [动能脉冲] 强劲的日内放量大实体阳线 (权:{fw:.2f}x)", 12, "QUANTUM")
@@ -1594,7 +1594,7 @@ def _evaluate_omni_matrix(stock: StockData, ctx: MarketContext, cf: ComplexFeatu
         if stock.curr['CVD_Divergence'] == 0:
             add_trigger("CVD筹码净流入", "🧬 [微观筹码] CVD 双均线平滑多头确立且无量价背离，真实买盘涌入 (权:{fw:.2f}x)", 12, "QUANTUM")
         else:
-            sig.append("⚠️ [微观筹码] 价格近高但 CVD 出现顶背离，尾盘动能涉嫌虚假欺骗 (已被AI降权)")
+            triggered_list.append("⚠️ [微观筹码] 价格近高但 CVD 出现顶背离，尾盘动能涉嫌虚假欺骗 (已被AI降权)")
 
     if stock.curr['VPT_ZScore'] > 0.5 and stock.curr['VPT_Accel'] > 0 and stock.prev['VPT_ZScore'] <= 0.5:
         add_trigger("VPT量价共振", "📈 [量价归一] VPT Z-Score突破且动能加速，真实买盘绝对共振 (权:{fw:.2f}x)", 10, "TREND")
