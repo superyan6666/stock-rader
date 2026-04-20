@@ -2,133 +2,177 @@
 <html lang="zh">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🧬 量化策略架构全景 · 演进蓝图</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>🧬 量化策略架构 · 紧凑专业版</title>
     <style>
         * {
             box-sizing: border-box;
             margin: 0;
-            font-family: 'Segoe UI', 'Inter', system-ui, sans-serif;
+            padding: 0;
         }
         body {
-            background: #0b0f18;
-            padding: 24px;
-            color: #eef2fb;
+            background: #0a0e16;
+            padding: 16px 20px;
+            color: #e3e9f5;
+            font-family: 'Inter', 'Segoe UI', 'Roboto', sans-serif;
+            font-weight: 400;
+            line-height: 1.4;
         }
-        .container {
-            max-width: 1400px;
+        .dashboard {
+            max-width: 1600px;
             margin: 0 auto;
+        }
+        /* 紧凑头部 */
+        .header {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            margin-bottom: 16px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #2a374b;
         }
         h1 {
             font-weight: 500;
-            font-size: 2.4rem;
-            letter-spacing: -0.01em;
-            margin-bottom: 8px;
+            font-size: 1.9rem;
+            letter-spacing: -0.02em;
+            color: #f0f6ff;
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 10px;
         }
-        h1 small {
-            font-size: 1rem;
+        .version-tag {
+            background: #1f3a6b;
+            padding: 4px 12px;
+            border-radius: 40px;
+            font-size: 0.8rem;
             font-weight: 400;
-            color: #8e9db5;
-            margin-left: 12px;
+            color: #b4d0ff;
+            border: 1px solid #3060b0;
         }
-        .subtitle {
-            color: #8e9db5;
-            margin-bottom: 32px;
-            border-left: 4px solid #3b82f6;
-            padding-left: 20px;
-            font-weight: 300;
+        .sub-line {
+            color: #859aba;
+            font-size: 0.9rem;
         }
-        .card-grid {
+        /* 网格系统 — 更紧凑 */
+        .grid-2 {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
-            gap: 24px;
-            margin-bottom: 32px;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+        .grid-3 {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+        .grid-4 {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 14px;
+            margin-bottom: 16px;
         }
         .card {
-            background: #141a26;
-            border-radius: 28px;
-            padding: 24px;
-            box-shadow: 0 20px 35px -8px rgba(0,0,0,0.6), 0 0 0 1px rgba(75, 130, 255, 0.1) inset;
-            backdrop-filter: blur(4px);
-            transition: transform 0.2s ease, box-shadow 0.2s;
-        }
-        .card:hover {
-            box-shadow: 0 24px 42px -12px #00000080, 0 0 0 1px #3b82f666 inset;
-            transform: translateY(-3px);
+            background: #111a26;
+            border-radius: 20px;
+            padding: 16px 18px;
+            box-shadow: 0 8px 16px -6px #00000060, 0 0 0 1px #253449 inset;
+            backdrop-filter: blur(2px);
+            transition: all 0.15s;
+            border: 1px solid #1e2e44;
         }
         .card-header {
             display: flex;
             align-items: center;
-            gap: 12px;
-            margin-bottom: 20px;
-            border-bottom: 1px solid #2a3442;
-            padding-bottom: 14px;
+            gap: 10px;
+            margin-bottom: 12px;
+            border-bottom: 1px solid #26344a;
+            padding-bottom: 8px;
         }
-        .card-header h2 {
+        .card-header h3 {
             font-weight: 500;
-            font-size: 1.5rem;
-            margin: 0;
+            font-size: 1.1rem;
+            letter-spacing: -0.01em;
+            color: #d6e3ff;
         }
         .badge {
-            background: #1e2b41;
-            padding: 4px 10px;
+            background: #16273f;
+            padding: 2px 10px;
             border-radius: 30px;
-            font-size: 0.75rem;
-            color: #9bb9f0;
-            border: 1px solid #2e4a76;
+            font-size: 0.7rem;
+            color: #9bbaf0;
+            border: 1px solid #2c4970;
+            font-weight: 400;
         }
-        .mermaid-wrapper {
-            background: #0f1622;
-            border-radius: 20px;
-            padding: 16px 8px;
-            overflow-x: auto;
+        .mermaid-container {
+            background: #0c1320;
+            border-radius: 14px;
+            padding: 10px 4px;
             text-align: center;
+            overflow-x: auto;
         }
-        .pill-list {
+        .pill-group {
             display: flex;
             flex-wrap: wrap;
-            gap: 10px;
-            margin: 20px 0 8px;
+            gap: 6px;
+            margin-top: 10px;
         }
         .pill {
-            background: #1f2a3c;
-            padding: 6px 16px;
-            border-radius: 40px;
-            font-size: 0.9rem;
-            border: 1px solid #334153;
+            background: #1b2538;
+            padding: 4px 12px;
+            border-radius: 30px;
+            font-size: 0.75rem;
+            border: 1px solid #314a6e;
+            color: #bfd3ff;
+        }
+        .compact-list {
+            margin-top: 8px;
+            font-size: 0.8rem;
+            color: #b0c6e3;
+            padding-left: 6px;
+        }
+        .compact-list li {
+            list-style: none;
+            margin-bottom: 5px;
+            display: flex;
+            gap: 8px;
         }
         .roadmap-phase {
             display: flex;
-            flex-wrap: wrap;
+            gap: 12px;
             border-left: 3px solid;
-            padding-left: 20px;
-            margin: 18px 0;
+            padding-left: 14px;
+            margin: 12px 0;
         }
-        .phase-tag {
+        .phase-title {
+            min-width: 90px;
             font-weight: 600;
-            margin-right: 16px;
-            min-width: 100px;
-            color: #c6d9ff;
-        }
-        .divider {
-            height: 1px;
-            background: linear-gradient(90deg, #2f405b, transparent);
-            margin: 24px 0;
-        }
-        .footer {
-            text-align: right;
-            color: #5f748e;
-            margin-top: 40px;
             font-size: 0.85rem;
         }
-        .accent {
-            color: #6ea8fe;
+        .phase-desc {
+            font-size: 0.8rem;
+            color: #b8c9e6;
+        }
+        .divider-light {
+            height: 1px;
+            background: #23324a;
+            margin: 14px 0;
+        }
+        .footnote {
+            margin-top: 20px;
+            text-align: right;
+            color: #5f779b;
+            font-size: 0.75rem;
+        }
+        .accent-text {
+            color: #7aa9ff;
+        }
+        /* 适应大屏紧凑 */
+        @media (min-width: 1400px) {
+            body { padding: 16px 32px; }
         }
         .mermaid {
-            font-size: 14px;
+            font-size: 13px;
         }
     </style>
     <script type="module">
@@ -137,323 +181,276 @@
             startOnLoad: true, 
             theme: 'dark', 
             themeVariables: {
-                'background': '#0f1622',
-                'primaryColor': '#1f3a6b',
+                'background': '#0c1320',
+                'primaryColor': '#1c3e6e',
                 'primaryBorderColor': '#3b82f6',
-                'primaryTextColor': '#e2e8f0',
-                'lineColor': '#4e7396',
-                'secondaryColor': '#1b2a41',
-                'tertiaryColor': '#14212e',
-                'clusterBkg': '#141a26',
-                'clusterBorder': '#2a405c',
+                'primaryTextColor': '#dfe7f5',
+                'lineColor': '#527aa0',
+                'secondaryColor': '#14273e',
+                'tertiaryColor': '#0e1b2b',
+                'clusterBkg': '#111a26',
+                'clusterBorder': '#2e4a70',
             },
-            flowchart: { useMaxWidth: true, htmlLabels: true, curve: 'cardinal' },
+            flowchart: { useMaxWidth: true, htmlLabels: true, curve: 'basis', padding: 10 },
         });
     </script>
 </head>
 <body>
-<div class="container">
-    <h1>
-        <span>⚡ QUANT ENGINE · 自适应量化架构</span>
-        <small>v3.1 · 执行网关集成</small>
-    </h1>
-    <div class="subtitle">
-        🧠 从“特征工厂”到“闭环交易系统” —— 当前架构、网关蓝图与演进路线图
+<div class="dashboard">
+    <div class="header">
+        <h1>
+            ⚡ QUANT ENGINE · 自适应架构
+            <span class="version-tag">v3.1 执行网关集成</span>
+        </h1>
+        <div class="sub-line">宏观感知 · 因子代谢 · 元学习 · 网关解耦</div>
     </div>
 
-    <!-- 第一行：宏观状态卡 + 核心 pipeline -->
-    <div class="card-grid">
+    <!-- 第一行：宏观 + 特征工厂 (2列紧凑) -->
+    <div class="grid-2">
+        <!-- 宏观感知卡片 -->
         <div class="card">
             <div class="card-header">
-                <h2>🌐 宏观感知 & 决策上下文</h2>
-                <span class="badge">MarketContext</span>
+                <h3>🌐 宏观感知 · MarketContext</h3>
+                <span class="badge">实时风控</span>
             </div>
-            <div class="pill-list">
-                <span class="pill">🐂 市场状态机 (regime)</span>
-                <span class="pill">📊 VIX 曲面/倒挂</span>
-                <span class="pill">🏦 信用利差 · 美元引力</span>
-                <span class="pill">⚖️ 板块轮动/RRG</span>
-                <span class="pill">🧠 XAI 权重 · 痛觉神经</span>
-            </div>
-            <div class="mermaid-wrapper">
+            <div class="mermaid-container">
                 <pre class="mermaid">
                 flowchart LR
-                    subgraph Macro [宏观层]
-                        VIX[VIX & 期限结构] --> Health[健康度评分]
+                    subgraph Macro[宏观变量]
+                        VIX[VIX/期限] --> Health
                         HYG[信用利差] --> Health
                         DXY[美元指数] --> Health
-                        Breadth[市场宽度] --> Regime[🐂🐻 regime]
+                        Width[市场宽度] --> Regime
                     end
-                    Health --> Wmul[动态乘数 w_mul]
+                    Health --> Wmul[动态乘数]
                     Regime --> Wmul
-                    Wmul --> Scoring[因子评分调制]
+                    Wmul --> Scoring
                 </pre>
             </div>
-            <div style="margin-top: 12px; color: #aac8ff;">
-                ✅ 实时计算 vix_term_structure, credit_spread_mom, market_pcr，注入元学习器。
+            <div class="pill-group">
+                <span class="pill">VIX倒挂检测</span>
+                <span class="pill">信用紧缩警报</span>
+                <span class="pill">美元引力波</span>
+                <span class="pill">痛觉降杠杆</span>
             </div>
         </div>
-
+        <!-- 特征工厂 + AI 管线 -->
         <div class="card">
             <div class="card-header">
-                <h2>🧬 特征工厂 & AI 推理管线</h2>
-                <span class="badge">53因子 · 双塔元学习</span>
+                <h3>🧬 特征工厂 · 双塔元学习</h3>
+                <span class="badge">53因子 · Rank IC淘汰</span>
             </div>
-            <div class="mermaid-wrapper">
+            <div class="mermaid-container">
                 <pre class="mermaid">
                 flowchart TD
-                    A[日线+周线+月线+60m] --> B[calculate_indicators]
-                    B --> C[RSI/MACD/ATR/CMF/VPT...]
-                    C --> D[ComplexFeatures<br>FFT/Hurst/KDE/Alpha]
-                    D --> E[ML特征向量 53维]
-                    E --> F{Group A 传统趋势}
-                    E --> G{Group B 高级微观}
-                    F --> H[LGBM_A]
-                    G --> I[LGBM_B]
-                    H --> J[Stacking Meta Learner]
-                    I --> J
-                    Macro[宏观变量] --> J
-                    J --> K[AI胜率 & 最终评分]
+                    A[日/周/月/60m] --> B[指标矩阵]
+                    B --> C[ComplexFeatures<br>FFT/Hurst/KDE]
+                    C --> D[ML特征53维]
+                    D --> E{Group A 传统}
+                    D --> F{Group B 高级}
+                    E --> G[LGBM_A]
+                    F --> H[LGBM_B]
+                    G --> I[Stacking Meta]
+                    H --> I
+                    Macro[宏观变量] --> I
+                    I --> J[AI胜率 · 评分]
                 </pre>
             </div>
-            <div style="margin-top: 8px;">
-                <span class="pill">🔥 Rank IC 因子大逃杀 (T-stat淘汰)</span>
-                <span class="pill">📈 动态阈值 (vcp_bear/bull)</span>
+            <div class="compact-list">
+                <li>✅ T‑stat 因子代谢 · 自动剔除失效因子</li>
+                <li>✅ 自适应阈值 (VCP/KDE动态)</li>
             </div>
         </div>
     </div>
 
-    <!-- 第二行：评分矩阵 + 优化器 + 网关路由 -->
-    <div class="card-grid">
+    <!-- 第二行：评分矩阵 + 组合优化 + 网关路由 (3列) -->
+    <div class="grid-3">
         <div class="card">
             <div class="card-header">
-                <h2>🎯 全息评分矩阵 · 饱和映射</h2>
+                <h3>🎯 全息评分 · 饱和映射</h3>
                 <span class="badge">OmniMatrix</span>
             </div>
-            <div class="mermaid-wrapper">
+            <div class="mermaid-container">
                 <pre class="mermaid">
                 flowchart LR
-                    subgraph Theme[四大战区]
-                        T[TREND 趋势] 
-                        V[VOLATILITY 波动]
-                        R[REVERSAL 反转]
-                        Q[QUANTUM 另类/量子]
+                    subgraph Theater[四大战区]
+                        T[TREND]
+                        V[VOL]
+                        R[REVERSAL]
+                        Q[QUANTUM]
                     end
-                    T --> SAT[非线性饱和 ∑]
-                    V --> SAT
-                    R --> SAT
-                    Q --> SAT
-                    SAT --> Score[0-100 终极评级]
-                    Score --> Filter[市场过滤器<br>RSI/偏离/板块]
-                    Filter --> Final[最终分数]
+                    T & V & R & Q --> SAT[非线性饱和]
+                    SAT --> Filter[市场过滤<br>RSI/偏离/板块]
+                    Filter --> Final[0-100评分]
                 </pre>
             </div>
-            <div style="margin-top: 12px;">
-                ✂️ 冗余惩罚 (MACD金叉/带量金叉去重) · 黑天鹅熔断 (PCR/IV Skew)
+            <div class="pill-group">
+                <span class="pill">冗余惩罚</span>
+                <span class="pill">黑天鹅熔断</span>
+                <span class="pill">PCR/IV Skew</span>
             </div>
         </div>
-
         <div class="card">
             <div class="card-header">
-                <h2>⚖️ Kelly-CVaR 组合优化</h2>
+                <h3>⚖️ Kelly-CVaR 优化</h3>
                 <span class="badge">凸优化 · 风险平价</span>
             </div>
-            <div class="mermaid-wrapper">
+            <div class="mermaid-container">
                 <pre class="mermaid">
-                flowchart TD
-                    Reports[候选标的池] --> Sort[按评分/AI胜率排序]
-                    Sort --> Cov[Ledoit-Wolf 协方差]
-                    Cov --> CVaR[CVaR 95% 下行风险]
-                    CVaR --> Opt[SLSQP 优化<br>max utility - risk_aversion*CVaR]
-                    Opt --> Weights[最优权重 (0.02~0.15)]
-                    Weights --> Kelly[Kelly分数调整]
-                    Kelly --> FinalPos[目标仓位阵列]
+                flowchart LR
+                    Pool[候选池] --> Cov[Ledoit-Wolf]
+                    Cov --> CVaR[CVaR 95%]
+                    CVaR --> Opt[SLSQP]
+                    Opt --> Weights[0.02~0.15]
+                    Weights --> Kelly[Kelly调整]
                 </pre>
             </div>
-            <div style="margin-top: 8px;">
-                💡 风险厌恶系数动态关联 health_score，恐慌时自动降仓。
-            </div>
+            <div style="font-size:0.8rem; margin-top:6px;">风险厌恶系数 = f(health_score)，恐慌降仓</div>
         </div>
-
         <div class="card">
             <div class="card-header">
-                <h2>📡 执行网关路由 (IPC)</h2>
-                <span class="badge">SQLite 账本 · 异步解耦</span>
+                <h3>📡 网关路由 · IPC</h3>
+                <span class="badge">SQLite 账本</span>
             </div>
-            <div class="mermaid-wrapper">
+            <div class="mermaid-container">
                 <pre class="mermaid">
                 flowchart LR
-                    subgraph QuantBot[主引擎 quantbot.py]
-                        Opt[Kelly-CVaR 权重]
-                        Router[_route_orders_to_gateway]
-                    end
-                    subgraph Gateway[独立网关进程 execution_gateway.py]
-                        Poll[轮询/订阅 SQLite]
-                        FSM[订单状态机]
-                        Broker[券商API]
-                    end
-                    Opt -->|计算股数| Router
-                    Router -->|INSERT PENDING_SUBMIT| DB[(order_state.db)]
-                    DB --> Poll
-                    Poll --> FSM
-                    FSM -->|市价/限价| Broker
-                    Broker -->|成交回报| FSM
-                    FSM -->|UPDATE status| DB
+                    Q[主引擎] -->|INSERT| DB[(order_state.db)]
+                    DB -->|轮询/订阅| G[execution_gateway]
+                    G -->|状态更新| DB
+                    G --> Broker[券商API]
                 </pre>
             </div>
-            <div>
-                <span class="pill">🧾 原子写入 .tmp</span>
-                <span class="pill">🔒 WAL模式防锁</span>
-                <span class="pill">🆔 client_oid UUID</span>
+            <div class="pill-group">
+                <span class="pill">WAL模式</span>
+                <span class="pill">原子写入</span>
+                <span class="pill">client_oid</span>
             </div>
         </div>
     </div>
 
-    <!-- 网关蓝图详细 FSM + 风控 -->
-    <div class="card" style="margin-bottom: 24px;">
+    <!-- 第三行：网关蓝图 + 风控 (展开为2列？用一整行宽卡) -->
+    <div class="card" style="margin-bottom:16px;">
         <div class="card-header">
-            <h2>🏛️ 实盘执行网关 · 四层异步架构 (蓝图)</h2>
-            <span class="badge">execution_gateway.py · 防爆墙设计</span>
+            <h3>🏛️ 执行网关 · 四层异步 FSM & 防爆墙</h3>
+            <span class="badge">execution_gateway 蓝图</span>
         </div>
-        <div class="mermaid-wrapper">
-            <pre class="mermaid">
-            flowchart TD
-                subgraph BAL[代理抽象层]
-                    Alpaca[AlpacaGateway]
-                    IBKR[IBKR_Gateway]
-                end
-                subgraph FSM[异步订单状态机]
-                    PENDING --> SUBMITTED
-                    SUBMITTED --> OPEN
-                    OPEN --> PARTIAL
-                    PARTIAL --> FILLED
-                    OPEN --> CANCELED
-                    PARTIAL --> CANCELED
-                    SUBMITTED --> REJECTED
-                end
-                subgraph Router[仓位Delta路由]
-                    Target[目标权重] --> Delta[Target - Live持仓]
-                    Delta --> Orders[订单列表]
-                end
-                subgraph TCA[交易成本归因]
-                    Arrival[到达价格] --> Slip[滑点bps]
-                    Exec[执行均价] --> Slip
-                    Slip --> TCA_DB[(tca_history)]
-                end
-                subgraph Kill[防爆墙]
-                    Fat[胖手指: 单笔≤15%权益]
-                    Loop[重试≤3次 → 死信队列]
-                    Time[收盘前5min全平]
-                end
-                BAL --> FSM
-                Router --> BAL
-                FSM --> TCA
-                Kill -.-> FSM
-                Kill -.-> Router
-            </pre>
+        <div class="grid-2" style="gap:12px;">
+            <div class="mermaid-container" style="grid-column: span 2;">
+                <pre class="mermaid">
+                flowchart LR
+                    subgraph BAL[代理层]
+                        Alpaca
+                        IBKR
+                    end
+                    subgraph FSM[状态机]
+                        PENDING --> SUBMITTED --> OPEN --> PARTIAL --> FILLED
+                        OPEN --> CANCELED
+                    end
+                    subgraph Delta[仓位路由]
+                        Target --> DeltaCalc[Target - Live]
+                    end
+                    subgraph TCA[TCA归因]
+                        Arrival --> Slip[滑点bps]
+                    end
+                    subgraph Kill[防爆墙]
+                        Fat[单笔≤15%]
+                        Loop[重试≤3→DLQ]
+                        Time[收盘前5min全平]
+                    end
+                    BAL --> FSM
+                    Delta --> BAL
+                    FSM --> TCA
+                    Kill -.-> FSM
+                </pre>
+            </div>
         </div>
-        <div style="display: flex; flex-wrap: wrap; gap: 16px; margin-top: 16px;">
-            <div><span class="badge">🛡️ 账户级日亏损熔断</span></div>
-            <div><span class="badge">📉 行情断流保护</span></div>
-            <div><span class="badge">🔄 重启状态恢复 (SQLite持久化)</span></div>
-            <div><span class="badge">📊 TCA 归因供RL强化学习</span></div>
+        <div class="pill-group">
+            <span class="pill">🛡️ 日亏损熔断</span>
+            <span class="pill">📉 行情断流保护</span>
+            <span class="pill">🔄 重启状态恢复</span>
+            <span class="pill">📊 TCA→RL奖励</span>
         </div>
     </div>
 
-    <!-- 下一步演进框架 -->
+    <!-- 第四行：演进路线 (紧凑但完整) -->
     <div class="card">
         <div class="card-header">
-            <h2>🚀 战略演进路线图 · 从自动化到机构级</h2>
-            <span class="badge">Next 6-12 months</span>
+            <h3>🚀 战略演进 · 从自动化到机构级</h3>
+            <span class="badge">6-12个月</span>
         </div>
-        <div class="roadmap-phase" style="border-left-color: #10b981;">
-            <div class="phase-tag">🔰 阶段一 · 地基加固</div>
-            <div style="flex:1">
-                <ul style="list-style-type: none; padding-left: 0;">
-                    <li>✅ 本地数据仓库 (Parquet) + 原子写入</li>
-                    <li>✅ 单元测试覆盖核心指标</li>
-                    <li>✅ 参数敏感性扫描 & 样本外验证</li>
-                    <li>🔜 回测报告自动生成 & 交易明细Excel导出</li>
-                </ul>
+        <div class="grid-4" style="margin-bottom:0;">
+            <div class="roadmap-phase" style="border-left-color: #10b981;">
+                <div class="phase-title">🔰 地基加固</div>
+                <div class="phase-desc">
+                    ✅ 本地数据仓库<br>
+                    ✅ 单元测试覆盖<br>
+                    ✅ 样本外验证<br>
+                    🔜 交易明细导出
+                </div>
+            </div>
+            <div class="roadmap-phase" style="border-left-color: #3b82f6;">
+                <div class="phase-title">⚙️ 实盘闭环</div>
+                <div class="phase-desc">
+                    ✅ 网关SQLite路由<br>
+                    ✅ FSM持久化<br>
+                    🔄 持仓同步反馈<br>
+                    🔄 影子账户Paper
+                </div>
+            </div>
+            <div class="roadmap-phase" style="border-left-color: #a855f7;">
+                <div class="phase-title">🧪 持续进化</div>
+                <div class="phase-desc">
+                    🕒 每日增量训练<br>
+                    🕒 模型版本管理<br>
+                    🕒 遗传规划因子<br>
+                    🕒 RL调参
+                </div>
+            </div>
+            <div class="roadmap-phase" style="border-left-color: #f97316;">
+                <div class="phase-title">🏆 机构级</div>
+                <div class="phase-desc">
+                    ☁️ 分布式回测<br>
+                    ☁️ Redis总线<br>
+                    ☁️ 监控看板<br>
+                    ☁️ K8s全容器化
+                </div>
             </div>
         </div>
-        <div class="roadmap-phase" style="border-left-color: #3b82f6;">
-            <div class="phase-tag">⚙️ 阶段二 · 实盘闭环</div>
-            <div style="flex:1">
-                <ul style="list-style-type: none; padding-left: 0;">
-                    <li>✅ 执行网关 SQLite 路由</li>
-                    <li>✅ 订单状态机 & FSM 持久化</li>
-                    <li>🔄 持仓同步反馈 (网关→主引擎)</li>
-                    <li>🔄 模拟交易 (Paper Trading) 影子账户</li>
-                    <li>🔄 定时任务调度 (cron / systemd timer)</li>
-                </ul>
-            </div>
-        </div>
-        <div class="roadmap-phase" style="border-left-color: #a855f7;">
-            <div class="phase-tag">🧪 阶段三 · 持续进化</div>
-            <div style="flex:1">
-                <ul style="list-style-type: none; padding-left: 0;">
-                    <li>🕒 每日自动增量训练 (滚动窗口)</li>
-                    <li>🕒 模型版本管理 & 自动回滚</li>
-                    <li>🕒 因子挖掘 (遗传规划 Symbolic Regression)</li>
-                    <li>🕒 强化学习 TCA 反馈调参</li>
-                    <li>🕒 多策略并行 (低波/反转/事件驱动)</li>
-                </ul>
-            </div>
-        </div>
-        <div class="roadmap-phase" style="border-left-color: #f97316;">
-            <div class="phase-tag">🏆 阶段四 · 机构级运维</div>
-            <div style="flex:1">
-                <ul style="list-style-type: none; padding-left: 0;">
-                    <li>☁️ 分布式回测 (Dask/Ray)</li>
-                    <li>☁️ 实时监控看板 (Streamlit/Grafana)</li>
-                    <li>☁️ 消息总线升级 (Redis Pub/Sub 替代轮询)</li>
-                    <li>☁️ Docker/K8s 全容器化部署</li>
-                    <li>☁️ 风控中台 · 多账户管理</li>
-                </ul>
-            </div>
-        </div>
-        <div class="divider"></div>
-        <div style="display: flex; gap: 24px; justify-content: space-around;">
-            <div><strong>🧩 当前架构标签</strong><br>· 数据闭环 · 因子代谢 · Stacking元学习 · 网关解耦</div>
-            <div><strong>⚡ 短期里程碑</strong><br>· 持仓同步 · Paper Trading · 自动调度</div>
-            <div><strong>🌌 长期愿景</strong><br>· 全自动因子挖掘 · 在线学习 · 机构级执行</div>
+        <div class="divider-light"></div>
+        <div style="display:flex; justify-content:space-between; font-size:0.8rem;">
+            <span><span class="accent-text">当前架构标签：</span>数据闭环 · 因子代谢 · Stacking · 网关解耦</span>
+            <span><span class="accent-text">短期里程碑：</span>持仓同步 · Paper Trading · 自动调度</span>
+            <span><span class="accent-text">长期愿景：</span>在线学习 · 因子挖掘 · 机构执行</span>
         </div>
     </div>
 
-    <!-- 技术栈 & 通信矩阵 -->
-    <div class="card-grid">
-        <div class="card">
-            <div class="card-header"><h2>📚 技术栈 & 依赖</h2></div>
-            <div class="pill-list">
+    <!-- 底部技术栈简表 -->
+    <div class="grid-2" style="margin-top:16px;">
+        <div class="card" style="padding:12px 18px;">
+            <div style="display:flex; gap:20px; align-items:center;">
+                <span style="font-weight:500;">📚 技术栈</span>
                 <span class="pill">Python 3.10+</span>
-                <span class="pill">pandas / numpy</span>
-                <span class="pill">scikit-learn</span>
+                <span class="pill">pandas/numpy</span>
                 <span class="pill">LightGBM</span>
-                <span class="pill">yfinance</span>
                 <span class="pill">SQLite</span>
-                <span class="pill">Redis (计划)</span>
+                <span class="pill">Redis(计划)</span>
                 <span class="pill">Docker</span>
-                <span class="pill">systemd</span>
             </div>
         </div>
-        <div class="card">
-            <div class="card-header"><h2>📡 微服务通信协议</h2></div>
-            <div class="mermaid-wrapper">
-                <pre class="mermaid">
-                flowchart LR
-                    Q[quantbot.py] -->|SQLite INSERT| DB[(order_state.db)]
-                    DB -->|轮询 / 订阅| G[execution_gateway]
-                    G -->|更新状态| DB
-                    Q -.->|未来: Redis LPUSH| R[Redis]
-                    R -.->|BRPOP| G
-                </pre>
+        <div class="card" style="padding:12px 18px;">
+            <div style="display:flex; gap:20px; align-items:center;">
+                <span style="font-weight:500;">📡 通信协议</span>
+                <span class="pill">SQLite WAL</span>
+                <span class="pill">JSON over temp file</span>
+                <span class="pill">未来: Redis Pub/Sub</span>
+                <span class="pill">gRPC (规划)</span>
             </div>
         </div>
     </div>
 
-    <div class="footer">
-        QuantBot · 架构演进蓝图 v2.0 · 基于真实生产代码绘制 · 设计用于汇报与规划
+    <div class="footnote">
+        QuantBot 架构蓝图 · 基于生产代码绘制 · 设计用于技术汇报与演进规划
     </div>
 </div>
 </body>
