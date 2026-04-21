@@ -1318,7 +1318,10 @@ def _prepare_universe_data(ctx: MarketContext) -> Tuple[List[dict], dict]:
         df_ind = calculate_indicators(df)
         curr, prev = df_ind.iloc[-1], df_ind.iloc[-2]
         stock = StockData(sym, df_ind, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), curr, prev, curr['Volume'] > curr['Vol_MA20'] * 1.5, df_ind['High'].iloc[-11:-1].max() if len(df_ind) >= 11 else curr['High'])
-        return {'sym': sym, 'stock': stock, 'alt': AltData(*safe_get_sentiment_data(sym)[:4], *safe_get_alt_data(sym)[:4]), 'cf': _extract_complex_features(stock, ctx), 'seq': _get_transformer_seq(df_ind), 'curr': curr, 'prev': prev, 'news': "", 'close_history': df['Close'].tail(60).values}
+        pcr, iv_skew, sc, sf = safe_get_sentiment_data(sym)
+        inb, am, nlp, news = safe_get_alt_data(sym)
+        wsb = ctx.global_wsb_data.get(sym, 0.0)
+        return {'sym': sym, 'stock': stock, 'alt': AltData(pcr, iv_skew, sc, sf, inb, am, nlp, wsb), 'cf': _extract_complex_features(stock, ctx), 'seq': _get_transformer_seq(df_ind), 'curr': curr, 'prev': prev, 'news': news, 'close_history': df['Close'].tail(60).values}
     with concurrent.futures.ThreadPoolExecutor(max_workers=Config.Params.MAX_WORKERS) as executor:
         for res in executor.map(_worker, active_pool):
             if res: prepared_data.append(res); price_history_dict[res['sym']] = res['close_history']
