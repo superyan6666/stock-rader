@@ -1429,6 +1429,26 @@ def run_matrix():
 
     if reports and all_raw_scores:
         ctx.dynamic_min_score = max(Config.Params.MIN_SCORE_THRESHOLD, np.percentile(all_raw_scores, 85))
+        reports = [r for r in reports if r['score'] >= ctx.dynamic_min_score]
+        
+        # 🚀 还原：同质化板块拥挤度惩罚防线
+        groups = defaultdict(list)
+        for r in reports: groups[r["sector"]].append(r)
+        
+        for sec, stks in groups.items():
+            if sec not in Config.CROWDING_EXCLUDE_SECTORS and len(stks) >= Config.Params.CROWDING_MIN_STOCKS:
+                pen = max(0.6, min(0.9, Config.Params.CROWDING_PENALTY * (1.0 + ctx.health_score * 0.3)))
+                for s in stks[1:]: 
+                    s["score"] = int(s["score"] * pen)
+                    s["signals"].append(f"⚠️ [防拥挤] 同板块标的过多，触发多元化防线降权 (-{(1-pen)*100:.0f}%)")
+
+        final_reports = _apply_kelly_cluster_optimization(reports, price_dict, ctx.total_market_exposure, ctx)
+        for r in final_reports: set_alerted(r["symbol"])
+        
+        # 🚀 还原：生成暗影背景池 (Shadow Pool) 供 MLOps 提取负样本
+        final_symbols = {r['symbol'] for r in final_reports}
+        unselected_bg = [s for s in background_pool if s['symbol'] not in final_symbols]
+        random.shuffle(unselected_bg)
         final_shadow_pool = unselected_bg[:150]
         for r in final_shadow_pool: set_alerted(r["symbol"], is_shadow=True, shadow_data=r)
             
@@ -1455,9 +1475,22 @@ def run_backtest():
                         
                         # 🚀 满血还原：合并正样本(top_picks)与反事实负样本(shadow_pool)
                         daily_samples = log.get('top_picks', []) + log.get('shadow_pool', [])
+                        macro = log.get('macro_meta', {})
                         
                         for p in daily_samples:
-                            trades.append({'date': log['date'], 'vix': log.get('macro_meta', {}).get('vix', 18.0), 'symbol': p['symbol'], 'ml_features': p.get('ml_features', {}), 'factors': p.get('factors', []), 'sl': p.get('sl', 0.0), 'tp': p.get('tp', float('inf'))})
+                            # 🚀 修复点 1：补齐所有宏观环境因子的精准拉取
+                            trades.append({
+                                'date': log['date'], 
+                                'vix': macro.get('vix', 18.0), 
+                                'cred': macro.get('credit_spread_mom', 0.0),
+                                'term': macro.get('vix_term_structure', 1.0),
+                                'pcr': macro.get('market_pcr', 1.0),
+                                'symbol': p['symbol'], 
+                                'ml_features': p.get('ml_features', {}), 
+                                'factors': p.get('factors', []), 
+                                'sl': p.get('sl', 0.0), 
+                                'tp': p.get('tp', float('inf'))
+                            })
                     except Exception: pass
         except Exception: pass
             
@@ -1603,6 +1636,12 @@ def run_backtest():
             scaler = RobustScaler()
             X_scaled = scaler.fit_transform(X_all_df[active_factors_list])
             
+            # 🚀 修复点 2：完整提取 4 维宏观环境流矩阵
+            vix_all = trade_df['vix'].values / 20.0
+            cred_all = trade_df['cred'].values
+            term_all = trade_df['term'].values - 1.0
+            pcr_all = trade_df['pcr'].values - 1.0
+            
             tscv = TimeSeriesSplit(n_splits=3)
             oof_pred = np.zeros(len(y_all_class))
             lgbm = LGBMClassifier(n_estimators=60, max_depth=3, learning_rate=0.05, class_weight='balanced', random_state=42)
@@ -1612,7 +1651,9 @@ def run_backtest():
                 oof_pred[val_idx] = lgbm.predict_proba(X_scaled[val_idx])[:, 1]
                 
             meta = LogisticRegression(class_weight='balanced', random_state=42)
-            meta.fit(np.column_stack([oof_pred, np.zeros(len(X_scaled)), np.zeros(len(X_scaled)), np.zeros(len(X_scaled)), np.zeros(len(X_scaled)), np.zeros(len(X_scaled))]), y_all_class)
+            # 🚀 修复点 3：拔除 np.zeros 虚假占位，装载真实宏观切片，对齐推理端 6 维网络
+            X_meta = np.column_stack([oof_pred, np.full(len(oof_pred), 0.5), vix_all, cred_all, term_all, pcr_all])
+            meta.fit(X_meta, y_all_class)
             
             lgbm.fit(X_scaled, y_all_class)
             
