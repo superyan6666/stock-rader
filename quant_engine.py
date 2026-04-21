@@ -179,6 +179,9 @@ _GLOBAL_HEADERS = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
 }
 
+# 🚀 优化：模块级全局推送线程池，告别裸线程泄漏
+_ALERT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="alert_push")
+
 def _init_ext_cache():
     global _DAILY_EXT_CACHE
     with _DAILY_EXT_LOCK:
@@ -235,6 +238,18 @@ def safe_div(num: float, den: float, cap: float = 20.0) -> float:
 def check_macd_cross(curr: pd.Series, prev: pd.Series) -> bool:
     return prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']
 
+def _push_webhook(url: str, payload: dict, headers: dict) -> None:
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=10)
+        if resp.status_code != 200: logger.warning(f"Webhook 推送异常: {resp.status_code}")
+    except Exception as e: logger.error(f"Webhook 网络错误: {e}")
+
+def _push_telegram(token: str, chat_id: str, text: str, headers: dict) -> None:
+    try:
+        resp = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML"}, headers=headers, timeout=10)
+        if resp.status_code != 200: logger.warning(f"Telegram 推送异常: {resp.text[:100]}")
+    except Exception as e: logger.error(f"Telegram 网络错误: {e}")
+
 def send_alert(title: str, content: str) -> None:
     if not content.strip(): return
     formatted_time = datetime_to_str()
@@ -244,7 +259,7 @@ def send_alert(title: str, content: str) -> None:
     if Config.WEBHOOK_URL:
         payload = {"msgtype": "markdown", "markdown": {"title": f"【{Config.DINGTALK_KEYWORD}】{title}", "text": f"## 🤖 【{Config.DINGTALK_KEYWORD}】{title}\n\n{content}\n\n---\n*⏱️ {formatted_time}*"}}
         for url in [u.strip() for u in Config.WEBHOOK_URL.split(',') if u.strip()]:
-            threading.Thread(target=lambda u, p: requests.post(u, json=p, headers=req_headers, timeout=10) if True else None, args=(url, payload), daemon=False).start()
+            _ALERT_EXECUTOR.submit(_push_webhook, url, payload, req_headers)
                 
     if Config.TELEGRAM_BOT_TOKEN and Config.TELEGRAM_CHAT_ID:
         html_title = title.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
@@ -253,10 +268,7 @@ def send_alert(title: str, content: str) -> None:
         html_content = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', html_content)
         html_content = re.sub(r'`(.*?)`', r'<code>\1</code>', html_content)
         tg_text = f"🤖 <b>【量化监控】{html_title}</b>\n\n{html_content}\n\n⏱️ <i>{formatted_time}</i>"
-        def _send_tg():
-            try: requests.post(f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": Config.TELEGRAM_CHAT_ID, "text": tg_text[:4000], "parse_mode": "HTML"}, headers=req_headers, timeout=10)
-            except Exception: pass
-        threading.Thread(target=_send_tg, daemon=False).start()
+        _ALERT_EXECUTOR.submit(_push_telegram, Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID, tg_text, req_headers)
 
 def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 3, auto_adjust: bool = True, fast_mode: bool = False) -> pd.DataFrame:
     cache_key = f"{symbol}_{interval}"
@@ -648,6 +660,9 @@ class AlpacaGateway(BaseBrokerGateway):
             return BrokerOrder(broker_oid=data["id"], status=self._map_status(data["status"]), filled_qty=float(data["filled_qty"]), avg_fill_price=float(data["filled_avg_price"] or 0.0))
         raise RuntimeError(f"Alpaca Fetch Error: {resp.text}")
 
+# 🚀 优化：TCA 日志文件互斥锁
+_TCA_LOCK = threading.Lock()
+
 class ExecutionEngine:
     def __init__(self, broker: BaseBrokerGateway, db_path: str = Config.ORDER_DB_PATH):
         self.broker = broker
@@ -660,23 +675,26 @@ class ExecutionEngine:
             "qty": float(order_row['filled_qty']), "arrival_price": float(order_row['arrival_price']),
             "execution_price": float(order_row['avg_fill_price']), "timestamp": datetime_to_str()
         }
-        arr_px = np.maximum(tca_record["arrival_price"], 1e-10)
+        
+        arr_px = max(float(tca_record["arrival_price"]), 1e-10)
+        is_valid_arrival = float(tca_record["arrival_price"]) > 0.01
+        
         slippage_bps = (tca_record["execution_price"] - arr_px) / arr_px * 10000.0
-        if tca_record["side"] == "SELL": slippage_bps = -slippage_bps 
-        tca_record["slippage_bps"] = float(slippage_bps)
-
-        tmp_path = f"{Config.TCA_LOG_PATH}.{threading.get_ident()}.tmp"
+        if tca_record["side"] == "SELL": slippage_bps = -slippage_bps
+        
+        tca_record["slippage_bps"] = float(slippage_bps) if is_valid_arrival else None
+        tca_record["valid"] = is_valid_arrival
+        
+        # 🚀 优化：直接加锁追加写，消除 O(n) 读写瓶颈
         try:
-            history = []
-            if os.path.exists(Config.TCA_LOG_PATH):
-                with open(Config.TCA_LOG_PATH, 'r') as f: history = [json.loads(line) for line in f]
-            history.append(tca_record)
-            with open(tmp_path, 'w') as f:
-                for h in history: f.write(json.dumps(h) + '\n')
-            os.replace(tmp_path, Config.TCA_LOG_PATH)
-            logger.info(f"📊 [TCA] {order_row['symbol']} 归因完成。滑点: {slippage_bps:.2f} bps")
-        except Exception:
-            if os.path.exists(tmp_path): os.remove(tmp_path)
+            with _TCA_LOCK:
+                with open(Config.TCA_LOG_PATH, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(tca_record) + '\n')
+            
+            log_slip = f"{slippage_bps:.2f}" if is_valid_arrival else "N/A (异常到达价)"
+            logger.info(f"📊 [TCA] {order_row['symbol']} 归因完成。滑点: {log_slip} bps")
+        except Exception as e:
+            logger.error(f"TCA 写入失败: {e}")
 
     def _recover_state(self):
         df_pending = self.ledger.fetch_orders_by_status(['SUBMITTED', 'OPEN', 'PARTIALLY_FILLED'])
@@ -751,21 +769,27 @@ def _robust_fft_ensemble(close_prices: np.ndarray, base_length=120, ensemble_cou
         votes.append(1.0 if 0 < current_phase < np.pi else -1.0)
     return float(sum(votes) / len(votes)) if votes else 0.0
 
-def _robust_hurst(close_prices: np.ndarray, min_window=30, n_bootstrap=100) -> Tuple[float, float, bool]:
+def _robust_hurst(close_prices: np.ndarray, min_window=30, n_bootstrap=25) -> Tuple[float, float, bool]:
+    # 🚀 优化：使用线程安全的独立随机生成器，并降低重采样次数
     safe_prices = np.maximum(close_prices, 1e-10)
     log_ret = np.diff(np.log(safe_prices[-121:])) if len(safe_prices) > 120 else np.diff(np.log(safe_prices))
-    if len(log_ret) <= min_window: return 0.5, 0.0, False
-    np.random.seed(42)
+    n = len(log_ret)
+    if n <= min_window: return 0.5, 0.0, False
+    
+    rng = np.random.default_rng()
+    sub_lens = rng.integers(min_window, n, size=n_bootstrap)
+    start_offs = rng.integers(0, n - min_window, size=n_bootstrap)
+    
     hurst_samples = []
-    for _ in range(n_bootstrap):
-        sub_len = np.random.randint(min_window, len(log_ret))
-        sub_ret = log_ret[np.random.randint(0, len(log_ret) - sub_len):][:sub_len]
-        S = np.std(sub_ret)
-        if S == 0: continue
-        cum_dev = np.cumsum(sub_ret - np.mean(sub_ret))
-        R = np.max(cum_dev) - np.min(cum_dev)
-        if R > 0: hurst_samples.append(np.log(R/S) / np.log(len(sub_ret)))
-    if len(hurst_samples) < 20: return 0.5, 0.0, False
+    for sub_len, start in zip(sub_lens, start_offs):
+        sub = log_ret[min(start, n - sub_len) : min(start, n - sub_len) + sub_len]
+        S = np.std(sub)
+        if S < 1e-10: continue
+        cum_dev = np.cumsum(sub - sub.mean())
+        R = cum_dev.max() - cum_dev.min()
+        if R > 0: hurst_samples.append(np.log(R / S) / np.log(sub_len))
+        
+    if len(hurst_samples) < 10: return 0.5, 0.0, False
     h_median = float(np.median(hurst_samples))
     h_iqr = float(np.percentile(hurst_samples, 75) - np.percentile(hurst_samples, 25))
     return h_median, h_iqr, bool((h_iqr < 0.15) and (abs(h_median - 0.5) > 0.1))
@@ -1183,6 +1207,42 @@ def _apply_kelly_cluster_optimization(reports: List[dict], price_history_dict: d
         return candidate_pool
     except Exception: return candidate_pool
 
+def _calculate_position_size(stock: StockData, ctx: MarketContext, ai_prob: float, is_bearish_div: bool, black_swan: bool) -> Tuple[float, float, float, str]:
+    # 🚀 满血还原：VIX 波动率标量与最高价棘轮吊灯止损 (Chandelier Exit)
+    atr_mult_sl = 1.0 if ctx.vix_inv else 1.5
+    atr_mult_tp = 2.0 if ctx.vix_inv else 3.0
+    
+    tp_val = stock.curr['Close'] + atr_mult_tp * ctx.vix_scalar * stock.curr['ATR']
+    
+    # 优先使用形态止损线，否则回退到 ATR 动态止损
+    sl_chandelier = stock.curr['Chandelier_Exit'] if pd.notna(stock.curr['Chandelier_Exit']) else (stock.curr['Close'] - atr_mult_sl * ctx.vix_scalar * stock.curr['ATR'])
+    sl_val = max(sl_chandelier, stock.curr['Close'] - atr_mult_sl * ctx.vix_scalar * stock.curr['ATR'])
+    
+    kelly = ai_prob - (1.0 - ai_prob) / 2.0
+    
+    if black_swan: return tp_val, sl_val, 0.0, "❌ 黑天鹅极险"
+    if kelly <= 0 or is_bearish_div: return tp_val, sl_val, 0.0, "❌ 盈亏比劣势"
+    return tp_val, sl_val, max(0.0, kelly), ""
+
+def _route_orders_to_gateway(final_reports: List[dict], ctx: MarketContext) -> None:
+    if not final_reports: return
+    ledger = OrderLedger(Config.ORDER_DB_PATH)
+    
+    # 🚀 终极防线：持仓与挂单对账，防止无限重复买入
+    existing_orders = ledger.fetch_orders_by_status(['PENDING_SUBMIT', 'SUBMITTED', 'OPEN', 'PARTIALLY_FILLED', 'FILLED'])
+    existing_symbols = set(existing_orders['symbol'].tolist()) if not existing_orders.empty else set()
+    
+    routed_count = 0
+    for r in final_reports:
+        if r['symbol'] in existing_symbols:
+            logger.info(f"⏭️ [网关路由] {r['symbol']} 已在账本中存在持仓或挂单，跳过重复发单。")
+            continue
+        qty = round((Config.Params.PORTFOLIO_VALUE * ctx.total_market_exposure * r.get('opt_weight', 0.1)) / max(r['curr_close'], 1e-10), 4)
+        if qty > 0:
+            ledger.insert_order(r['symbol'], 'BUY', qty, r['curr_close'])
+            routed_count += 1
+    logger.info(f"✅ [网关路由] 成功推送 {routed_count} 笔实盘发单指令到 SQLite。")
+
 # ================= 6. 核心管线重构 (四大支柱) =================
 
 def run_matrix():
@@ -1408,7 +1468,6 @@ def run_backtest():
             scaler = RobustScaler()
             X_scaled = scaler.fit_transform(X_all_df[active_factors_list])
             
-            # 🚀 还原：时序防穿越的验证与 Stacked 元学习
             tscv = TimeSeriesSplit(n_splits=3)
             oof_pred = np.zeros(len(y_all_class))
             lgbm = LGBMClassifier(n_estimators=60, max_depth=3, learning_rate=0.05, class_weight='balanced', random_state=42)
@@ -1427,7 +1486,6 @@ def run_backtest():
             logger.info(f"✅ Rank IC 代谢完成，保留 {len(active_factors_list)} 维高能特征，LightGBM 元学习器重训落盘。")
         except Exception as e: logger.error(f"模型训练崩溃: {e}")
 
-    # 🚀 还原：MLOps 张量缓冲区的持久化压入
     if TRANSFORMER_AVAILABLE and len(transformer_X) >= 64:
         logger.info(f"🧠 [MLOps] 已捕获 {len(transformer_X)} 笔三元组时序切片，正压入训练数据共享缓冲区...")
         try:
@@ -1688,7 +1746,7 @@ class QuantEngineTests(unittest.TestCase):
         with open(Config.TCA_LOG_PATH, 'r') as f:
             logs = [json.loads(line) for line in f]
             self.assertEqual(len(logs), 1)
-            self.assertTrue(logs[0]['slippage_bps'] > 1000000.0)
+            self.assertTrue(logs[0]['slippage_bps'] is None)
 
 def main():
     initialize_directories()
