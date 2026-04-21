@@ -1197,7 +1197,7 @@ def _apply_ai_inference(raw_reports: List[dict], ctx: MarketContext) -> List[dic
 def _apply_kelly_cluster_optimization(reports: List[dict], price_history_dict: dict, total_exposure: float, ctx: MarketContext) -> List[dict]:
     """🚀 还原：Kelly-CVaR 风险平价与凸优化阵型"""
     reports.sort(key=lambda x: (x["score"], x["ai_prob"]), reverse=True)
-    candidate_pool = reports[:15]
+    candidate_pool = reports[:10]  # 🚀 资金集中度优化：推荐上限缩减至 Top 10
     if not candidate_pool: return []
     if len(candidate_pool) == 1:
         candidate_pool[0]['pos_advice'] = f"✅ 组合配置权重: {total_exposure * 100:.1f}% (极简化单目标资产)"
@@ -1398,37 +1398,37 @@ def run_matrix():
         raw_reports.append({'sym': d['sym'], 'curr': d['curr'], 'prev': d['prev'], 'score': score, 'sig': sig, 'factors': factors, 'ml_features': ml_feat, 'news': d['news'], 'sym_sec': Config.get_sector_etf(d['sym']), 'is_bearish_div': is_bearish_div, 'black_swan_risk': black_swan, 'total_score': score, 'is_untradeable': False, 'ai_prob': 0.0})
 
     raw_reports = _apply_ai_inference(raw_reports, ctx)
-    reports = []
-    background_pool = []
+    
+    reports, background_pool, all_raw_scores = [], [], []
     for r in raw_reports:
-        tp, sl, kelly, advice = _calculate_position_size(StockData(r['sym'], pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), r['curr'], r['prev'], False, 0.0), ctx, r['ai_prob'], r['is_bearish_div'], r['black_swan_risk'])
-        if r['total_score'] > 0 and kelly > 0:
-            reports.append({'symbol': r['sym'], 'score': r['total_score'], 'ai_prob': r['ai_prob'], 'signals': r['sig'][:8], 'factors': r['factors'], 'ml_features': r['ml_features'], 'curr_close': float(r['curr']['Close']), 'tp': tp, 'sl': sl, 'news': r['news'], 'sector': r['sym_sec'], 'pos_advice': advice, 'kelly_fraction': kelly})
+        if r['total_score'] > 0: all_raw_scores.append(r['total_score'])
+        
+        tp_val, sl_val, kelly_fraction, basic_advice = _calculate_position_size(
+            StockData(r['sym'], pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), r['curr'], r['prev'], False, 0.0), 
+            ctx, r['ai_prob'], r['is_bearish_div'], r['black_swan_risk']
+        )
+
+        stock_data_pack = {
+            # 🚀 修复 1：解除 [:8] 硬截断，释放 100% 的因子佐证明细
+            "symbol": r['sym'], "score": r['total_score'], "ai_prob": r['ai_prob'], "signals": r['sig'], 
+            "factors": r['factors'], "ml_features": r['ml_features'],
+            "curr_close": float(r['curr']['Close']), "tp": float(tp_val), "sl": float(sl_val), 
+            "news": r['news'], "sector": r['sym_sec'], "pos_advice": basic_advice,
+            "kelly_fraction": kelly_fraction
+        }
+
+        if not r['is_untradeable'] and r['total_score'] > 0 and kelly_fraction > 0:
+            if check_earnings_risk(r['sym']):
+                # 🚀 修复 2：确保财报核弹警告被真正写入推文流
+                stock_data_pack["signals"].append("💣 [财报雷区] 近5日发布财报，已强制触发风险折半惩罚！")
+                r['total_score'] = int(r['total_score'] * 0.5)
+                stock_data_pack["score"] = r['total_score']
+            reports.append(stock_data_pack)
         else:
-            background_pool.append({'symbol': r['sym'], 'score': r['total_score'], 'ai_prob': r['ai_prob'], 'factors': r['factors'], 'ml_features': r['ml_features']})
+            background_pool.append(stock_data_pack)
 
-    if reports:
-        ctx.dynamic_min_score = max(Config.Params.MIN_SCORE_THRESHOLD, np.percentile([r['score'] for r in reports], 85))
-        reports = [r for r in reports if r['score'] >= ctx.dynamic_min_score]
-        
-        # 🚀 还原：同质化板块拥挤度惩罚防线
-        groups = defaultdict(list)
-        for r in reports: groups[r["sector"]].append(r)
-        
-        for sec, stks in groups.items():
-            if sec not in Config.CROWDING_EXCLUDE_SECTORS and len(stks) >= Config.Params.CROWDING_MIN_STOCKS:
-                pen = max(0.6, min(0.9, Config.Params.CROWDING_PENALTY * (1.0 + ctx.health_score * 0.3)))
-                for s in stks[1:]: 
-                    s["score"] = int(s["score"] * pen)
-                    s["signals"].append(f"⚠️ [防拥挤] 同板块标的过多，触发多元化防线降权 (-{(1-pen)*100:.0f}%)")
-
-        final_reports = _apply_kelly_cluster_optimization(reports, price_dict, ctx.total_market_exposure, ctx)
-        for r in final_reports: set_alerted(r["symbol"])
-        
-        # 🚀 还原：生成暗影背景池 (Shadow Pool) 供 MLOps 提取负样本
-        final_symbols = {r['symbol'] for r in final_reports}
-        unselected_bg = [s for s in background_pool if s['symbol'] not in final_symbols]
-        random.shuffle(unselected_bg)
+    if reports and all_raw_scores:
+        ctx.dynamic_min_score = max(Config.Params.MIN_SCORE_THRESHOLD, np.percentile(all_raw_scores, 85))
         final_shadow_pool = unselected_bg[:150]
         for r in final_shadow_pool: set_alerted(r["symbol"], is_shadow=True, shadow_data=r)
             
