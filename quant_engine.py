@@ -1329,6 +1329,52 @@ def _prepare_universe_data(ctx: MarketContext) -> Tuple[List[dict], dict]:
 
 # ================= 6. 核心管线重构 (四大支柱) =================
 
+def _generate_and_send_matrix_report(final_reports: List[dict], final_shadow_pool: List[dict], ctx: MarketContext) -> None:
+    """🚀 还原：生成并推送包含宏观全息图与止盈止损策略的高级矩阵战报"""
+    txts = []
+    for idx, r in enumerate(final_reports):
+        icon = ['🥇', '🥈', '🥉'][idx] if idx < 3 else '🔸'
+        sigs_fmt = "\n".join([f"- {s}" for s in r["signals"]])
+        news_fmt = f"\n- 📰 {r['news']}" if r['news'] else ""
+        ai_display = f"🔥 **{r.get('ai_prob', 0):.1%}**" if r.get('ai_prob', 0) > 0.60 else f"{r.get('ai_prob', 0):.1%}"
+
+        txts.append(
+            f"### {icon} **{r['symbol']}** | 🤖 分层元学习胜率: {ai_display} | 🌟 终极评级: {r['score']}分\n"
+            f"**💡 机构交易透视:**\n{sigs_fmt}{news_fmt}\n\n"
+            f"**💰 绝对风控界限:**\n"
+            f"- 💵 现价: `{r['curr_close']:.2f}`\n"
+            f"- ⚖️ {r.get('pos_advice', '✅ 缺省仓位')}\n"
+            f"- 🎯 建议止盈: **${r['tp']:.2f}**\n"
+            f"- 🛡️ 吊灯止损: **${r['sl']:.2f} (最高价回落保护)**\n"
+            f"- 📈 离场纪律: **跌破止损防线请无条件市价清仓！**"
+        )
+
+    perf = load_strategy_performance_tag()
+    header = f"**📊 宏观引力与决策体系状态:**\n- {ctx.vix_desc}\n- {ctx.regime_desc}{ctx.pain_warning}\n- ⚔️ 今日截面淘汰线: **{ctx.dynamic_min_score:.1f}分**"
+
+    meta_desc = ""
+    if ctx.meta_weights:
+        w_A = ctx.meta_weights.get('Group_A', 0)
+        w_B = ctx.meta_weights.get('Group_B', 0)
+        meta_desc = f"\n\n**🧠 Stacking Meta-Learner 状态:**\n- 传统大局观 (Group A) 权重: **{w_A*100:.1f}%**\n- 高级微观组 (Group B) 权重: **{w_B*100:.1f}%**"
+
+    final_content = (f"{perf}\n\n{header}\n\n---\n\n" if perf else f"{header}\n\n---\n\n") + \
+                    "\n\n---\n\n".join(txts) + \
+                    meta_desc
+
+    send_alert("Matrix 扫盘决断战报 (全息解析版)", final_content)
+
+    try:
+        with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
+            log_entry = {
+                "date": datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+                "macro_meta": {"vix": ctx.vix_current, "credit_spread_mom": ctx.credit_spread_mom, "vix_term_structure": ctx.vix_term_structure, "market_pcr": ctx.market_pcr},
+                "top_picks": [{"symbol": r.get("symbol"), "score": r.get("score"), "signals": r.get("signals"), "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports],
+                "shadow_pool": [{"symbol": r.get("symbol"), "score": r.get("score"), "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0)} for r in final_shadow_pool]
+            }
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+    except Exception as e: logger.error(f"写入全息日志崩溃: {e}")
+
 def run_matrix():
     """支柱 1：每日决策主脑"""
     logger.info("🚀 启动 Matrix 决策主脑...")
@@ -1387,21 +1433,8 @@ def run_matrix():
         for r in final_shadow_pool: set_alerted(r["symbol"], is_shadow=True, shadow_data=r)
             
         _route_orders_to_gateway(final_reports, ctx)
+        _generate_and_send_matrix_report(final_reports, final_shadow_pool, ctx)
         
-        msg = "\n\n".join([f"**{r['symbol']}** | 评分: {r['score']} | AI胜率: {r.get('ai_prob',0):.1%} | 现价: {r['curr_close']:.2f}\n" + "\n".join(r['signals']) for r in final_reports[:10]])
-        
-        try:
-            with open(Config.get_current_log_file(), "a", encoding="utf-8") as f:
-                log_entry = {
-                    "date": datetime.now(timezone.utc).strftime('%Y-%m-%d'), 
-                    "macro_meta": {"vix": ctx.vix_current, "credit_spread_mom": ctx.credit_spread_mom, "vix_term_structure": ctx.vix_term_structure, "market_pcr": ctx.market_pcr},
-                    "top_picks": [{"symbol": r.get("symbol"), "score": r.get("score"), "signals": r.get("signals"), "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0), "tp": r.get("tp"), "sl": r.get("sl")} for r in final_reports],
-                    "shadow_pool": [{"symbol": r.get("symbol"), "score": r.get("score"), "factors": r.get("factors", []), "ml_features": r.get("ml_features", []), "ai_prob": r.get("ai_prob", 0.0)} for r in final_shadow_pool]
-                }
-                f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-        except Exception as e: logger.error(f"写入全息日志崩溃: {e}")
-
-        send_alert("Matrix 扫盘决断战报", f"今日 VIX: {ctx.vix_current:.1f}\n\n{msg}")
     logger.info("✅ Matrix 决策管线执行完毕。")
 
 def run_backtest():
