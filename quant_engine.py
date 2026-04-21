@@ -35,7 +35,7 @@ try:
     import yfinance as yf
     import requests
 except ImportError:
-    print("❌ 缺少基础依赖，请执行: pip install yfinance requests pandas numpy scipy scikit-learn lightgbm")
+    print("❌ 缺少基础依赖，请执行: pip install yfinance requests pandas numpy scipy scikit-learn lightgbm pyarrow")
     sys.exit(1)
 
 try:
@@ -270,16 +270,19 @@ def send_alert(title: str, content: str) -> None:
         tg_text = f"🤖 <b>【量化监控】{html_title}</b>\n\n{html_content}\n\n⏱️ <i>{formatted_time}</i>"
         _ALERT_EXECUTOR.submit(_push_telegram, Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID, tg_text, req_headers)
 
-def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 3, auto_adjust: bool = True, fast_mode: bool = False) -> pd.DataFrame:
+def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 5, auto_adjust: bool = True, fast_mode: bool = False) -> pd.DataFrame:
     cache_key = f"{symbol}_{interval}"
-    cache_file = os.path.join(Config.DATA_DIR, f"{cache_key}.pkl")
+    cache_file = os.path.join(Config.DATA_DIR, f"{cache_key}.parquet")
+    archive_dir = os.path.join(Config.DATA_DIR, "archive", symbol)
+    
     with _KLINE_LOCK:
         if cache_key in _KLINE_CACHE: return _KLINE_CACHE[cache_key].copy()
             
     df = pd.DataFrame()
-    if os.path.exists(cache_file):
-        try: df = pd.read_pickle(cache_file)
-        except Exception: pass
+    try:
+        if os.path.exists(cache_file):
+            df = pd.read_parquet(cache_file)
+    except Exception: pass
     
     needs_full = True
     download_period = period
@@ -301,12 +304,33 @@ def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retr
                     df = pd.concat([df[~df.index.isin(new_df.index)], new_df]).sort_index()
                 else: df = new_df
                 df = df[~df.index.duplicated(keep='last')]
-                if len(df) > 800: df = df.iloc[-800:] 
+                
+                df_to_archive = df.iloc[:-800] if len(df) > 800 else pd.DataFrame()
+                if len(df) > 800: df = df.iloc[-800:]
+                
+                if not df_to_archive.empty:
+                    try:
+                        os.makedirs(archive_dir, exist_ok=True)
+                        for (year, month), group in df_to_archive.groupby([df_to_archive.index.year, df_to_archive.index.month]):
+                            arch_file = os.path.join(archive_dir, f"{year}_{month:02d}_{interval}.parquet")
+                            if os.path.exists(arch_file):
+                                old_arch = pd.read_parquet(arch_file)
+                                combined_arch = pd.concat([old_arch, group])
+                                combined_arch = combined_arch[~combined_arch.index.duplicated(keep='last')]
+                            else:
+                                combined_arch = group
+                            tmp_arch = f"{arch_file}.{threading.get_ident()}.tmp"
+                            combined_arch.to_parquet(tmp_arch)
+                            os.replace(tmp_arch, arch_file)
+                    except Exception: pass
                 
                 with _KLINE_LOCK: _KLINE_CACHE[cache_key] = df.copy()
-                tmp_c = f"{cache_file}.tmp"
-                df.to_pickle(tmp_c)
-                os.replace(tmp_c, cache_file)
+                    
+                try:
+                    temp_cache_file = f"{cache_file}.{threading.get_ident()}.tmp"
+                    df.to_parquet(temp_cache_file)
+                    os.replace(temp_cache_file, cache_file)
+                except Exception: pass
                 return df
         except Exception:
             if attempt == retries - 1: return df
@@ -1243,6 +1267,63 @@ def _route_orders_to_gateway(final_reports: List[dict], ctx: MarketContext) -> N
             routed_count += 1
     logger.info(f"✅ [网关路由] 成功推送 {routed_count} 笔实盘发单指令到 SQLite。")
 
+def get_vix_level() -> Tuple[float, str]:
+    df = safe_get_history(Config.VIX_INDEX, period="5d", interval="1d", retries=3, auto_adjust=False, fast_mode=True)
+    vix = df['Close'].ffill().iloc[-1] if not df.empty and len(df) >= 1 else 18.0
+    if vix > 30: return vix, f"🚨 极其恐慌 (VIX: {vix:.2f})"
+    if vix > 25: return vix, f"⚠️ 市场恐慌 (VIX: {vix:.2f})"
+    if vix < 15: return vix, f"✅ 市场平静 (VIX: {vix:.2f})"
+    return vix, f"⚖️ 正常波动 (VIX: {vix:.2f})"
+
+def get_market_regime() -> Tuple[str, str, pd.DataFrame, bool, bool]:
+    df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", auto_adjust=False, fast_mode=True)
+    if len(df) < 200: return "range", "数据不足，默认震荡", df, False, False
+    c_close = df['Close'].ffill().iloc[-1]
+    ma200 = df['Close'].rolling(200).mean().iloc[-1]
+    trend_20d = (c_close - df['Close'].iloc[-20]) / df['Close'].iloc[-20]
+    if c_close > ma200: return ("bull", "🐂 牛市主升", df, False, False) if trend_20d > 0.02 else ("range", "⚖️ 牛市高位震荡", df, False, False)
+    else: return ("bear", "🐻 熊市回调", df, False, False) if trend_20d < -0.02 else ("range", "⚖️ 熊市底部震荡", df, False, False)
+
+def _build_market_context() -> MarketContext:
+    logger.info("🌐 正在构建宏观市场感知雷达...")
+    qqq_df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", fast_mode=True)
+    spy_df = safe_get_history("SPY", period="1y", interval="1d", fast_mode=True)
+    vix_current, vix_desc = get_vix_level()
+    regime, regime_desc, _, _, _ = get_market_regime()
+    xai_weights, meta_weights = {}, {}
+    try:
+        if os.path.exists(Config.STATS_FILE):
+            with open(Config.STATS_FILE, "r") as f:
+                stats_data = json.load(f)
+                xai_weights = stats_data.get("xai_importances", {})
+                meta_weights = stats_data.get("meta_weights", {})
+    except Exception: pass
+    w_mul = 0.6 if regime == "bear" else (1.2 if regime == "bull" else 1.0)
+    total_exp = 0.6 if vix_current > 25 else (0.3 if vix_current > 35 else 1.0)
+    ctx = MarketContext(regime=regime, regime_desc=regime_desc, w_mul=w_mul, xai_weights=xai_weights, vix_current=vix_current, vix_desc=vix_desc, vix_scalar=1.0, max_risk=0.015, macro_gravity=False, is_credit_risk_high=False, vix_inv=vix_current>30, qqq_df=qqq_df, macro_data={'spy': spy_df}, total_market_exposure=total_exp, health_score=1.0, pain_warning="", meta_weights=meta_weights)
+    if TRANSFORMER_AVAILABLE and os.path.exists(Config.TRANSFORMER_PTH):
+        try:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            ctx.transformer_model = QuantAlphaTransformer.load_checkpoint(Config.TRANSFORMER_PTH, device=device)
+            logger.info("🧠 深度学习右脑已唤醒。")
+        except Exception as e: logger.error(f"右脑加载失败: {e}")
+    return ctx
+
+def _prepare_universe_data(ctx: MarketContext) -> Tuple[List[dict], dict]:
+    active_pool = get_filtered_watchlist(100)
+    prepared_data, price_history_dict = [], {}
+    def _worker(sym: str):
+        df = safe_get_history(sym, "1y", "1d", fast_mode=True)
+        if df.empty or len(df) < 120: return None
+        df_ind = calculate_indicators(df)
+        curr, prev = df_ind.iloc[-1], df_ind.iloc[-2]
+        stock = StockData(sym, df_ind, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), curr, prev, curr['Volume'] > curr['Vol_MA20'] * 1.5, df_ind['High'].iloc[-11:-1].max() if len(df_ind) >= 11 else curr['High'])
+        return {'sym': sym, 'stock': stock, 'alt': AltData(*safe_get_sentiment_data(sym)[:4], *safe_get_alt_data(sym)[:4]), 'cf': _extract_complex_features(stock, ctx), 'seq': _get_transformer_seq(df_ind), 'curr': curr, 'prev': prev, 'news': "", 'close_history': df['Close'].tail(60).values}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=Config.Params.MAX_WORKERS) as executor:
+        for res in executor.map(_worker, active_pool):
+            if res: prepared_data.append(res); price_history_dict[res['sym']] = res['close_history']
+    return prepared_data, price_history_dict
+
 # ================= 6. 核心管线重构 (四大支柱) =================
 
 def run_matrix():
@@ -1357,15 +1438,24 @@ def run_backtest():
         time.sleep(1)
         
     if not dfs: return
-    df_all = pd.concat(dfs, axis=1)
-    df_c = df_all['Close'] if isinstance(df_all.columns, pd.MultiIndex) else df_all[['Close']].rename(columns={'Close': syms[0]})
-    df_o = df_all['Open'] if isinstance(df_all.columns, pd.MultiIndex) else df_all[['Open']].rename(columns={'Open': syms[0]})
-    df_h = df_all['High'] if isinstance(df_all.columns, pd.MultiIndex) else df_all[['High']].rename(columns={'High': syms[0]})
-    df_l = df_all['Low'] if isinstance(df_all.columns, pd.MultiIndex) else df_all[['Low']].rename(columns={'Low': syms[0]})
-    df_c.index = df_c.index.strftime('%Y-%m-%d')
-    df_o.index = df_o.index.strftime('%Y-%m-%d')
-    df_h.index = df_h.index.strftime('%Y-%m-%d')
-    df_l.index = df_l.index.strftime('%Y-%m-%d')
+    try:
+        df_all = pd.concat(dfs, axis=1)
+        if isinstance(df_all.columns, pd.MultiIndex):
+            df_c = df_all['Close'] if 'Close' in df_all.columns else df_all.xs('Close', level=0, axis=1)
+            df_o = df_all['Open'] if 'Open' in df_all.columns else df_all.xs('Open', level=0, axis=1)
+            df_h = df_all['High'] if 'High' in df_all.columns else df_all.xs('High', level=0, axis=1)
+            df_l = df_all['Low'] if 'Low' in df_all.columns else df_all.xs('Low', level=0, axis=1)
+        else:
+            df_c = df_all[['Close']].rename(columns={'Close': syms[0]})
+            df_o = df_all[['Open']].rename(columns={'Open': syms[0]})
+            df_h = df_all[['High']].rename(columns={'High': syms[0]})
+            df_l = df_all[['Low']].rename(columns={'Low': syms[0]})
+            
+        df_c.index = pd.to_datetime(df_c.index, utc=True)
+        df_o.index = pd.to_datetime(df_o.index, utc=True)
+        df_h.index = pd.to_datetime(df_h.index, utc=True)
+        df_l.index = pd.to_datetime(df_l.index, utc=True)
+    except Exception: return
     
     SLIPPAGE, COMMISSION = Config.Params.SLIPPAGE, Config.Params.COMMISSION
     stats_period = {'T+1': [], 'T+3': [], 'T+5': []}
@@ -1377,11 +1467,20 @@ def run_backtest():
     
     for t in trades:
         sym, r_dt = t['symbol'], t['date']
-        initial_sl, tp_price = t.get('sl', 0.0), t.get('tp', float('inf'))
-        if sym not in df_c.columns: continue
-        valid = df_c.index[df_c.index >= r_dt]
+        r_dt_ts = pd.to_datetime(r_dt, utc=True)
+        initial_sl = t.get('sl', 0)
+        if pd.isna(initial_sl): initial_sl = 0
+        tp_price = t.get('tp', float('inf'))
+        if pd.isna(tp_price): tp_price = float('inf')
+        
+        if sym not in df_c.columns or sym not in df_o.columns: continue
+        valid = df_c.index[df_c.index >= r_dt_ts]
         if len(valid) == 0: continue
+        
         e_idx = df_c.index.get_loc(valid[0])
+        if isinstance(e_idx, slice): e_idx = e_idx.stop - 1
+        elif isinstance(e_idx, np.ndarray): e_idx = np.where(e_idx)[0][0]
+        
         if e_idx + 1 >= len(df_c): continue
         
         entry = df_o.iloc[e_idx + 1][sym]
@@ -1419,7 +1518,7 @@ def run_backtest():
                                     sym_df = pd.DataFrame({'Close': df_c[sym], 'Open': df_o[sym], 'High': df_h[sym], 'Low': df_l[sym], 'Volume': 1000000})
                                     cached_inds[sym] = calculate_indicators(sym_df)
                                 ind_df = cached_inds[sym]
-                                valid_dates = ind_df.index[ind_df.index <= r_dt]
+                                valid_dates = ind_df.index[ind_df.index <= r_dt_ts]
                                 if len(valid_dates) > 0:
                                     t_idx = ind_df.index.get_loc(valid_dates[-1])
                                     if isinstance(t_idx, slice): t_idx = t_idx.stop - 1
