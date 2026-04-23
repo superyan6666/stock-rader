@@ -8,7 +8,7 @@ from typing import List, Dict, Optional
 class Order:
     """标准化订单结构"""
     symbol: str
-    qty: int
+    qty: float
     side: str  # "BUY" or "SELL"
     order_type: str = "MARKET" # "MARKET", "LIMIT"
     limit_price: Optional[float] = None
@@ -16,13 +16,21 @@ class Order:
     created_at: datetime = datetime.now()
 
 @dataclass
+class BrokerOrderStatus:
+    """标准化订单状态查询回报"""
+    broker_oid: str
+    status: str  # 统一映射为: "OPEN", "PARTIALLY_FILLED", "FILLED", "CANCELED", "REJECTED"
+    filled_qty: float
+    avg_fill_price: float
+
+@dataclass
 class Execution:
-    """标准化成交回报结构"""
+    """标准化成交回报结构 (TCA专用)"""
     client_oid: str
-    broker_oid: str  # 券商端的订单ID
+    broker_oid: str  
     symbol: str
     side: str
-    exec_qty: int
+    exec_qty: float
     exec_price: float
     exec_time: datetime
     commission: float = 0.0
@@ -31,7 +39,7 @@ class Execution:
 class Position:
     """标准化持仓结构"""
     symbol: str
-    qty: int
+    qty: float
     avg_price: float
     market_value: float
     unrealized_pnl: float
@@ -60,10 +68,7 @@ class BaseBrokerGateway(ABC):
 
     @abstractmethod
     def get_account_summary(self) -> Dict[str, float]:
-        """
-        获取账户资金摘要
-        返回范例: {"total_cash": 10000.0, "buying_power": 20000.0, "net_liquidation": 10000.0}
-        """
+        """获取账户资金摘要"""
         pass
 
     @abstractmethod
@@ -73,10 +78,12 @@ class BaseBrokerGateway(ABC):
 
     @abstractmethod
     def place_order(self, order: Order) -> Optional[str]:
-        """
-        发送订单
-        返回: 成功返回 broker_oid (券商订单号), 失败返回 None
-        """
+        """发送订单 (成功返回 broker_oid)"""
+        pass
+        
+    @abstractmethod
+    def fetch_order(self, broker_oid: str) -> BrokerOrderStatus:
+        """查询订单当前状态与成交进度"""
         pass
 
     @abstractmethod
@@ -86,5 +93,5 @@ class BaseBrokerGateway(ABC):
     
     @abstractmethod
     def get_latest_price(self, symbol: str) -> float:
-        """获取单个标的的最新市场价格 (用于计算持仓市值)"""
+        """获取单个标的的最新市场价格"""
         pass
