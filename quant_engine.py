@@ -57,10 +57,10 @@ class Config:
     VIX_INDEX: str = "^VIX" 
     
     SECTOR_MAP = {
-        'XLK': ['AAPL', 'MSFT', 'NVDA', 'AVGO', 'QCOM', 'AMD', 'INTC', 'CRM', 'ADBE'],
-        'XLY': ['AMZN', 'TSLA', 'BKNG', 'SBUX', 'MAR', 'MELI', 'LULU', 'HD', 'ROST'],
-        'XLC': ['GOOGL', 'GOOG', 'META', 'NFLX', 'CMCSA', 'TMUS', 'EA', 'TTWO'],
-        'XLV': ['AMGN', 'GILD', 'VRTX', 'REGN', 'ISRG', 'BIIB', 'ILMN', 'DXCM'],
+        'XLK': ['AAPL', 'MSFT', 'NVDA', 'AVGO', 'QCOM', 'AMD', 'INTC', 'CRM', 'ADBE', 'CSCO', 'TXN', 'INTU', 'AMAT', 'MU', 'LRCX', 'PANW', 'KLAC', 'SNPS', 'CDNS', 'NXPI', 'MRVL', 'MCHP', 'FTNT', 'CRWD'],
+        'XLY': ['AMZN', 'TSLA', 'BKNG', 'SBUX', 'MAR', 'MELI', 'LULU', 'HD', 'ROST', 'EBAY', 'TSCO', 'PDD', 'DASH', 'CPRT', 'PCAR'],
+        'XLC': ['GOOGL', 'GOOG', 'META', 'NFLX', 'CMCSA', 'TMUS', 'EA', 'TTWO', 'WBD', 'SIRI', 'CHTR'],
+        'XLV': ['AMGN', 'GILD', 'VRTX', 'REGN', 'ISRG', 'BIIB', 'ILMN', 'DXCM', 'IDXX', 'MRNA', 'ALGN', 'BMRN', 'GEHC'],
         'XLP': ['PEP', 'COST', 'MDLZ', 'KDP', 'KHC', 'MNST', 'WBA']
     }
     
@@ -97,6 +97,7 @@ class Config:
         CROWDING_PENALTY = 0.75     
         CROWDING_MIN_STOCKS = 2     
         PORTFOLIO_VALUE = 100000.0  
+        ALERT_COOLDOWN_HOURS = 24.0 
         SLIPPAGE = 0.003            
         COMMISSION = 0.0005         
         MIN_T_STAT = 1.0            
@@ -237,7 +238,41 @@ def _save_ext_cache():
             os.replace(temp_ext, Config.EXT_CACHE_FILE)
         except Exception: pass
 
-# 🚀 获取 WSB 数据
+def fetch_tradingview_screener(max_tickers=150) -> list:
+    try:
+        url = "https://scanner.tradingview.com/america/scan"
+        payload = {
+            "filter": [
+                {"left": "type", "operation": "in_range", "right": ["stock"]},
+                {"left": "subtype", "operation": "in_range", "right": ["common"]},
+                {"left": "exchange", "operation": "in_range", "right": ["AMEX", "NASDAQ", "NYSE"]},
+                {"left": "close", "operation": "greater", "right": 15}, 
+                {"left": "average_volume_10d_calc", "operation": "greater", "right": 2500000}, 
+                {"left": "beta_1_year", "operation": "greater", "right": 1.1}
+            ],
+            "options": {"lang": "en"},
+            "markets": ["america"],
+            "symbols": {"query": {"types": []}, "tickers": []},
+            "columns": ["name", "close", "volume", "RelativeVolume10CG"],
+            "sort": {"sortBy": "RelativeVolume10CG", "sortOrder": "desc"},
+            "range": [0, max_tickers]
+        }
+        headers = _GLOBAL_HEADERS.copy()
+        headers["Content-Type"] = "application/json"
+        
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            tickers = []
+            for item in data.get('data', []):
+                raw_ticker = item['d'][0]
+                ticker = raw_ticker.split(':')[1] if ':' in raw_ticker else raw_ticker
+                tickers.append(ticker)
+            valid_tickers = [t.replace('.', '-') for t in tickers if len(t) <= 5]
+            return valid_tickers
+    except Exception: pass
+    return []
+
 def fetch_global_wsb_data() -> Dict[str, float]:
     with _ALT_DATA_LOCK:
         if "WSB_ACCEL_GLOBAL" in _ALT_DATA_CACHE: return _ALT_DATA_CACHE["WSB_ACCEL_GLOBAL"]
@@ -277,7 +312,6 @@ def fetch_global_wsb_data() -> Dict[str, float]:
     with _ALT_DATA_LOCK: _ALT_DATA_CACHE["WSB_ACCEL_GLOBAL"] = wsb_accel_dict
     return wsb_accel_dict
 
-# 🚀 获取情绪与期权数据
 def safe_get_sentiment_data(symbol: str) -> Tuple[float, float, float, float]:
     _init_ext_cache()
     with _DAILY_EXT_LOCK:
@@ -303,7 +337,6 @@ def safe_get_sentiment_data(symbol: str) -> Tuple[float, float, float, float]:
     _save_ext_cache()
     return pcr, iv_skew, short_change, short_float
 
-# 🚀 获取另类因子数据
 def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
     _init_ext_cache()
     with _DAILY_EXT_LOCK:
@@ -337,7 +370,6 @@ def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
     _save_ext_cache()
     return insider_net_buy, analyst_mom, nlp_score, news_summary
 
-# 🚀 财报风控排雷
 def check_earnings_risk(symbol: str) -> bool:
     try:
         tk = yf.Ticker(symbol)
@@ -357,7 +389,64 @@ def check_earnings_risk(symbol: str) -> bool:
     except Exception: pass
     return False
 
-def get_filtered_watchlist(max_stocks: int = 150) -> list: return list(Config.CORE_WATCHLIST)[:max_stocks]
+def get_filtered_watchlist(max_stocks: int = 150) -> list:
+    tickers = set(Config.CORE_WATCHLIST) if hasattr(Config, 'CORE_WATCHLIST') else set()
+    tv_tickers = fetch_tradingview_screener(120)
+    if tv_tickers: tickers.update(tv_tickers)
+    
+    if os.path.exists(Config.CACHE_FILE):
+        try:
+            mtime = os.path.getmtime(Config.CACHE_FILE)
+            if time.time() - mtime < 7 * 86400:
+                with open(Config.CACHE_FILE, "r", encoding="utf-8") as f:
+                    cached_tickers = json.load(f)
+                    tickers.update(cached_tickers)
+        except Exception: pass
+
+    tickers_list = list(tickers)
+    try:
+        chunk_size = 50 
+        dfs = []
+        for i in range(0, len(tickers_list), chunk_size):
+            chunk = tickers_list[i:i + chunk_size]
+            for attempt in range(3):
+                try:
+                    chunk_df = yf.download(chunk, period="5d", progress=False, threads=False, timeout=10)
+                    if not chunk_df.empty: 
+                        dfs.append(chunk_df)
+                        break
+                    else: time.sleep((attempt + 1) * 2.5)
+                except Exception: time.sleep((attempt + 1) * 3)
+            if i + chunk_size < len(tickers_list): time.sleep(random.uniform(2.0, 3.5))
+                
+        if not dfs: raise ValueError("批量下载发生全局失败。")
+        df = pd.concat(dfs, axis=1)
+        
+        if isinstance(df.columns, pd.MultiIndex):
+            close_df = df['Close'] if 'Close' in df.columns else df.xs('Close', level=0, axis=1)
+            volume_df = df['Volume'] if 'Volume' in df.columns else df.xs('Volume', level=0, axis=1)
+        else:
+            close_df, volume_df = df, pd.DataFrame(1e6, index=df.index, columns=df.columns)
+
+        available_tickers = set(close_df.columns) if isinstance(close_df, pd.DataFrame) else set()
+        
+        if len(available_tickers) > 200:
+            try:
+                temp_cache = f"{Config.CACHE_FILE}.{threading.get_ident()}.tmp"
+                with open(temp_cache, "w", encoding="utf-8") as f: json.dump(list(available_tickers), f)
+                os.replace(temp_cache, Config.CACHE_FILE)
+            except Exception: pass
+
+        closes = close_df.dropna(axis=1, how='all').ffill().iloc[-1]
+        volumes = volume_df.dropna(axis=1, how='all').mean()
+        turnovers = (closes * volumes).dropna()
+        
+        valid_turnovers = turnovers[(closes > 10.0) & (turnovers > 30_000_000)]
+        top_tickers = valid_turnovers.sort_values(ascending=False).head(max_stocks).index.tolist()
+        if top_tickers: return top_tickers
+        return list(Config.CORE_WATCHLIST)[:max_stocks] if hasattr(Config, 'CORE_WATCHLIST') else []
+    except Exception:
+        return list(Config.CORE_WATCHLIST)[:max_stocks] if hasattr(Config, 'CORE_WATCHLIST') else []
 
 def load_strategy_performance_tag() -> str:
     try:
@@ -467,6 +556,7 @@ def _robust_hurst(close_prices: np.ndarray, min_window=30, n_bootstrap=100) -> T
     return h_median, h_iqr, is_reliable
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """计算核心技术指标，已彻底修复 numpy array 的 rolling 方法报错"""
     df = df.sort_index()
     df['Close'], df['Volume'] = df['Close'].ffill(), df['Volume'].ffill()
     df['Open'], df['High'], df['Low'] = df['Open'].ffill(), df['High'].ffill(), df['Low'].ffill()
@@ -533,7 +623,9 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['Highest_22'] = df['High'].rolling(22).max()
     df['ATR_22'] = df['TR'].rolling(22).mean()
     df['Chandelier_Exit'] = df['Highest_22'] - 2.5 * df['ATR_22']
-    df['Smart_Money_Flow'] = (clv_num / hl_diff).rolling(10).mean()
+    
+    # 🚀 物理防御：确保 numpy array 被安全的包裹为 Pandas Series，彻底免疫 'numpy.ndarray' 报错
+    df['Smart_Money_Flow'] = pd.Series(clv_num / hl_diff, index=df.index).rolling(10).mean()
 
     df['Recent_Price_Surge_3d'] = (df['Close'] / df['Open'] - 1).rolling(3).max().shift(1) * 100
     df['Recent_Vol_Surge_3d'] = (df['Volume'] / (df['Vol_MA20']+1)).rolling(3).max().shift(1)
@@ -1260,8 +1352,11 @@ def run_backtest_engine() -> None:
     report_md = [f"# 📈 自动量化战报与 AI 透视\n**更新:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n## ⚔️ 核心表现评估\n| 周期 | 原始胜率 | ⚡代谢演化过滤 | 均收益 | 盈亏比 | Sharpe | 胜单平均抗压(MAE) | 笔数 |\n|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"]
     for p in ['T+1', 'T+3', 'T+5']:
         d = res.get(p, {'win_rate':0,'avg_ret':0,'profit_factor':0,'sharpe':0,'avg_win_mae':0,'max_cons_loss':0,'total_trades':0})
-        # 🚀 修复核心：提早计算 f-string 变量，绝不发生内外同态引号嵌套导致的抽象树雪崩崩溃
-        ai_str = f"**{d.get('ai_win_rate', 0.0)*100:.1f}%**" if 'ai_win_rate' in d else "-"
+        
+        # 🚀 坚守防线：预计算 f-string 变量，绝不发生内外同态引号嵌套导致的 AST 树雪崩崩溃
+        ai_win_rate_val = d.get('ai_win_rate', 0.0)
+        ai_str = f"**{ai_win_rate_val*100:.1f}%**" if 'ai_win_rate' in d else "-"
+        
         report_md.append(f"| {p} | {d['win_rate']*100:.1f}% | {ai_str} | {d['avg_ret']*100:+.2f}% | {d['profit_factor']:.2f} | {d['sharpe']:.2f} | {d['avg_win_mae']*100:.1f}% | {d['total_trades']} |")
     
     if factor_ic_report:
@@ -1296,8 +1391,10 @@ def run_backtest_engine() -> None:
     # 🚀 坚守防线：处理第二个战报推送中的嵌套漏洞
     alert_lines = ["### 📊 **机构级回测报表 (含代谢淘汰赛)**"]
     for p, d in res.items():
-        ai_text = f" | ⚡代谢演化过滤: **{d.get('ai_win_rate', 0.0)*100:.1f}%**" if 'ai_win_rate' in d else ""
+        ai_win_rate_val = d.get('ai_win_rate', 0.0)
+        ai_text = f" | ⚡代谢演化过滤: **{ai_win_rate_val*100:.1f}%**" if 'ai_win_rate' in d else ""
         alert_lines.append(f"- **{p}:** 原始胜率 {d['win_rate']*100:.1f}%{ai_text} | 盈亏比 {d['profit_factor']:.2f}")
+        
     send_alert("策略终极回测战报 (代谢进化版)", "\n".join(alert_lines))
 
 # 🛡️ 恢复：合成数据压测引擎与辅助函数
