@@ -1,22 +1,127 @@
---- a/.github/workflows/main.yml
-+++ b/.github/workflows/main.yml
-@@ -37,7 +37,8 @@
-         run: |
-           # 依赖于甲骨文服务器全局安装的 flake8
-           flake8 quant_engine.py quant_transformer.py --count --select=E9,F63,F7,F82 --show-source --statistics
-+          # 安装全息指挥仓依赖
-+          pip install streamlit altair
+name: Tickeron Pro AI Bot
 
-       - name: 🛡️ 核心引擎测谎仪 (Unit Tests)
-         run: |
-@@ -99,3 +100,10 @@
-               --data-urlencode "text=🚨 *Quant Engine 严重崩溃*！测试未通过或流水线异常，请立即检查 Actions 日志。" \
-               --data-urlencode "parse_mode=Markdown"
-           fi
-+
-+      - name: 🌐 激活全息指挥仓 (Web Dashboard)
-+        if: always()
-+        run: |
-+          echo "检测 Dashboard 进程..."
-+          # 如果没运行就后台启动它，如果已经在运行就忽略
-+          pgrep streamlit || (nohup streamlit run dashboard.py --server.port 8501 --server.address 0.0.0.1 > dashboard.log 2>&1 &)
+run-name: 🤖 Quant Engine 运行状态 - ${{ github.event.inputs.run_mode || '自动调度 (Schedule)' }}
+
+on:
+  schedule:
+    - cron: '45 20 * * 1-5'   
+    - cron: '0 23 * * 5'
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: '选择运行模式'
+        required: true
+        default: 'test'
+        type: choice
+        options:
+          - test
+          - matrix
+          - backtest
+
+concurrency:
+  group: bot-running-group
+  cancel-in-progress: true
+
+jobs:
+  run-bot:
+    runs-on: self-hosted
+    timeout-minutes: 720  
+      
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 📁 数据基底物理映射校验
+        run: |
+          mkdir -p .quantbot_data/archive
+          echo "✅ 侦测到物理 SSD 挂载，本地账本与缓存字典处于永生状态。"
+
+      - name: 🔍 代码质量检查与依赖补齐
+        run: |
+          flake8 quant_engine.py quant_transformer.py --count --select=E9,F63,F7,F82 --show-source --statistics
+          # 安装全息指挥仓依赖
+          pip install streamlit altair
+
+      - name: 🛡️ 核心引擎测谎仪 (Unit Tests)
+        run: |
+          echo "启动物理边界与逻辑漂移测试..."
+          python quant_engine.py test
+
+      - name: ⚙️ 执行主脑引擎 (Data / Inference / Backtest)
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            MODE="${{ github.event.inputs.run_mode }}"
+          elif [[ "${{ github.event_name }}" == "schedule" ]]; then
+            UTC_H=$(date -u +%-H)
+            UTC_D=$(date -u +%-u)
+            if [[ "$UTC_D" == "5" && "$UTC_H" == "23" ]]; then
+              MODE="backtest"
+            else
+              MODE="matrix"
+            fi
+          fi
+          
+          echo "RUN_MODE=$MODE" >> $GITHUB_ENV
+          if [[ "$MODE" != "test" ]]; then
+             python quant_engine.py $MODE
+          fi
+
+      - name: 🧠 触发深度神经代谢 (MLOps Training)
+        if: env.RUN_MODE == 'backtest'
+        id: training
+        continue-on-error: true  
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "启动 Transformer 右脑增量训练..."
+          set +e
+          python train_transformer.py
+          TRAIN_EXIT=$?
+          set -e
+          case $TRAIN_EXIT in
+            0) echo "::notice title=MLOps 换代成功::隐空间权重已进化，准备接管下周实盘流。" ;;
+            2) echo "::warning title=MLOps 训练中断::样本不足，神经代谢节点已安全跳过本次更新。" ;;
+            3) echo "::warning title=MLOps 冠军拦截::新模型未能击败线上模型，已被物理销毁，保留旧权重。" ;;
+            *) echo "::error title=MLOps 训练崩溃::神经代谢中枢发生异常 (Exit Code: $TRAIN_EXIT)，请排查！" && exit 1 ;;
+          esac
+
+      - name: 📦 上传核心阵列制品 (Artifacts - 仅供云端遥测查阅)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantbot-core-artifacts
+          path: |
+            .quantbot_data/transformer_production.pth
+            .quantbot_data/tca_history.jsonl
+            .quantbot_data/strategy_stats.json
+            .quantbot_data/backtest_report.md
+          retention-days: 30
+
+      - name: 🚨 崩溃告警
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=🚨 *Quant Engine 严重崩溃*！测试未通过或流水线异常，请立即检查 Actions 日志。" \
+              --data-urlencode "parse_mode=Markdown"
+          fi
+
+      - name: 🌐 激活全息指挥仓 (Web Dashboard)
+        if: always()
+        run: |
+          echo "检测 Dashboard 进程..."
+          # 如果没运行就后台启动它，如果已经在运行就忽略
+          pgrep streamlit || (nohup streamlit run dashboard.py --server.port 8501 --server.address 0.0.0.0 > dashboard.log 2>&1 &)
