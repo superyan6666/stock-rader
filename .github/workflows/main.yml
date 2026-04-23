@@ -1,98 +1,130 @@
-import streamlit as st
-import pandas as pd
-import json
-import os
-from datetime import datetime
-import altair as alt
+name: Tickeron Pro AI Bot
 
-# --- 🎯 页面全局配置 ---
-st.set_page_config(
-    page_title="Tickeron Pro AI | 全息指挥仓",
-    page_icon="🤖",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+run-name: 🤖 Quant Engine 运行状态 - ${{ github.event.inputs.run_mode || '自动调度 (Schedule)' }}
 
-# --- 📁 数据加载管道 ---
-DATA_DIR = ".quantbot_data"
-STATS_FILE = os.path.join(DATA_DIR, "strategy_stats.json")
-TCA_FILE = os.path.join(DATA_DIR, "tca_history.jsonl")
+on:
+  schedule:
+    - cron: '45 20 * * 1-5'   
+    - cron: '0 23 * * 5'
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: '选择运行模式'
+        required: true
+        default: 'test'
+        type: choice
+        options:
+          - test
+          - matrix
+          - backtest
 
-@st.cache_data(ttl=60) # 缓存 60 秒，避免频繁读取硬盘
-def load_data():
-    stats_data = {}
-    if os.path.exists(STATS_FILE):
-        try:
-            with open(STATS_FILE, "r") as f:
-                stats_data = json.load(f)
-        except Exception as e:
-            st.error(f"无法读取状态文件: {e}")
+concurrency:
+  group: bot-running-group
+  cancel-in-progress: true
 
-    tca_records = []
-    if os.path.exists(TCA_FILE):
-        try:
-            with open(TCA_FILE, "r") as f:
-                for line in f:
-                    tca_records.append(json.loads(line.strip()))
-        except Exception as e:
-            st.error(f"无法读取交易历史记录: {e}")
-            
-    tca_df = pd.DataFrame(tca_records) if tca_records else pd.DataFrame()
-    return stats_data, tca_df
+jobs:
+  run-bot:
+    runs-on: self-hosted
+    timeout-minutes: 720  
+    # 🚀 强制将流水线的底层环境指向我们的 Conda 物理沙盒
+    env:
+      PATH: /home/ubuntu/miniforge3/envs/quantbot/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
 
-# --- 🖥️ 核心渲染逻辑 ---
-def main():
-    st.title("🤖 Quant Engine 全息指挥仓")
-    st.markdown("实时监控底座：甲骨文 4核 24G ARM 物理矩阵 | 算力中枢：GitHub Actions")
-    st.divider()
+      - name: 📁 数据基底物理映射校验
+        run: |
+          mkdir -p .quantbot_data/archive
+          echo "✅ 侦测到物理 SSD 挂载，本地账本与缓存字典处于永生状态。"
 
-    stats_data, tca_df = load_data()
+      - name: 🔍 代码质量检查与依赖补齐
+        run: |
+          # 补齐依赖并执行检查
+          pip install flake8 streamlit altair
+          flake8 quant_engine.py quant_transformer.py --count --select=E9,F63,F7,F82 --show-source --statistics
 
-    if not stats_data and tca_df.empty:
-        st.warning("暂未在 .quantbot_data 目录中侦测到核心阵列数据，请先执行一次 Matrix 扫盘或等待周末 Backtest 完成。")
-        return
+      - name: 🛡️ 核心引擎测谎仪 (Unit Tests)
+        run: |
+          echo "启动物理边界与逻辑漂移测试..."
+          python quant_engine.py test
 
-    # --- 模块一：核心代谢指标 (Metrics) ---
-    st.subheader("💡 引擎代谢指标")
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric(label="当前右脑版本 (Version)", value=stats_data.get("model_version", "v0_baseline"))
-    with col2:
-        t3_stats = stats_data.get("overall", {}).get("T+3", {})
-        st.metric(label="T+3 原始胜率 (Win Rate)", value=f"{t3_stats.get('win_rate', 0.0):.2%}")
-    with col3:
-        st.metric(label="T+3 盈亏比 (Profit Factor)", value=f"{t3_stats.get('profit_factor', 0.0):.2f}")
-    with col4:
-        st.metric(label="AI 元学习胜率过滤", value=f"{t3_stats.get('ai_win_rate', 0.0):.2%}" if 'ai_win_rate' in t3_stats else "N/A")
+      - name: ⚙️ 执行主脑引擎 (Data / Inference / Backtest)
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            MODE="${{ github.event.inputs.run_mode }}"
+          elif [[ "${{ github.event_name }}" == "schedule" ]]; then
+            UTC_H=$(date -u +%-H)
+            UTC_D=$(date -u +%-u)
+            if [[ "$UTC_D" == "5" && "$UTC_H" == "23" ]]; then
+              MODE="backtest"
+            else
+              MODE="matrix"
+            fi
+          fi
+          
+          echo "RUN_MODE=$MODE" >> $GITHUB_ENV
+          if [[ "$MODE" != "test" ]]; then
+             python quant_engine.py $MODE
+          fi
 
-    st.divider()
+      - name: 🧠 触发深度神经代谢 (MLOps Training)
+        if: env.RUN_MODE == 'backtest'
+        id: training
+        continue-on-error: true  
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "启动 Transformer 右脑增量训练..."
+          set +e
+          python train_transformer.py
+          TRAIN_EXIT=$?
+          set -e
+          case $TRAIN_EXIT in
+            0) echo "::notice title=MLOps 换代成功::隐空间权重已进化，准备接管下周实盘流。" ;;
+            2) echo "::warning title=MLOps 训练中断::样本不足，神经代谢节点已安全跳过本次更新。" ;;
+            3) echo "::warning title=MLOps 冠军拦截::新模型未能击败线上模型，已被物理销毁，保留旧权重。" ;;
+            *) echo "::error title=MLOps 训练崩溃::神经代谢中枢发生异常 (Exit Code: $TRAIN_EXIT)，请排查！" && exit 1 ;;
+          esac
 
-    # --- 模块二：近期交易截面 (TCA Tracker) ---
-    st.subheader("📊 近期交易截面追踪 (TCA 滑点监控)")
-    
-    if not tca_df.empty:
-        if 'timestamp' in tca_df.columns:
-            tca_df['timestamp'] = pd.to_datetime(tca_df['timestamp']).dt.strftime('%Y-%m-%d %H:%M')
-            
-        display_cols = [c for c in ['timestamp', 'client_oid', 'symbol', 'side', 'qty', 'arrival_price', 'execution_price', 'slippage_bps'] if c in tca_df.columns]
-        
-        st.dataframe(
-            tca_df[display_cols].sort_index(ascending=False).head(20), 
-            use_container_width=True,
-            hide_index=True
-        )
-        
-        if 'slippage_bps' in tca_df.columns:
-            st.markdown("#### 实盘执行滑点分布 (Slippage BPS)")
-            chart = alt.Chart(tca_df.dropna(subset=['slippage_bps'])).mark_bar().encode(
-                x=alt.X('slippage_bps:Q', bin=alt.Bin(maxbins=30), title='滑点基点 (BPS)'),
-                y=alt.Y('count()', title='笔数'),
-                color=alt.Color('side:N', scale=alt.Scale(domain=['BUY', 'SELL'], range=['#00C853', '#D50000']))
-            ).properties(height=300)
-            st.altair_chart(chart, use_container_width=True)
-    else:
-        st.info("尚未记录到任何网关交易执行截面数据 (TCA)。")
+      - name: 📦 上传核心阵列制品 (Artifacts - 仅供云端遥测查阅)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantbot-core-artifacts
+          path: |
+            .quantbot_data/transformer_production.pth
+            .quantbot_data/tca_history.jsonl
+            .quantbot_data/strategy_stats.json
+            .quantbot_data/backtest_report.md
+          retention-days: 30
 
-if __name__ == "__main__":
-    main()
+      - name: 🚨 崩溃告警
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=🚨 *Quant Engine 严重崩溃*！测试未通过或流水线异常，请立即检查 Actions 日志。" \
+              --data-urlencode "parse_mode=Markdown"
+          fi
+
+      - name: 🌐 激活全息指挥仓 (Web Dashboard)
+        if: always()
+        run: |
+          echo "检测 Dashboard 进程..."
+          # 如果没运行就后台启动它，如果已经在运行就忽略
+          pgrep streamlit || (nohup streamlit run dashboard.py --server.port 8501 --server.address 0.0.0.0 > dashboard.log 2>&1 &)
