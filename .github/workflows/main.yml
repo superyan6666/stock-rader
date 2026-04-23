@@ -35,14 +35,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 📁 数据基底物理映射校验
+      - name: 📁 数据基底物理映射校验
         run: |
           mkdir -p .quantbot_data/archive
           echo "✅ 侦测到物理 SSD 挂载，本地账本与缓存字典处于永生状态。"
 
       - name: 🔍 代码质量检查与依赖补齐
         run: |
-          # 补齐依赖并执行检查
-          pip install flake8 streamlit altair
+          # 先安装 flake8 和全息指挥仓依赖
+          pip install flake8 streamlit altair streamlit-autorefresh
           flake8 quant_engine.py quant_transformer.py --count --select=E9,F63,F7,F82 --show-source --statistics
 
       - name: 🛡️ 核心引擎测谎仪 (Unit Tests)
