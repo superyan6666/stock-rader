@@ -1317,7 +1317,7 @@ class BaseBrokerGateway:
     def get_account_summary(self) -> Dict[str, float]: raise NotImplementedError
     def get_positions(self) -> List[Position]: raise NotImplementedError
     def cancel_order(self, broker_oid: str) -> bool: raise NotImplementedError
-    def submit_order(self, symbol: str, side: str, qty: float, order_type: str, limit_price: float = None) -> BrokerOrder: raise NotImplementedError
+    def submit_order(self, symbol: str, side: str, qty: float, order_type: str, limit_price: float = None, client_oid: str = None) -> BrokerOrder: raise NotImplementedError
     def fetch_order(self, broker_oid: str) -> BrokerOrder: raise NotImplementedError
 
 class MockAlpacaGateway(BaseBrokerGateway):
@@ -1348,7 +1348,7 @@ class MockAlpacaGateway(BaseBrokerGateway):
             return True
         return False
 
-    def submit_order(self, symbol: str, side: str, qty: float, order_type: str, limit_price: float = None) -> BrokerOrder:
+    def submit_order(self, symbol: str, side: str, qty: float, order_type: str, limit_price: float = None, client_oid: str = None) -> BrokerOrder:
         broker_oid = f"ALPACA_{uuid.uuid4().hex[:12]}"
         self._mock_exchange[broker_oid] = {
             "status": "OPEN", "filled_qty": 0.0, "avg_fill_price": 0.0, "qty": qty, 
@@ -1408,9 +1408,10 @@ class AlpacaGateway(BaseBrokerGateway):
     def _map_status(self, alpaca_status: str) -> str:
         return {"new": "OPEN", "accepted": "OPEN", "partially_filled": "PARTIALLY_FILLED", "filled": "FILLED", "done_for_day": "FILLED", "canceled": "CANCELED", "expired": "EXPIRED", "replaced": "OPEN", "pending_cancel": "OPEN", "pending_replace": "OPEN", "rejected": "REJECTED", "suspended": "REJECTED"}.get(alpaca_status, "OPEN")
 
-    def submit_order(self, symbol: str, side: str, qty: float, order_type: str, limit_price: float = None) -> BrokerOrder:
+    def submit_order(self, symbol: str, side: str, qty: float, order_type: str, limit_price: float = None, client_oid: str = None) -> BrokerOrder:
         payload = {"symbol": symbol, "qty": str(qty), "side": side.lower(), "type": "market" if order_type == "MARKET" else "limit", "time_in_force": "day"}
         if limit_price and payload["type"] == "limit": payload["limit_price"] = str(round(limit_price, 2))
+        if client_oid: payload["client_order_id"] = client_oid # 👈 注入强一致性幂等标识，彻底免疫网络波动导致的多重扣款
         resp = requests.post(f"{self.base_url}/v2/orders", json=payload, headers=self.headers, timeout=10)
         if resp.status_code in [200, 201]: return BrokerOrder(resp.json()["id"], self._map_status(resp.json()["status"]), float(resp.json()["filled_qty"]), float(resp.json()["filled_avg_price"] or 0.0))
         logger.error(f"❌ [Alpaca] 委托拒绝: {resp.text}"); return None
@@ -1478,7 +1479,8 @@ class ExecutionEngine:
                 continue
             try:
                 logger.info(f"📤 向券商提交订单 {oid}: {row['side']} {row['qty']} {row['symbol']}")
-                b_order = self.broker.submit_order(row['symbol'], row['side'], float(row['qty']), "MARKET" if row['order_type'] == "MKT" else "LIMIT", float(row['limit_price']) if pd.notna(row['limit_price']) else None)
+                # 🚀 将策略端生成的唯一 OID 送入网关，构建防重下屏障
+                b_order = self.broker.submit_order(row['symbol'], row['side'], float(row['qty']), "MARKET" if row['order_type'] == "MKT" else "LIMIT", float(row['limit_price']) if pd.notna(row['limit_price']) else None, client_oid=oid)
                 if b_order: self.ledger.update_order_status(oid, b_order.status, b_order.filled_qty, b_order.avg_fill_price, b_order.broker_oid)
                 else: self.ledger.update_order_status(oid, 'REJECTED')
             except Exception as e:
