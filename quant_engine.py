@@ -237,7 +237,7 @@ def _save_ext_cache():
             os.replace(temp_ext, Config.EXT_CACHE_FILE)
         except Exception: pass
 
-# 🚀 满血恢复：获取 WSB 数据
+# 🚀 获取 WSB 数据
 def fetch_global_wsb_data() -> Dict[str, float]:
     with _ALT_DATA_LOCK:
         if "WSB_ACCEL_GLOBAL" in _ALT_DATA_CACHE: return _ALT_DATA_CACHE["WSB_ACCEL_GLOBAL"]
@@ -277,7 +277,7 @@ def fetch_global_wsb_data() -> Dict[str, float]:
     with _ALT_DATA_LOCK: _ALT_DATA_CACHE["WSB_ACCEL_GLOBAL"] = wsb_accel_dict
     return wsb_accel_dict
 
-# 🚀 满血恢复：获取情绪与期权数据
+# 🚀 获取情绪与期权数据
 def safe_get_sentiment_data(symbol: str) -> Tuple[float, float, float, float]:
     _init_ext_cache()
     with _DAILY_EXT_LOCK:
@@ -303,7 +303,7 @@ def safe_get_sentiment_data(symbol: str) -> Tuple[float, float, float, float]:
     _save_ext_cache()
     return pcr, iv_skew, short_change, short_float
 
-# 🚀 满血恢复：获取另类因子数据
+# 🚀 获取另类因子数据
 def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
     _init_ext_cache()
     with _DAILY_EXT_LOCK:
@@ -337,7 +337,7 @@ def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
     _save_ext_cache()
     return insider_net_buy, analyst_mom, nlp_score, news_summary
 
-# 🚀 满血恢复：财报风控排雷
+# 🚀 财报风控排雷
 def check_earnings_risk(symbol: str) -> bool:
     try:
         tk = yf.Ticker(symbol)
@@ -543,7 +543,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-# 🚀 满血恢复：提取 Transformer 49 维张量切片
+# 🚀 提取 Transformer 49 维张量切片
 def _get_transformer_seq(df_ind: pd.DataFrame, end_idx: int = -1) -> np.ndarray:
     if end_idx == -1: end_idx = len(df_ind)
     start_idx = end_idx - 60
@@ -575,7 +575,7 @@ def _get_transformer_seq(df_ind: pd.DataFrame, end_idx: int = -1) -> np.ndarray:
     for idx, vals in feature_mapping: seq[:, idx] = vals
     return np.nan_to_num(seq, nan=0.0, posinf=5.0, neginf=-5.0)
 
-# 🚀 满血恢复：提取多维跨频复杂特征
+# 🚀 提取多维跨频复杂特征
 def _extract_complex_features(stock: StockData, ctx: MarketContext) -> ComplexFeatures:
     weekly_bullish, weekly_macd_res, fvg_lower, fvg_upper = False, 0.0, 0.0, 0.0
     aligned_w = stock.df_w
@@ -659,7 +659,7 @@ def _extract_complex_features(stock: StockData, ctx: MarketContext) -> ComplexFe
         rs_20=float(rs_20), pure_alpha=float(pure_alpha)
     )
 
-# 🚀 满血恢复：提取喂给 LightGBM 的机器学习特征字典
+# 🚀 提取喂给 LightGBM 的机器学习特征字典
 def _extract_ml_features(stock: StockData, ctx: MarketContext, cf: ComplexFeatures, alt: AltData, alpha_vec: np.ndarray = None) -> dict:
     macd_cross_strength = safe_div(stock.curr['MACD'] - stock.curr['Signal_Line'], abs(stock.curr['Close']) * 0.01)
     vol_surge_ratio = safe_div(stock.curr['Volume'], stock.curr['Vol_MA20'], cap=50.0)
@@ -706,7 +706,7 @@ def _extract_ml_features(stock: StockData, ctx: MarketContext, cf: ComplexFeatur
         for i in range(1, 17): feat_dict[f"Alpha_T{i:02d}"] = 0.0
     return {f: float(np.nan_to_num(feat_dict.get(f, 0.0), nan=0.0, posinf=20.0, neginf=-20.0)) for f in Config.ALL_FACTORS}
 
-# 🚀 满血恢复：53 维因子的绝对大脑，全息张量打分器
+# 🚀 53 维因子的绝对大脑，全息张量打分器
 def _evaluate_omni_matrix(stock: StockData, ctx: MarketContext, cf: ComplexFeatures, alt: AltData) -> Tuple[int, List[str], List[str], bool]:
     triggered_list, factors_list = [], []
     theme_scores = {'TREND': 0.0, 'VOLATILITY': 0.0, 'REVERSAL': 0.0, 'QUANTUM': 0.0}
@@ -1260,7 +1260,9 @@ def run_backtest_engine() -> None:
     report_md = [f"# 📈 自动量化战报与 AI 透视\n**更新:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n## ⚔️ 核心表现评估\n| 周期 | 原始胜率 | ⚡代谢演化过滤 | 均收益 | 盈亏比 | Sharpe | 胜单平均抗压(MAE) | 笔数 |\n|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"]
     for p in ['T+1', 'T+3', 'T+5']:
         d = res.get(p, {'win_rate':0,'avg_ret':0,'profit_factor':0,'sharpe':0,'avg_win_mae':0,'max_cons_loss':0,'total_trades':0})
-        report_md.append(f"| {p} | {d['win_rate']*100:.1f}% | {f'**{d.get('ai_win_rate', 0.0)*100:.1f}%**' if 'ai_win_rate' in d else '-'} | {d['avg_ret']*100:+.2f}% | {d['profit_factor']:.2f} | {d['sharpe']:.2f} | {d['avg_win_mae']*100:.1f}% | {d['total_trades']} |")
+        # 🚀 修复核心：提早计算 f-string 变量，绝不发生内外同态引号嵌套导致的抽象树雪崩崩溃
+        ai_str = f"**{d.get('ai_win_rate', 0.0)*100:.1f}%**" if 'ai_win_rate' in d else "-"
+        report_md.append(f"| {p} | {d['win_rate']*100:.1f}% | {ai_str} | {d['avg_ret']*100:+.2f}% | {d['profit_factor']:.2f} | {d['sharpe']:.2f} | {d['avg_win_mae']*100:.1f}% | {d['total_trades']} |")
     
     if factor_ic_report:
         report_md.append("\n## 🧬 因子动物园 Rank IC 淘汰赛排行榜 (Top 10)\n| 因子特征 | 均值 IC | T-Statistic (绝对值) | 状态 |\n|:---|:---:|:---:|:---:|")
@@ -1290,7 +1292,13 @@ def run_backtest_engine() -> None:
         except Exception as e: logger.error(f"⚠️ 缓冲区落盘失败: {e}")
 
     with open(Config.REPORT_FILE, 'w', encoding='utf-8') as f: f.write('\n'.join(report_md))
-    send_alert("策略终极回测战报 (代谢进化版)", "\n".join(["### 📊 **机构级回测报表 (含代谢淘汰赛)**"] + [f"- **{p}:** 原始胜率 {d['win_rate']*100:.1f}%{f' | ⚡代谢演化过滤: **{d.get('ai_win_rate', 0.0)*100:.1f}%**' if 'ai_win_rate' in d else ''} | 盈亏比 {d['profit_factor']:.2f}" for p, d in res.items()]))
+    
+    # 🚀 坚守防线：处理第二个战报推送中的嵌套漏洞
+    alert_lines = ["### 📊 **机构级回测报表 (含代谢淘汰赛)**"]
+    for p, d in res.items():
+        ai_text = f" | ⚡代谢演化过滤: **{d.get('ai_win_rate', 0.0)*100:.1f}%**" if 'ai_win_rate' in d else ""
+        alert_lines.append(f"- **{p}:** 原始胜率 {d['win_rate']*100:.1f}%{ai_text} | 盈亏比 {d['profit_factor']:.2f}")
+    send_alert("策略终极回测战报 (代谢进化版)", "\n".join(alert_lines))
 
 # 🛡️ 恢复：合成数据压测引擎与辅助函数
 def _decompose_and_perturb(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
