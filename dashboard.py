@@ -59,44 +59,40 @@ def main():
     with col1:
         st.metric(label="当前右脑版本 (Version)", value=stats_data.get("model_version", "v0_baseline"))
     with col2:
-        st.metric(label="全局交易胜率 (Win Rate)", value=f"{stats_data.get('overall_win_rate', 0.0):.2%}")
+        t3_stats = stats_data.get("overall", {}).get("T+3", {})
+        st.metric(label="T+3 原始胜率 (Win Rate)", value=f"{t3_stats.get('win_rate', 0.0):.2%}")
     with col3:
-        st.metric(label="累计 PnL 异动", value=f"${stats_data.get('cumulative_pnl', 0.0):.2f}")
+        st.metric(label="T+3 盈亏比 (Profit Factor)", value=f"{t3_stats.get('profit_factor', 0.0):.2f}")
     with col4:
-        st.metric(label="最后代谢时间 (Last Update)", value=stats_data.get("last_updated", "N/A")[:10] if stats_data.get("last_updated") else "N/A")
+        st.metric(label="AI 元学习胜率过滤", value=f"{t3_stats.get('ai_win_rate', 0.0):.2%}" if 'ai_win_rate' in t3_stats else "N/A")
 
     st.divider()
 
     # --- 模块二：近期交易截面 (TCA Tracker) ---
-    st.subheader("📊 近期交易截面追踪 (TCA)")
+    st.subheader("📊 近期交易截面追踪 (TCA 滑点监控)")
     
     if not tca_df.empty:
-        # 将 timestamp 转为 datetime 以便展示
         if 'timestamp' in tca_df.columns:
             tca_df['timestamp'] = pd.to_datetime(tca_df['timestamp']).dt.strftime('%Y-%m-%d %H:%M')
             
-        # 优化展示列
-        display_cols = [c for c in ['timestamp', 'ticker', 'signal', 'price', 'ai_prob', 'confidence', 'latency_ms'] if c in tca_df.columns]
+        display_cols = [c for c in ['timestamp', 'client_oid', 'symbol', 'side', 'qty', 'arrival_price', 'execution_price', 'slippage_bps'] if c in tca_df.columns]
         
-        # 使用 Streamlit 原生的高亮 DataFrame 展示
         st.dataframe(
-            tca_df[display_cols].sort_index(ascending=False).head(20), # 只看最近 20 条
+            tca_df[display_cols].sort_index(ascending=False).head(20), 
             use_container_width=True,
             hide_index=True
         )
         
-        # 简单绘制 AI 概率分布直方图
-        if 'ai_prob' in tca_df.columns:
-            st.markdown("#### AI 胜率判定分布云")
-            chart = alt.Chart(tca_df).mark_bar().encode(
-                x=alt.X('ai_prob:Q', bin=alt.Bin(maxbins=20), title='AI 预判胜率 (Probability)'),
-                y=alt.Y('count()', title='样本数量 (Count)'),
-                color=alt.Color('signal:N', scale=alt.Scale(domain=['BUY', 'SELL', 'HOLD'], range=['#00C853', '#D50000', '#757575']))
+        if 'slippage_bps' in tca_df.columns:
+            st.markdown("#### 实盘执行滑点分布 (Slippage BPS)")
+            chart = alt.Chart(tca_df.dropna(subset=['slippage_bps'])).mark_bar().encode(
+                x=alt.X('slippage_bps:Q', bin=alt.Bin(maxbins=30), title='滑点基点 (BPS)'),
+                y=alt.Y('count()', title='笔数'),
+                color=alt.Color('side:N', scale=alt.Scale(domain=['BUY', 'SELL'], range=['#00C853', '#D50000']))
             ).properties(height=300)
             st.altair_chart(chart, use_container_width=True)
-
     else:
-        st.info("尚未记录到任何交易执行截面数据 (TCA)。")
+        st.info("尚未记录到任何网关交易执行截面数据 (TCA)。")
 
 if __name__ == "__main__":
     main()
