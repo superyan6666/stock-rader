@@ -1,171 +1,22 @@
-name: Tickeron Pro AI Bot
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -37,7 +37,8 @@
+         run: |
+           # 依赖于甲骨文服务器全局安装的 flake8
+           flake8 quant_engine.py quant_transformer.py --count --select=E9,F63,F7,F82 --show-source --statistics
++          # 安装全息指挥仓依赖
++          pip install streamlit altair
 
-run-name: 🤖 Quant Engine 运行状态 - ${{ github.event.inputs.run_mode || '自动调度 (Schedule)' }}
-
-on:
-  schedule:
-    # 🚀 算力全量聚焦：矩阵每天仅 1 次。
-    # ⚠️ 响应夏冬令时陷阱：UTC 20:45 = 美东夏令时(EDT) 16:45 (盘后) / 美东冬令时(EST) 15:45 (尾盘)
-    - cron: '45 20 * * 1-5'   
-    - cron: '0 23 * * 5'               # backtest 周五深夜
-  workflow_dispatch:
-    inputs:
-      run_mode:
-        description: '选择运行模式'
-        required: true
-        default: 'test'
-        type: choice
-        options:
-          - test
-          - matrix
-          - backtest
-
-concurrency:
-  group: bot-running-group
-  cancel-in-progress: true
-
-jobs:
-  run-bot:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write     
-    # 放宽超时红线，给 CPU 深度学习代谢与全量回测留足时间
-    timeout-minutes: 120  
-      
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 设置 Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.9'
-
-      - name: 缓存 pip 依赖
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-quantbot
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      # 🚀 数据基底保护
-      - name: 📁 初始化数据基底目录
-        run: mkdir -p .quantbot_data/archive
-
-      # 🚀 使用 run_number 实现滚动增量拉取
-      - name: 🗄️ 恢复历史行情数据与 AI 权重缓存 (Restore)
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            .quantbot_data/*.pkl
-            .quantbot_data/archive/
-            .quantbot_data/tickers_cache.json
-            .quantbot_data/transformer_production.pth
-          key: quantbot-market-data-${{ runner.os }}-${{ github.run_number }}
-          restore-keys: |
-            quantbot-market-data-${{ runner.os }}-
-
-      - name: 安装组件
-        run: |
-          pip install -r requirements.txt
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-      # 🚀 修复点 1：对齐全新的代码检查目标
-      - name: 🔍 代码质量检查 (Linting)
-        run: |
-          flake8 quant_engine.py quant_transformer.py --count --select=E9,F63,F7,F82 --show-source --statistics
-
-      # 🚀 修复点 2：对齐单体引擎的测谎仪入口
-      - name: 🛡️ 核心引擎测谎仪 (Unit Tests)
-        run: |
-          echo "启动物理边界与逻辑漂移测试..."
-          python quant_engine.py test
-
-      # 🚀 修复点 3：对齐单体引擎的执行入口
-      - name: ⚙️ 执行主脑引擎 (Data / Inference / Backtest)
-        env:
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            MODE="${{ github.event.inputs.run_mode }}"
-          elif [[ "${{ github.event_name }}" == "schedule" ]]; then
-            UTC_H=$(date -u +%-H)
-            UTC_D=$(date -u +%-u)
-            if [[ "$UTC_D" == "5" && "$UTC_H" == "23" ]]; then
-              MODE="backtest"
-            else
-              MODE="matrix"
-            fi
-          fi
-          
-          echo "RUN_MODE=$MODE" >> $GITHUB_ENV
-          if [[ "$MODE" != "test" ]]; then
-             python quant_engine.py $MODE
-          fi
-
-      # 🚀 修复点 4：指向新的独立右脑训练触发器
-      - name: 🧠 触发深度神经代谢 (MLOps Training)
-        if: env.RUN_MODE == 'backtest'
-        id: training
-        continue-on-error: true  
-        env:
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          echo "启动 Transformer 右脑增量训练..."
-          
-          set +e
-          python quant_transformer.py
-          TRAIN_EXIT=$?
-          set -e
-          
-          case $TRAIN_EXIT in
-            0) echo "::notice title=MLOps 换代成功::隐空间权重已进化，准备接管下周实盘流。" ;;
-            2) echo "::warning title=MLOps 训练中断::样本不足，神经代谢节点已安全跳过本次更新。" ;;
-            3) echo "::warning title=MLOps 冠军拦截::新模型未能击败线上模型，已被物理销毁，保留旧权重。" ;;
-            *) echo "::error title=MLOps 训练崩溃::神经代谢中枢发生异常 (Exit Code: $TRAIN_EXIT)，请排查！" && exit 1 ;;
-          esac
-
-      # 🚀 修复点 5：对齐最新版的报告存放路径 (.quantbot_data 内部)
-      - name: 📦 上传核心阵列制品 (Artifacts)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: quantbot-core-artifacts
-          path: |
-            .quantbot_data/transformer_production.pth
-            .quantbot_data/tca_history.jsonl
-            .quantbot_data/strategy_stats.json
-            .quantbot_data/backtest_report.md
-          retention-days: 30
-
-      - name: 🚨 崩溃告警
-        if: failure()
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          if [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=🚨 *Quant Engine 严重崩溃*！测试未通过或流水线异常，请立即检查 Actions 日志。" \
-              --data-urlencode "parse_mode=Markdown"
-          fi
-
-      # 去除了战报的 Git 自动提交。因为所有统计结果已收纳在 Artifacts 和 Cache 中，保持 Git 代码库绝对干净。
-
-      # 🚀 增量入库：利用 GHA 底层 LRU 淘汰机制，实现完美的滚动缓存池
-      - name: 💾 增量保存行情数据与 AI 权重缓存 (Save-Always)
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            .quantbot_data/*.pkl
-            .quantbot_data/archive/
-            .quantbot_data/tickers_cache.json
-            .quantbot_data/transformer_production.pth
-          key: quantbot-market-data-${{ runner.os }}-${{ github.run_number }}
+       - name: 🛡️ 核心引擎测谎仪 (Unit Tests)
+         run: |
+@@ -99,3 +100,10 @@
+               --data-urlencode "text=🚨 *Quant Engine 严重崩溃*！测试未通过或流水线异常，请立即检查 Actions 日志。" \
+               --data-urlencode "parse_mode=Markdown"
+           fi
++
++      - name: 🌐 激活全息指挥仓 (Web Dashboard)
++        if: always()
++        run: |
++          echo "检测 Dashboard 进程..."
++          # 如果没运行就后台启动它，如果已经在运行就忽略
++          pgrep streamlit || (nohup streamlit run dashboard.py --server.port 8501 --server.address 0.0.0.1 > dashboard.log 2>&1 &)
