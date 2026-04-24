@@ -688,6 +688,9 @@ def _robust_hurst(close_prices: np.ndarray, min_window=30, n_bootstrap=100) -> T
     return h_median, h_iqr, is_reliable
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    # ✅ 修复：显式深拷贝隔离，切断对上游 xs() 视图的原地修改，防止底层数据污染
+    df = df.copy()
+    
     df = df.sort_index()
     df['Close'], df['Volume'] = df['Close'].ffill(), df['Volume'].ffill()
     df['Open'], df['High'], df['Low'] = df['Open'].ffill(), df['High'].ffill(), df['Low'].ffill()
@@ -1213,8 +1216,17 @@ def _prepare_universe_data(ctx: MarketContext) -> Tuple[List[dict], dict]:
 
     logger.info(f"⚡ 启动多进程 CPU 矩阵运算，跨进程并行调度核心数: {pool_kwargs['max_workers']} ...")
     with concurrent.futures.ProcessPoolExecutor(**pool_kwargs) as cpu_executor:
-        for res in cpu_executor.map(_cpu_calc_worker, io_results):
-            if res: prepared_data.append(res)
+        # ✅ 修复: 移除脆弱的 map，改用 submit + as_completed 实现单节点崩溃熔断隔离
+        future_map = {cpu_executor.submit(_cpu_calc_worker, payload): payload['sym'] for payload in io_results}
+        for future in concurrent.futures.as_completed(future_map, timeout=300.0):
+            sym = future_map[future]
+            try:
+                res = future.result(timeout=60.0)
+                if res: prepared_data.append(res)
+            except concurrent.futures.TimeoutError:
+                logger.warning(f"⚠️ CPU Worker {sym} 计算超时，已被系统安全跳过。")
+            except Exception as e:
+                logger.warning(f"⚠️ CPU Worker {sym} 遭遇崩溃 ({type(e).__name__}: {e})，已隔离。")
 
     return prepared_data, {d['sym']: d['close_history'] for d in prepared_data}
 
@@ -1842,11 +1854,20 @@ def run_synthetic_stress_test() -> None:
         pool_kwargs["mp_context"] = ctx_mp
 
     with concurrent.futures.ProcessPoolExecutor(**pool_kwargs) as cpu_executor:
-        for res in cpu_executor.map(_stress_test_cpu_worker, io_results):
-            for env_name in metrics: 
-                metrics[env_name]['trades'] += res[env_name]['trades']
-                metrics[env_name]['wins'] += res[env_name]['wins']
-                metrics[env_name]['ret_sum'] += res[env_name]['ret_sum']
+        # ✅ 修复: 移除脆弱的 map，改用 submit + as_completed 实现单节点崩溃熔断隔离
+        future_map = {cpu_executor.submit(_stress_test_cpu_worker, payload): payload['sym'] for payload in io_results}
+        for future in concurrent.futures.as_completed(future_map, timeout=300.0):
+            sym = future_map[future]
+            try:
+                res = future.result(timeout=60.0)
+                for env_name in metrics: 
+                    metrics[env_name]['trades'] += res[env_name]['trades']
+                    metrics[env_name]['wins'] += res[env_name]['wins']
+                    metrics[env_name]['ret_sum'] += res[env_name]['ret_sum']
+            except concurrent.futures.TimeoutError:
+                logger.warning(f"⚠️ CPU 压测 Worker {sym} 计算超时，已跳过。")
+            except Exception as e:
+                logger.warning(f"⚠️ CPU 压测 Worker {sym} 遭遇崩溃 ({type(e).__name__}: {e})，已隔离。")
 
     def _fmt(m): return f"交易笔数: {m['trades']} | 胜率: {(m['wins']/m['trades'])*100 if m['trades']>0 else 0:.1f}% | 单笔均利: {(m['ret_sum']/m['trades'])*100 if m['trades']>0 else 0:.2f}%"
     orig, phase, noise = metrics['Original'], metrics['Phase_Chaos'], metrics['Noise_Explosion']
