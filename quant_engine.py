@@ -27,6 +27,12 @@ from sklearn.preprocessing import RobustScaler
 from dataclasses import dataclass, field
 
 try:
+    import pyarrow.feather as feather
+    FEATHER_AVAILABLE = True
+except ImportError:
+    FEATHER_AVAILABLE = False
+
+try:
     from quant_transformer import QuantAlphaTransformer, train_alpha_model
     TRANSFORMER_AVAILABLE = True
 except ImportError:
@@ -200,7 +206,36 @@ class ComplexFeatures:
     beta_60d: float; tlt_corr: float; dxy_corr: float; vrp: float; rs_20: float; pure_alpha: float 
 
 # ================= 3. 核心计算与数据拉取 =================
-_KLINE_CACHE = {}; _KLINE_LOCK = threading.Lock()
+
+class SharedDFCache:
+    """基于内存映射的零拷贝DataFrame缓存，多进程可直接读取 (破解 IPC 瓶颈)"""
+    def __init__(self, cache_dir: str = "/dev/shm/quantbot" if os.path.exists("/dev/shm") else ".quantbot_data/shm"):
+        os.makedirs(cache_dir, exist_ok=True)
+        self.cache_dir = cache_dir
+
+    def get(self, key: str) -> Optional[pd.DataFrame]:
+        if not FEATHER_AVAILABLE: return None
+        path = os.path.join(self.cache_dir, f"{key}.feather")
+        if os.path.exists(path):
+            try:
+                # feather 支持零拷贝读取，耗时极低，完美适配多进程共享
+                return feather.read_feather(path, memory_map=True)
+            except Exception as e:
+                logger.debug(f"Cache read error for {key}: {e}")
+        return None
+
+    def set(self, key: str, df: pd.DataFrame):
+        if not FEATHER_AVAILABLE: return
+        path = os.path.join(self.cache_dir, f"{key}.feather")
+        tmp = path + ".tmp"
+        try:
+            feather.write_feather(df, tmp)
+            os.replace(tmp, path)  # 原子级写入，防多进程竞态
+        except Exception as e:
+            logger.debug(f"Cache write error for {key}: {e}")
+
+_SHARED_CACHE = SharedDFCache()
+
 _DAILY_EXT_CACHE = {}; _DAILY_EXT_LOCK = threading.Lock()
 _ALT_DATA_CACHE = {}; _ALT_DATA_LOCK = threading.Lock()
 
@@ -212,9 +247,13 @@ def check_macd_cross(curr: pd.Series, prev: pd.Series) -> bool:
     return prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']
 
 def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 5, fast_mode: bool = False) -> pd.DataFrame:
-    cache_key = f"{symbol}_{interval}"
-    with _KLINE_LOCK:
-        if cache_key in _KLINE_CACHE: return _KLINE_CACHE[cache_key].copy()
+    cache_key = f"{symbol}_{interval}_{period}"
+    
+    # 优先从跨进程共享内存提取数据，实现零拷贝
+    cached_df = _SHARED_CACHE.get(cache_key)
+    if cached_df is not None and not cached_df.empty:
+        return cached_df.copy()
+        
     df = pd.DataFrame()
     for attempt in range(retries):
         try:
@@ -223,7 +262,7 @@ def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retr
             if not new_df.empty:
                 new_df.index = pd.to_datetime(new_df.index, utc=True)
                 df = new_df[~new_df.index.duplicated(keep='last')]
-                with _KLINE_LOCK: _KLINE_CACHE[cache_key] = df.copy()
+                _SHARED_CACHE.set(cache_key, df) # 写入共享内存
                 return df
         except Exception:
             time.sleep(2 + attempt * 2)
