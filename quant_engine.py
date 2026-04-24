@@ -16,6 +16,8 @@ import uuid
 import scipy.stats as stats
 import concurrent.futures
 import threading
+import multiprocessing
+import copy
 from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
@@ -879,35 +881,111 @@ def _build_market_context() -> MarketContext:
     regime, regime_desc, _, _, _ = get_market_regime()
     return MarketContext(regime=regime, regime_desc=regime_desc, w_mul=1.0, xai_weights={}, vix_current=vix, vix_desc=vix_desc, vix_scalar=1.0, max_risk=0.015, macro_gravity=False, is_credit_risk_high=False, vix_inv=False, qqq_df=qqq_df, macro_data={}, total_market_exposure=1.0, health_score=1.0, pain_warning="", dynamic_min_score=8.0)
 
+# ================= 🚀 两阶段并行引擎工作函数 (顶层定义防 Pickling 崩溃) =================
+def _io_fetch_worker(sym: str) -> Optional[dict]:
+    """阶段1: 纯 IO 拉取工作节点"""
+    try:
+        df = safe_get_history(sym, "1y", "1d", fast_mode=True)
+        if len(df) < 60: return None
+        sentiment = safe_get_sentiment_data(sym)
+        alt_data = safe_get_alt_data(sym)
+        return {'sym': sym, 'df': df, 'sentiment': sentiment, 'alt_data': alt_data}
+    except Exception as e:
+        logger.debug(f"IO Fetch error for {sym}: {e}")
+        return None
+
+def _cpu_calc_worker(payload: dict) -> Optional[dict]:
+    """阶段2: 纯 CPU 计算工作节点"""
+    try:
+        sym = payload['sym']
+        df = payload['df']
+        ctx = payload['ctx']
+        
+        df_ind = calculate_indicators(df)
+        stock = StockData(sym, df_ind, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), df_ind.iloc[-1], df_ind.iloc[-2], False, 0.0)
+        cf = _extract_complex_features(stock, ctx)
+        alt = AltData(*payload['sentiment'][:4], *payload['alt_data'][:3], 0.0)
+        seq = _get_transformer_seq(df_ind)
+        
+        return {
+            'sym': sym, 'stock': stock, 'alt': alt, 'cf': cf, 'seq': seq, 
+            'curr': df_ind.iloc[-1], 'prev': df_ind.iloc[-2], 'news': "", 
+            'close_history': df['Close'].tail(60).values
+        }
+    except Exception as e:
+        return None
+
+def _stress_test_io_worker(sym: str) -> Optional[dict]:
+    """压测阶段1: 历史 IO 拉取"""
+    df = safe_get_history(sym, "5y", "1d", fast_mode=True)
+    if len(df) < 500: return None
+    return {'sym': sym, 'df': df}
+
+def _stress_test_cpu_worker(payload: dict) -> dict:
+    """压测阶段2: 纯 CPU 并行扰动与回测"""
+    sym, df_raw, ctx = payload['sym'], payload['df'], payload['ctx']
+    df_phase, df_noise = _decompose_and_perturb(df_raw)
+    local_metrics = {'Original': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}, 'Phase_Chaos': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}, 'Noise_Explosion': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}}
+    
+    for env_name, df_env in {'Original': df_raw, 'Phase_Chaos': df_phase, 'Noise_Explosion': df_noise}.items():
+        try:
+            df_w = df_env.resample('W').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
+            df_m = df_env.resample('ME').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
+            df_ind = calculate_indicators(df_env)
+            
+            for i in range(len(df_ind) - 252, len(df_ind) - 5):
+                curr, prev = df_ind.iloc[i], df_ind.iloc[i-1]
+                if (curr['ATR'] / curr['Close'] > 0.15) or (pd.notna(curr['SMA_200']) and curr['Close'] < curr['SMA_200'] and curr['SMA_50'] < curr['SMA_200']): continue
+                is_vol = (curr['Volume'] / curr['Vol_MA20'] > 1.5) and (curr['Close'] > curr['Open'])
+                swing_high_10 = df_ind['High'].iloc[i-10:i].max() if i >= 10 else curr['High']
+                stock_data = StockData(sym, df_ind.iloc[:i+1], df_w, df_m, pd.DataFrame(), curr, prev, is_vol, swing_high_10)
+                
+                if _evaluate_omni_matrix(stock_data, ctx, _extract_complex_features(stock_data, ctx), AltData(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))[0] >= Config.Params.MIN_SCORE_THRESHOLD:
+                    ret = (df_ind['Close'].iloc[i+4] - df_ind['Open'].iloc[i+1]) / df_ind['Open'].iloc[i+1]
+                    local_metrics[env_name]['trades'] += 1
+                    local_metrics[env_name]['ret_sum'] += ret
+                    if ret > 0: local_metrics[env_name]['wins'] += 1
+        except Exception: pass
+    return local_metrics
+
+# ================= 数据预备引擎 (升级版: IO/CPU 解锁) =================
 def _prepare_universe_data(ctx: MarketContext) -> Tuple[List[dict], dict]:
     prepared_data = []
     symbols = get_filtered_watchlist(max_stocks=30)
-    logger.info(f"🚀 启动高并发特征抽取引擎，共 {len(symbols)} 个标的，开启网络防抖与死锁熔断保护...")
+    logger.info(f"🚀 启动架构升级版: IO与CPU分离的两阶段并行引擎 (解除GIL枷锁)...")
     
-    def _process_single_stock(sym: str) -> Optional[dict]:
-        try:
-            df = safe_get_history(sym, "1y", "1d", fast_mode=True)
-            if len(df) < 60: return None
-            df_ind = calculate_indicators(df)
-            stock = StockData(sym, df_ind, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), df_ind.iloc[-1], df_ind.iloc[-2], False, 0.0)
-            cf = _extract_complex_features(stock, ctx)
-            alt = AltData(*safe_get_sentiment_data(sym)[:4], *safe_get_alt_data(sym)[:3], 0.0)
-            return {'sym': sym, 'stock': stock, 'alt': alt, 'cf': cf, 'seq': _get_transformer_seq(df_ind), 'curr': df_ind.iloc[-1], 'prev': df_ind.iloc[-2], 'news': "", 'close_history': df['Close'].tail(60).values}
-        except Exception as e:
-            return None
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=Config.Params.MAX_WORKERS * 2) as executor:
-        future_to_sym = {executor.submit(_process_single_stock, sym): sym for sym in symbols}
-        # 设置总超时与单任务等待，防止整个 Matrix 陷入网络死锁
-        for future in concurrent.futures.as_completed(future_to_sym, timeout=180.0):
+    # --- 阶段 1: 极高并发异步 IO 拉取 ---
+    io_results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as io_executor:
+        future_to_sym = {io_executor.submit(_io_fetch_worker, sym): sym for sym in symbols}
+        for future in concurrent.futures.as_completed(future_to_sym, timeout=120.0):
             sym = future_to_sym[future]
             try:
-                res = future.result(timeout=45.0) 
-                if res: prepared_data.append(res)
+                res = future.result(timeout=30.0) 
+                if res: io_results.append(res)
             except concurrent.futures.TimeoutError:
                 logger.warning(f"⚠️ [防抖熔断] 标的 {sym} API 响应死锁 (处理超时)，已被沙盒强行隔离剔除！")
             except Exception as e:
                 logger.warning(f"⚠️ [数据异常] 标的 {sym} 获取失败，已忽略: {e}")
+
+    if not io_results: return [], {}
+
+    # 剔除 PyTorch 模型等不可序列化对象，只保留基础结构
+    ctx_lite = copy.copy(ctx)
+    ctx_lite.transformer_model = None
+    for res in io_results:
+        res['ctx'] = ctx_lite
+        
+    # --- 阶段 2: 多进程池纯 CPU 计算 (破解 GIL) ---
+    ctx_mp = multiprocessing.get_context("forkserver") if hasattr(multiprocessing, "get_context") else None
+    pool_kwargs = {"max_workers": min(4, os.cpu_count() or 1)}
+    if sys.platform != "win32" and ctx_mp:
+        pool_kwargs["mp_context"] = ctx_mp
+
+    logger.info(f"⚡ 启动多进程 CPU 矩阵运算，跨进程并行调度核心数: {pool_kwargs['max_workers']} ...")
+    with concurrent.futures.ProcessPoolExecutor(**pool_kwargs) as cpu_executor:
+        for res in cpu_executor.map(_cpu_calc_worker, io_results):
+            if res: prepared_data.append(res)
 
     return prepared_data, {d['sym']: d['close_history'] for d in prepared_data}
 
@@ -1459,35 +1537,37 @@ def run_synthetic_stress_test() -> None:
     metrics = {'Original': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}, 'Phase_Chaos': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}, 'Noise_Explosion': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}}
     market_ctx = MarketContext(regime="bull", regime_desc="", w_mul=1.0, xai_weights=xai_weights, vix_current=18.0, vix_desc="", vix_scalar=1.0, max_risk=0.015, macro_gravity=False, is_credit_risk_high=False, vix_inv=False, qqq_df=pd.DataFrame(), macro_data={'spy': pd.DataFrame(), 'tlt': pd.DataFrame(), 'dxy': pd.DataFrame()}, total_market_exposure=1.0, health_score=1.0, pain_warning="", dynamic_min_score=8.0)
     
-    def _stress_test_worker(sym):
-        df_raw = safe_get_history(sym, "5y", "1d", fast_mode=True)
-        if len(df_raw) < 500: return None
-        df_phase, df_noise = _decompose_and_perturb(df_raw)
-        
-        local_metrics = {'Original': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}, 'Phase_Chaos': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}, 'Noise_Explosion': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}}
-        
-        for env_name, df_env in {'Original': df_raw, 'Phase_Chaos': df_phase, 'Noise_Explosion': df_noise}.items():
+    # --- 压测阶段 1: 异步 IO 拉取 ---
+    io_results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as io_executor:
+        future_to_sym = {io_executor.submit(_stress_test_io_worker, sym): sym for sym in get_filtered_watchlist(max_stocks=30)[:20]}
+        for future in concurrent.futures.as_completed(future_to_sym, timeout=120.0):
             try:
-                df_w, df_m = df_env.resample('W').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna(), df_env.resample('M').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
-                df_ind = calculate_indicators(df_env)
-                
-                for i in range(len(df_ind) - 252, len(df_ind) - 5):
-                    curr, prev = df_ind.iloc[i], df_ind.iloc[i-1]
-                    if (curr['ATR'] / curr['Close'] > 0.15) or (pd.notna(curr['SMA_200']) and curr['Close'] < curr['SMA_200'] and curr['SMA_50'] < curr['SMA_200']): continue
-                    is_vol, swing_high_10 = (curr['Volume'] / curr['Vol_MA20'] > 1.5) and (curr['Close'] > curr['Open']), df_ind['High'].iloc[i-10:i].max() if i >= 10 else curr['High']
-                    stock_data = StockData(sym, df_ind.iloc[:i+1], df_w, df_m, pd.DataFrame(), curr, prev, is_vol, swing_high_10)
-                    
-                    if _evaluate_omni_matrix(stock_data, market_ctx, _extract_complex_features(stock_data, market_ctx), AltData(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))[0] >= Config.Params.MIN_SCORE_THRESHOLD:
-                        ret = (df_ind['Close'].iloc[i+4] - df_ind['Open'].iloc[i+1]) / df_ind['Open'].iloc[i+1]
-                        local_metrics[env_name]['trades'] += 1
-                        local_metrics[env_name]['ret_sum'] += ret
-                        if ret > 0: local_metrics[env_name]['wins'] += 1
+                res = future.result(timeout=30.0)
+                if res: io_results.append(res)
             except Exception: pass
-        return local_metrics
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=Config.Params.MAX_WORKERS) as executor:
-        for res in [future.result() for future in concurrent.futures.as_completed([executor.submit(_stress_test_worker, sym) for sym in get_filtered_watchlist(max_stocks=30)[:20]]) if future.result()]:
-            for env_name in metrics: metrics[env_name]['trades'] += res[env_name]['trades']; metrics[env_name]['wins'] += res[env_name]['wins']; metrics[env_name]['ret_sum'] += res[env_name]['ret_sum']
+    if not io_results:
+        logger.warning("压测样本历史数据获取失败。")
+        return
+
+    # 剔除无法序列化的模型对象
+    ctx_lite = copy.copy(market_ctx)
+    ctx_lite.transformer_model = None
+    for res in io_results: res['ctx'] = ctx_lite
+
+    # --- 压测阶段 2: 纯 CPU 计算多进程池 ---
+    ctx_mp = multiprocessing.get_context("forkserver") if hasattr(multiprocessing, "get_context") else None
+    pool_kwargs = {"max_workers": min(4, os.cpu_count() or 1)}
+    if sys.platform != "win32" and ctx_mp:
+        pool_kwargs["mp_context"] = ctx_mp
+
+    with concurrent.futures.ProcessPoolExecutor(**pool_kwargs) as cpu_executor:
+        for res in cpu_executor.map(_stress_test_cpu_worker, io_results):
+            for env_name in metrics: 
+                metrics[env_name]['trades'] += res[env_name]['trades']
+                metrics[env_name]['wins'] += res[env_name]['wins']
+                metrics[env_name]['ret_sum'] += res[env_name]['ret_sum']
 
     def _fmt(m): return f"交易笔数: {m['trades']} | 胜率: {(m['wins']/m['trades'])*100 if m['trades']>0 else 0:.1f}% | 单笔均利: {(m['ret_sum']/m['trades'])*100 if m['trades']>0 else 0:.2f}%"
     orig, phase, noise = metrics['Original'], metrics['Phase_Chaos'], metrics['Noise_Explosion']
