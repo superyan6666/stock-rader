@@ -190,23 +190,22 @@ class MarketContext:
 
 @dataclass
 class MarketContextLite:
-    """可安全跨进程序列化的纯值上下文（零 DataFrame，零锁对象）"""
+    """可安全跨进程序列化的纯值上下文（传递轻量级 Series，完美闭环宏观指标计算）"""
     regime: str; w_mul: float; xai_weights: dict; vix_current: float
     macro_gravity: bool; health_score: float; dynamic_min_score: float
-    qqq_ret_20d: float; spy_vol_20d: float
+    qqq_close: pd.Series; spy_close: pd.Series; tlt_close: pd.Series; dxy_close: pd.Series
 
 def _build_ctx_lite(ctx: MarketContext) -> MarketContextLite:
     """从完整 ctx 蒸馏出可序列化的轻量版本"""
-    qqq_ret_20d, spy_vol_20d = 0.0, 15.0
-    if not ctx.qqq_df.empty and len(ctx.qqq_df) >= 20:
-        qqq_ret_20d = float((ctx.qqq_df['Close'].iloc[-1] / ctx.qqq_df['Close'].iloc[-20]) - 1.0)
-        spy_ret = ctx.qqq_df['Close'].pct_change().dropna()
-        spy_vol_20d = float(spy_ret.iloc[-20:].std() * np.sqrt(252) * 100)
+    def _safe_close(df): return df['Close'] if not df.empty else pd.Series(dtype=float)
     return MarketContextLite(
         regime=ctx.regime, w_mul=ctx.w_mul, xai_weights=ctx.xai_weights,
         vix_current=ctx.vix_current, macro_gravity=ctx.macro_gravity,
-        qqq_ret_20d=qqq_ret_20d, spy_vol_20d=spy_vol_20d,
-        health_score=ctx.health_score, dynamic_min_score=ctx.dynamic_min_score
+        health_score=ctx.health_score, dynamic_min_score=ctx.dynamic_min_score,
+        qqq_close=_safe_close(ctx.qqq_df),
+        spy_close=_safe_close(ctx.macro_data.get('spy', pd.DataFrame())),
+        tlt_close=_safe_close(ctx.macro_data.get('tlt', pd.DataFrame())),
+        dxy_close=_safe_close(ctx.macro_data.get('dxy', pd.DataFrame()))
     )
 
 @dataclass
@@ -753,43 +752,40 @@ def _extract_complex_features(stock: StockData, ctx: Any) -> ComplexFeatures:
         if len(rsi_60m) >= 2 and rsi_60m.iloc[-1] > rsi_60m.iloc[-2] and rsi_60m.iloc[-2] < 40: rsi_60m_bounce = 1.0
             
     stock_ret = stock.df['Close'].pct_change().fillna(0)
-    beta_60d = 1.0
+    beta_60d, spy_realized_vol = 1.0, 15.0 
     tlt_corr, dxy_corr = 0.0, 0.0
     rs_20, pure_alpha = 0.0, 0.0
-    
-    # 动态适配 MarketContext (主进程) 与 MarketContextLite (子进程)
-    spy_realized_vol = getattr(ctx, 'spy_vol_20d', 15.0)
 
-    if hasattr(ctx, 'qqq_ret_20d') and len(stock.df) >= 20: 
-        # Lite Context 模式 (IPC 子进程极速计算)
-        try:
-            stock_ret_20d = float((stock.df['Close'].iloc[-1] / stock.df['Close'].iloc[-20]) - 1.0)
-            rs_20 = float((stock_ret_20d + 1.0) / (ctx.qqq_ret_20d + 1.0))
-        except Exception: pass
-    elif hasattr(ctx, 'qqq_df') and not ctx.qqq_df.empty: 
-        # Original Context 模式 (含完整 DataFrame 的精确计算)
-        m_df = pd.merge(stock.df[['Close']], ctx.qqq_df[['Close']], left_index=True, right_index=True, how='inner')
+    # 🚀 精准提取，统一兼容完整的 MarketContext 与序列化后的 MarketContextLite
+    is_lite = hasattr(ctx, 'spy_close')
+    qqq_c = ctx.qqq_close if is_lite else (ctx.qqq_df['Close'] if not ctx.qqq_df.empty else pd.Series(dtype=float))
+    spy_c = ctx.spy_close if is_lite else (ctx.macro_data.get('spy', pd.DataFrame())['Close'] if 'spy' in ctx.macro_data and not ctx.macro_data.get('spy', pd.DataFrame()).empty else pd.Series(dtype=float))
+    tlt_c = ctx.tlt_close if is_lite else (ctx.macro_data.get('tlt', pd.DataFrame())['Close'] if 'tlt' in ctx.macro_data and not ctx.macro_data.get('tlt', pd.DataFrame()).empty else pd.Series(dtype=float))
+    dxy_c = ctx.dxy_close if is_lite else (ctx.macro_data.get('dxy', pd.DataFrame())['Close'] if 'dxy' in ctx.macro_data and not ctx.macro_data.get('dxy', pd.DataFrame()).empty else pd.Series(dtype=float))
+
+    if not qqq_c.empty and len(stock.df) >= 60:
+        m_df = pd.DataFrame({'stock': stock.df['Close'], 'qqq': qqq_c}).dropna()
         if len(m_df) >= 60:
-            qqq_ret = max(m_df['Close_y'].iloc[-1] / m_df['Close_y'].iloc[-20], 0.5)
-            rs_20 = (m_df['Close_x'].iloc[-1] / m_df['Close_x'].iloc[-20]) / qqq_ret
-            ret_stock, ret_qqq = m_df['Close_x'].pct_change().dropna(), m_df['Close_y'].pct_change().dropna()
-            cov_matrix = np.cov(ret_stock.iloc[-60:], ret_qqq.iloc[-60:])
-            beta_local = cov_matrix[0,1] / (cov_matrix[1,1] + 1e-10) if cov_matrix[1,1] > 0 else 1.0
-            pure_alpha = (ret_stock.iloc[-5:].mean() - beta_local * ret_qqq.iloc[-5:].mean()) * 252
-            
-        if 'spy' in ctx.macro_data and not ctx.macro_data['spy'].empty and len(stock_ret) >= 60:
-            spy_ret = ctx.macro_data['spy']['Close'].pct_change().reindex(stock_ret.index).fillna(0)
-            cov_mat = np.cov(stock_ret.iloc[-60:], spy_ret.iloc[-60:])
-            if cov_mat[1,1] > 0: beta_60d = cov_mat[0, 1] / cov_mat[1, 1]
-            spy_realized_vol = spy_ret.iloc[-20:].std() * np.sqrt(252) * 100
-            
-        if 'tlt' in ctx.macro_data and not ctx.macro_data['tlt'].empty and len(stock_ret) >= 90:
-            tlt_ret = ctx.macro_data['tlt']['Close'].pct_change().reindex(stock_ret.index).fillna(0)
-            tlt_corr = stock_ret.iloc[-90:].corr(tlt_ret.iloc[-90:])
-            
-        if 'dxy' in ctx.macro_data and not ctx.macro_data['dxy'].empty and len(stock_ret) >= 20:
-            dxy_ret = ctx.macro_data['dxy']['Close'].pct_change().reindex(stock_ret.index).fillna(0)
-            dxy_corr = stock_ret.iloc[-20:].corr(dxy_ret.iloc[-20:])
+            qqq_ret_20 = max(m_df['qqq'].iloc[-1] / m_df['qqq'].iloc[-20], 0.5)
+            rs_20 = float((m_df['stock'].iloc[-1] / m_df['stock'].iloc[-20]) / qqq_ret_20)
+            ret_s, ret_q = m_df['stock'].pct_change().dropna(), m_df['qqq'].pct_change().dropna()
+            cov_m = np.cov(ret_s.iloc[-60:], ret_q.iloc[-60:])
+            beta_l = cov_m[0,1] / (cov_m[1,1] + 1e-10) if cov_m[1,1] > 0 else 1.0
+            pure_alpha = float((ret_s.iloc[-5:].mean() - beta_l * ret_q.iloc[-5:].mean()) * 252)
+
+    if not spy_c.empty and len(stock_ret) >= 60:
+        spy_ret = spy_c.pct_change().reindex(stock_ret.index).fillna(0)
+        cov_mat = np.cov(stock_ret.iloc[-60:], spy_ret.iloc[-60:])
+        if cov_mat[1,1] > 0: beta_60d = float(cov_mat[0, 1] / cov_mat[1, 1])
+        spy_realized_vol = float(spy_ret.iloc[-20:].std() * np.sqrt(252) * 100)
+
+    if not tlt_c.empty and len(stock_ret) >= 90:
+        tlt_ret = tlt_c.pct_change().reindex(stock_ret.index).fillna(0)
+        tlt_corr = float(stock_ret.iloc[-90:].corr(tlt_ret.iloc[-90:]))
+
+    if not dxy_c.empty and len(stock_ret) >= 20:
+        dxy_ret = dxy_c.pct_change().reindex(stock_ret.index).fillna(0)
+        dxy_corr = float(stock_ret.iloc[-20:].corr(dxy_ret.iloc[-20:]))
         
     return ComplexFeatures(
         weekly_bullish=weekly_bullish, fvg_lower=fvg_lower, fvg_upper=fvg_upper, 
@@ -978,9 +974,21 @@ def _apply_market_filters(curr, prev, sym, base_score, sig, a, b, c):
 
 def _build_market_context() -> MarketContext:
     qqq_df = safe_get_history(Config.INDEX_ETF, "1y", "1d", fast_mode=True)
+    # ✅ 连环 Bug 修复: 在构建完整 Context 时即拉取所有底层宏观数据，防止 macro_data 为空
+    spy_df = safe_get_history("SPY", "1y", "1d", fast_mode=True)
+    tlt_df = safe_get_history("TLT", "1y", "1d", fast_mode=True)
+    dxy_df = safe_get_history("DX-Y.NYB", "1y", "1d", fast_mode=True) # 使用 DX-Y.NYB 适配 Yahoo Finance
+    
     vix, vix_desc = get_vix_level(qqq_df)
     regime, regime_desc, _, _, _ = get_market_regime()
-    return MarketContext(regime=regime, regime_desc=regime_desc, w_mul=1.0, xai_weights={}, vix_current=vix, vix_desc=vix_desc, vix_scalar=1.0, max_risk=0.015, macro_gravity=False, is_credit_risk_high=False, vix_inv=False, qqq_df=qqq_df, macro_data={}, total_market_exposure=1.0, health_score=1.0, pain_warning="", dynamic_min_score=8.0)
+    
+    return MarketContext(
+        regime=regime, regime_desc=regime_desc, w_mul=1.0, xai_weights={}, vix_current=vix, 
+        vix_desc=vix_desc, vix_scalar=1.0, max_risk=0.015, macro_gravity=False, 
+        is_credit_risk_high=False, vix_inv=False, qqq_df=qqq_df, 
+        macro_data={'spy': spy_df, 'tlt': tlt_df, 'dxy': dxy_df}, 
+        total_market_exposure=1.0, health_score=1.0, pain_warning="", dynamic_min_score=8.0
+    )
 
 # ================= 🚀 两阶段并行引擎工作函数 (顶层定义防 Pickling 崩溃) =================
 def _io_fetch_worker(sym: str) -> Optional[dict]:
