@@ -239,10 +239,6 @@ _SHARED_CACHE = SharedDFCache()
 class TokenBucket:
     """令牌桶限速器：精确控制API调用频率，消除不必要等待"""
     def __init__(self, rate: float = 5.0, capacity: float = 10.0):
-        """
-        rate: 每秒补充令牌数 (yfinance 建议 ≤5 req/s)
-        capacity: 桶容量，允许短暂突发
-        """
         self.rate = rate
         self.capacity = capacity
         self._tokens = capacity
@@ -250,7 +246,6 @@ class TokenBucket:
         self._lock = threading.Lock()
 
     def acquire(self, tokens: float = 1.0) -> float:
-        """获取令牌，返回实际等待时间"""
         with self._lock:
             now = time.monotonic()
             elapsed = now - self._last_refill
@@ -520,7 +515,7 @@ def send_alert(title: str, content: str) -> None:
             
         threading.Thread(target=_send_tg, args=(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID, tg_text), daemon=False).start()
 
-# ================= 4. 特 প্রকৌশ =================
+# ================= 4. 特征工程 =================
 def get_vix_level(qqq_df: pd.DataFrame = None) -> Tuple[float, str]:
     df = safe_get_history(Config.VIX_INDEX, period="5d", interval="1d", fast_mode=True)
     vix = df['Close'].ffill().iloc[-1] if not df.empty else 18.0
@@ -1364,71 +1359,93 @@ def run_backtest_engine() -> None:
     stats_period, factor_rets, trades_with_ret, mae_mfe_records = {'T+1': [], 'T+3': [], 'T+5': []}, {}, [], {'T+1': [], 'T+3': [], 'T+5': []}
     ai_filtered_wins, ai_filtered_total, transformer_X, transformer_Y, cached_inds = 0, 0, [], [], {}
     
+    logger.info(f"⚡ 启动全张量 NumPy 向量化回测引擎，解除 Python 级多重循环枷锁...")
+    
+    # 1. 核心数据阵列化 (Vectorized Data Preparation)
+    c_arr, o_arr, h_arr, l_arr = df_c.values, df_o.values, df_h.values, df_l.values
+    max_idx = len(c_arr) - 1
+    
+    # 对齐并提取所有有效 Trade 的降维索引
+    valid_trades = []
     for t in trades:
-        sym, r_dt, initial_sl, tp_price = t['symbol'], t['date'], t.get('sl', 0) if not pd.isna(t.get('sl', 0)) else 0, t.get('tp', float('inf')) if not pd.isna(t.get('tp', float('inf'))) else float('inf')
-        if sym not in df_c.columns or sym not in df_o.columns: continue
-        valid = df_c.index[df_c.index >= r_dt]
-        if len(valid) == 0: continue
+        sym, r_dt = t['symbol'], t['date']
+        if sym in df_c.columns:
+            idx_pos = df_c.index.searchsorted(r_dt)
+            if idx_pos < len(df_c) and df_c.index[idx_pos] >= r_dt:
+                t['_e_idx'] = idx_pos
+                t['_s_col'] = df_c.columns.get_loc(sym)
+                valid_trades.append(t)
+
+    if not valid_trades: return
+    
+    e_indices = np.array([t['_e_idx'] for t in valid_trades])
+    sym_cols = np.array([t['_s_col'] for t in valid_trades])
+    
+    # 2. 向量化入场计算
+    entry_idxs = np.minimum(e_indices + 1, max_idx)
+    entry_opens = o_arr[entry_idxs, sym_cols]
+    prev_closes = c_arr[e_indices, sym_cols]
+    
+    # 布尔掩码剔除无效或停牌数据
+    valid_mask = (entry_opens > 0) & ~np.isnan(entry_opens) & ~np.isnan(prev_closes)
+    e_indices, sym_cols = e_indices[valid_mask], sym_cols[valid_mask]
+    entry_opens, prev_closes = entry_opens[valid_mask], prev_closes[valid_mask]
+    valid_trades = [valid_trades[i] for i in range(len(valid_trades)) if valid_mask[i]]
+    
+    if not valid_trades: return
+
+    # 向量化滑点与成本惩罚
+    gap_up = (entry_opens - prev_closes) / (prev_closes + 1e-10)
+    slippage_array = np.where(gap_up > 0.03, Config.Params.SLIPPAGE * 3, Config.Params.SLIPPAGE)
+    entry_costs = entry_opens * (1 + slippage_array + Config.Params.COMMISSION)
+    
+    # 3. 向量化时间窗口穿透 (T+1, T+3, T+5)
+    for d in [1, 3, 5]:
+        exit_idxs = np.minimum(e_indices + d, max_idx)
         
-        e_idx = df_c.index.get_loc(valid[0])
-        if e_idx + 1 >= len(df_c): continue
-        e_px_raw, prev_c_px = df_o.iloc[e_idx + 1][sym], df_c.iloc[e_idx][sym]
-        if pd.isna(e_px_raw) or e_px_raw <= 0: continue
+        # 提取出场价格与收益
+        exit_closes = c_arr[exit_idxs, sym_cols]
+        exit_revenues = exit_closes * (1 - Config.Params.SLIPPAGE - Config.Params.COMMISSION)
+        returns = (exit_revenues - entry_costs) / (entry_costs + 1e-10) * np.where(gap_up > 0.03, 0.5, 1.0)
         
-        gap_up = (e_px_raw - prev_c_px) / (prev_c_px + 1e-10)
-        entry_cost = e_px_raw * (1 + Config.Params.SLIPPAGE * 3 + Config.Params.COMMISSION) if gap_up > 0.03 else e_px_raw * (1 + Config.Params.SLIPPAGE + Config.Params.COMMISSION)
-        trail_distance = max(e_px_raw * 0.02, e_px_raw - initial_sl) if initial_sl > 0 else e_px_raw * 0.05
+        # 批量计算区间 MFE/MAE (最大高点与最小低点跨度)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            period_h = np.array([np.nanmax(h_arr[e+1:min(e+d+1, max_idx+1), c]) if e+1 <= max_idx else np.nan for e, c in zip(e_indices, sym_cols)])
+            period_l = np.array([np.nanmin(l_arr[e+1:min(e+d+1, max_idx+1), c]) if e+1 <= max_idx else np.nan for e, c in zip(e_indices, sym_cols)])
         
-        for d in [1, 3, 5]:
-            if e_idx + d < len(df_c):
-                exit_revenue, highest_seen_px, dynamic_sl, max_high_during_trade, min_low_during_trade = None, e_px_raw, initial_sl, e_px_raw, e_px_raw
+        # 4. 指标回填与右脑缓存投喂 (极速降维循环)
+        for idx, ret in enumerate(returns):
+            if np.isnan(ret): continue
+            t = valid_trades[idx]
+            mae_mfe_records[f'T+{d}'].append({'ret': float(ret), 'mfe': float((period_h[idx] - entry_costs[idx]) / entry_costs[idx]), 'mae': float((period_l[idx] - entry_costs[idx]) / entry_costs[idx])})
+            stats_period[f'T+{d}'].append(float(ret))
+            
+            if d == 3:
+                sym, r_dt = t['symbol'], t['date']
+                if TRANSFORMER_AVAILABLE:
+                    try:
+                        if sym not in cached_inds: cached_inds[sym] = calculate_indicators(df_all.xs(sym, level=1, axis=1) if isinstance(df_all.columns, pd.MultiIndex) else pd.DataFrame({'Close': df_c[sym], 'Open': df_o[sym], 'High': df_h[sym], 'Low': df_l[sym], 'Volume': 1000000}))
+                        ind_df = cached_inds[sym]
+                        valid_dates = ind_df.index[ind_df.index <= r_dt]
+                        if len(valid_dates) > 0:
+                            t_idx = np.where(ind_df.index.get_loc(valid_dates[-1]))[0][-1] if isinstance(ind_df.index.get_loc(valid_dates[-1]), np.ndarray) else (ind_df.index.get_loc(valid_dates[-1]).stop - 1 if isinstance(ind_df.index.get_loc(valid_dates[-1]), slice) else ind_df.index.get_loc(valid_dates[-1]))
+                            seq = _get_transformer_seq(ind_df, end_idx=t_idx + 1)
+                            if not np.all(seq == 0): transformer_X.append(seq); transformer_Y.append(ret) 
+                    except Exception: pass
                 
-                for i in range(1, d + 1):
-                    check_idx = e_idx + i
-                    day_open, day_low, day_high, day_close = df_o.iloc[check_idx][sym], df_l.iloc[check_idx][sym], df_h.iloc[check_idx][sym], df_c.iloc[check_idx][sym]
-                    if pd.isna(day_open) or pd.isna(day_low) or pd.isna(day_high): continue
+                factor_list = t.get('factors', [])
+                if not factor_list:
+                    for sig_txt in t.get('signals', []):
+                        m = re.search(r'\[(.*?)\]', sig_txt)
+                        if m: factor_list.append(m.group(1).split(" ")[0])
+                for f_name in factor_list: factor_rets.setdefault(f"[{f_name}]", []).append(float(ret))
                     
-                    max_high_during_trade, min_low_during_trade = max(max_high_during_trade, day_high), min(min_low_during_trade, day_low)
+                if t.get('ai_prob', 0.0) >= 0.50:  
+                    ai_filtered_total += 1
+                    if ret > 0: ai_filtered_wins += 1
                     
-                    if dynamic_sl > 0 and day_open < dynamic_sl: exit_revenue = day_open * (1 - Config.Params.SLIPPAGE * 5 - Config.Params.COMMISSION); break
-                    if dynamic_sl > 0 and day_low <= dynamic_sl: exit_revenue = dynamic_sl * (1 - Config.Params.SLIPPAGE * 3 - Config.Params.COMMISSION); break
-                    if tp_price > 0 and day_high >= tp_price: exit_revenue = tp_price * (1 - Config.Params.SLIPPAGE - Config.Params.COMMISSION); break
-                        
-                    highest_seen_px = max(highest_seen_px, day_high)
-                    dynamic_sl = max(dynamic_sl, highest_seen_px - trail_distance)
-                    
-                    if i == d: exit_revenue = day_close * (1 - (Config.Params.SLIPPAGE * 5 if abs((day_close - (df_c.iloc[check_idx-1][sym] if check_idx > e_idx else e_px_raw)) / (df_c.iloc[check_idx-1][sym] if check_idx > e_idx else e_px_raw + 1e-10)) > 0.15 else Config.Params.SLIPPAGE) - Config.Params.COMMISSION)
-                
-                if exit_revenue is not None:
-                    ret = (exit_revenue - entry_cost) / entry_cost * (0.5 if gap_up > 0.03 else 1.0)
-                    
-                    if TRANSFORMER_AVAILABLE:
-                        try:
-                            if sym not in cached_inds: cached_inds[sym] = calculate_indicators(df_all.xs(sym, level=1, axis=1) if isinstance(df_all.columns, pd.MultiIndex) else pd.DataFrame({'Close': df_c[sym], 'Open': df_o[sym], 'High': df_h[sym], 'Low': df_l[sym], 'Volume': 1000000}))
-                            ind_df = cached_inds[sym]
-                            valid_dates = ind_df.index[ind_df.index <= r_dt]
-                            if len(valid_dates) > 0:
-                                t_idx = np.where(ind_df.index.get_loc(valid_dates[-1]))[0][-1] if isinstance(ind_df.index.get_loc(valid_dates[-1]), np.ndarray) else (ind_df.index.get_loc(valid_dates[-1]).stop - 1 if isinstance(ind_df.index.get_loc(valid_dates[-1]), slice) else ind_df.index.get_loc(valid_dates[-1]))
-                                seq = _get_transformer_seq(ind_df, end_idx=t_idx + 1)
-                                if not np.all(seq == 0): transformer_X.append(seq); transformer_Y.append(ret if d == 3 else 0.0) 
-                        except Exception: pass
-                    
-                    mae_mfe_records[f'T+{d}'].append({'ret': ret, 'mfe': (max_high_during_trade - entry_cost) / entry_cost, 'mae': (min_low_during_trade - entry_cost) / entry_cost})
-                    stats_period[f'T+{d}'].append(ret)
-                    
-                    if d == 3:
-                        factor_list = t.get('factors', [])
-                        if not factor_list:
-                            for sig_txt in t.get('signals', []):
-                                m = re.search(r'\[(.*?)\]', sig_txt)
-                                if m: factor_list.append(m.group(1).split(" ")[0])
-                        for f_name in factor_list: factor_rets.setdefault(f"[{f_name}]", []).append(ret)
-                            
-                        if t.get('ai_prob', 0.0) >= 0.50:  
-                            ai_filtered_total += 1
-                            if ret > 0: ai_filtered_wins += 1
-                            
-                        if t.get('ml_features', {}): trades_with_ret.append({'date': t['date'], 'vix': t['vix'], 'cred': t['cred'], 'term': t['term'], 'pcr': t['pcr'], 'ml_features': t.get('ml_features', {}), 'factors': factor_list, 'ret': ret})
+                if t.get('ml_features', {}): trades_with_ret.append({'date': t['date'], 'vix': t['vix'], 'cred': t['cred'], 'term': t['term'], 'pcr': t['pcr'], 'ml_features': t.get('ml_features', {}), 'factors': factor_list, 'ret': float(ret)})
     
     feature_importances_dict, meta_weights_dict, factor_ic_report, trade_df = {}, {}, {}, pd.DataFrame(trades_with_ret)
     
@@ -1528,7 +1545,7 @@ def run_backtest_engine() -> None:
         attr_df = pd.DataFrame([{'ret': tr['ret'], **{f: 1 if f in tr.get('factors', []) else 0 for f in adv_factors + ["MACD金叉"]}} for tr in trades_with_ret])
         for f in adv_factors:
             trig, not_trig = attr_df[attr_df[f] == 1], attr_df[attr_df[f] == 0]
-            attr_report[f] = {'premium_bps': float((trig['ret'].median() - not_trig['ret'].median()) * 10000) if len(trig) > 0 and len(not_trig) > 0 else 0.0, 'corr_with_baseline': float(attr_df[f].corr(attr_df["MACD金叉"]) if len(attr_df) > 1 and not pd.isna(attr_df[f].corr(attr_df["MACD金叉"])) else 0.0), 'trigger_rate': float(len(trig) / len(attrdf)) if len(attr_df) > 0 else 0.0}
+            attr_report[f] = {'premium_bps': float((trig['ret'].median() - not_trig['ret'].median()) * 10000) if len(trig) > 0 and len(not_trig) > 0 else 0.0, 'corr_with_baseline': float(attr_df[f].corr(attr_df["MACD金叉"]) if len(attr_df) > 1 and not pd.isna(attr_df[f].corr(attr_df["MACD金叉"])) else 0.0), 'trigger_rate': float(len(trig) / len(attr_df)) if len(attr_df) > 0 else 0.0}
 
     with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: json.dump({"overall": res, "factors": f_res, "xai_importances": feature_importances_dict, "meta_weights": meta_weights_dict, "attribution": attr_report, "factor_ic": factor_ic_report}, f, indent=4)
     
