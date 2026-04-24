@@ -237,7 +237,6 @@ def _save_ext_cache():
             os.replace(temp_ext, Config.EXT_CACHE_FILE)
         except Exception: pass
 
-# 🚀 获取 WSB 数据
 def fetch_global_wsb_data() -> Dict[str, float]:
     with _ALT_DATA_LOCK:
         if "WSB_ACCEL_GLOBAL" in _ALT_DATA_CACHE: return _ALT_DATA_CACHE["WSB_ACCEL_GLOBAL"]
@@ -277,7 +276,6 @@ def fetch_global_wsb_data() -> Dict[str, float]:
     with _ALT_DATA_LOCK: _ALT_DATA_CACHE["WSB_ACCEL_GLOBAL"] = wsb_accel_dict
     return wsb_accel_dict
 
-# 🚀 获取情绪与期权数据
 def safe_get_sentiment_data(symbol: str) -> Tuple[float, float, float, float]:
     _init_ext_cache()
     with _DAILY_EXT_LOCK:
@@ -303,7 +301,6 @@ def safe_get_sentiment_data(symbol: str) -> Tuple[float, float, float, float]:
     _save_ext_cache()
     return pcr, iv_skew, short_change, short_float
 
-# 🚀 获取另类因子数据
 def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
     _init_ext_cache()
     with _DAILY_EXT_LOCK:
@@ -337,7 +334,6 @@ def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
     _save_ext_cache()
     return insider_net_buy, analyst_mom, nlp_score, news_summary
 
-# 🚀 财报风控排雷
 def check_earnings_risk(symbol: str) -> bool:
     try:
         tk = yf.Ticker(symbol)
@@ -394,16 +390,52 @@ def set_alerted(sym: str, is_shadow: bool = False, shadow_data: dict = None):
         os.replace(tmp, Config.ALERT_CACHE_FILE)
     except Exception: pass
 
+# 🚀 钉钉推送修复核心：植入关键词，剥离匿名函数，加入报错拦截
 def send_alert(title: str, content: str) -> None:
     if not content.strip(): return
     formatted_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    
+    req_headers = _GLOBAL_HEADERS.copy()
+    req_headers["Content-Type"] = "application/json"
+    
     if Config.WEBHOOK_URL:
-        payload = {"msgtype": "markdown", "markdown": {"title": title, "text": f"## 🤖 {title}\n\n{content}\n\n---\n*⏱️ {formatted_time}*"}}
+        keyword = getattr(Config, 'DINGTALK_KEYWORD', 'AI')
+        payload = {
+            "msgtype": "markdown", 
+            "markdown": {
+                "title": f"【{keyword}】{title}", 
+                "text": f"## 🤖 【{keyword}】{title}\n\n{content}\n\n---\n*⏱️ {formatted_time}*"
+            }
+        }
+        
+        def _send_webhook(url_str, p_data):
+            try: 
+                res = requests.post(url_str, json=p_data, headers=req_headers, timeout=10)
+                if res.status_code != 200:
+                    logger.error(f"Webhook 投递失败: HTTP {res.status_code} - {res.text}")
+            except Exception as e: 
+                logger.error(f"Webhook 网络异常: {e}")
+                
         for url in [u.strip() for u in Config.WEBHOOK_URL.split(',') if u.strip()]:
-            threading.Thread(target=lambda u_str, p: requests.post(u_str, json=p, headers=_GLOBAL_HEADERS, timeout=5) if True else None, args=(url, payload)).start()
+            threading.Thread(target=_send_webhook, args=(url, payload), daemon=False).start()
+            
     if Config.TELEGRAM_BOT_TOKEN and Config.TELEGRAM_CHAT_ID:
-        tg_text = f"🤖 <b>【量化监控】{title}</b>\n\n{content.replace('**', '<b>').replace('**', '</b>')}\n\n⏱️ <i>{formatted_time}</i>"
-        threading.Thread(target=lambda t, c, txt: requests.post(f"https://api.telegram.org/bot{t}/sendMessage", json={"chat_id": c, "text": txt[:4000], "parse_mode": "HTML"}, timeout=5) if True else None, args=(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID, tg_text)).start()
+        html_title = title.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        html_content = content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        html_content = re.sub(r'### (.*?)\n', r'<b>\1</b>\n', html_content)
+        html_content = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', html_content)
+        html_content = re.sub(r'`(.*?)`', r'<code>\1</code>', html_content)
+        html_content = html_content.replace('\n---', '\n━━━━━━━━━━━━━━━━━━')
+        
+        tg_text = f"🤖 <b>【量化监控】{html_title}</b>\n\n{html_content}\n\n⏱️ <i>{formatted_time}</i>"
+        
+        def _send_tg(t, c, txt):
+            try: 
+                res = requests.post(f"https://api.telegram.org/bot{t}/sendMessage", json={"chat_id": c, "text": txt[:4000], "parse_mode": "HTML"}, headers=req_headers, timeout=10)
+                if res.status_code != 200: logger.error(f"TG 推送被拒: {res.text}")
+            except Exception as e: logger.error(f"TG 网络异常: {e}")
+            
+        threading.Thread(target=_send_tg, args=(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID, tg_text), daemon=False).start()
 
 # ================= 4. 特征工程 =================
 def get_vix_level(qqq_df: pd.DataFrame = None) -> Tuple[float, str]:
@@ -544,7 +576,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-# 🚀 提取 Transformer 49 维张量切片
 def _get_transformer_seq(df_ind: pd.DataFrame, end_idx: int = -1) -> np.ndarray:
     if end_idx == -1: end_idx = len(df_ind)
     start_idx = end_idx - 60
@@ -576,7 +607,6 @@ def _get_transformer_seq(df_ind: pd.DataFrame, end_idx: int = -1) -> np.ndarray:
     for idx, vals in feature_mapping: seq[:, idx] = vals
     return np.nan_to_num(seq, nan=0.0, posinf=5.0, neginf=-5.0)
 
-# 🚀 提取多维跨频复杂特征
 def _extract_complex_features(stock: StockData, ctx: MarketContext) -> ComplexFeatures:
     weekly_bullish, weekly_macd_res, fvg_lower, fvg_upper = False, 0.0, 0.0, 0.0
     aligned_w = stock.df_w
@@ -660,7 +690,6 @@ def _extract_complex_features(stock: StockData, ctx: MarketContext) -> ComplexFe
         rs_20=float(rs_20), pure_alpha=float(pure_alpha)
     )
 
-# 🚀 提取喂给 LightGBM 的机器学习特征字典
 def _extract_ml_features(stock: StockData, ctx: MarketContext, cf: ComplexFeatures, alt: AltData, alpha_vec: np.ndarray = None) -> dict:
     macd_cross_strength = safe_div(stock.curr['MACD'] - stock.curr['Signal_Line'], abs(stock.curr['Close']) * 0.01)
     vol_surge_ratio = safe_div(stock.curr['Volume'], stock.curr['Vol_MA20'], cap=50.0)
@@ -707,7 +736,6 @@ def _extract_ml_features(stock: StockData, ctx: MarketContext, cf: ComplexFeatur
         for i in range(1, 17): feat_dict[f"Alpha_T{i:02d}"] = 0.0
     return {f: float(np.nan_to_num(feat_dict.get(f, 0.0), nan=0.0, posinf=20.0, neginf=-20.0)) for f in Config.ALL_FACTORS}
 
-# 🚀 53 维因子的绝对大脑，全息张量打分器
 def _evaluate_omni_matrix(stock: StockData, ctx: MarketContext, cf: ComplexFeatures, alt: AltData) -> Tuple[int, List[str], List[str], bool]:
     triggered_list, factors_list = [], []
     theme_scores = {'TREND': 0.0, 'VOLATILITY': 0.0, 'REVERSAL': 0.0, 'QUANTUM': 0.0}
@@ -901,7 +929,7 @@ def _route_orders_to_gateway(final_reports: List[dict], ctx: MarketContext) -> N
                     qty = round(alloc_usd / max(r['curr_close'], 1e-10), 4)
                     if qty > 0:
                         conn.execute('''INSERT INTO orders (client_oid, symbol, side, qty, order_type, arrival_price, status) VALUES (?, ?, 'BUY', ?, 'MKT', ?, 'PENDING_SUBMIT')''', (f"QB_{uuid.uuid4().hex[:8]}", r['symbol'], qty, r['curr_close']))
-                        logger.info(f"📡 [网关路由] 成功下发 {r['symbol']} BUY 指令: {qty} 股 -> PENDING_SUBMIT")
+                        logger.info(f"📡 [网关路由] 成功下下发 {r['symbol']} BUY 指令: {qty} 股 -> PENDING_SUBMIT")
     except Exception as e: logger.error(f"❌ [网关路由] IPC 致命错误: {e}")
 
 # ================= 5. 实盘执行网关 (Execution Gateway) =================
