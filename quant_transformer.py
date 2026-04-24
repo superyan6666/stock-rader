@@ -102,12 +102,16 @@ class QuantAlphaTransformer(nn.Module):
         alpha_vector = self.alpha_head(pooled_memory)
         return alpha_vector
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def extract_alpha(self, features: np.ndarray) -> np.ndarray:
         self.eval() 
         device = next(self.parameters()).device
-        tensor = torch.from_numpy(features.copy()).float().to(device)
+        # 移除 numpy 的冗余 copy()，结合 inference_mode 极速直读内存
+        tensor = torch.from_numpy(features).float().to(device)
         if tensor.dim() == 2: tensor = tensor.unsqueeze(0)
+        
+        # 强制内存连续化布局，配合 ARM CPU L1/L2 Cache 预取机制
+        tensor = tensor.contiguous()
         output = self.forward(tensor)
         return output.cpu().numpy()
 
@@ -136,6 +140,17 @@ class QuantAlphaTransformer(nn.Module):
         model.load_state_dict(checkpoint['state_dict'])
         model.to(device)
         model.eval()
+        
+        # 🚀 [ARM 终极推理加速] PyTorch 2.0+ Inductor 后端算子融合编译
+        import sys
+        if hasattr(torch, 'compile') and sys.platform != "win32":
+            try:
+                # 动态生成 C++ 算子并融合，针对 ARM NEON 自动进行底层 SIMD 调优
+                model = torch.compile(model, backend="inductor", mode="reduce-overhead")
+                logger.info("⚡ 已激活 torch.compile (Inductor) 算子融合与 ARM 硬件级编译！")
+            except Exception as e:
+                logger.warning(f"⚠️ torch.compile 加速启动失败，已平滑降级为普通推理: {e}")
+                
         logger.info(f"🔄 模型成功热加载。计算设备: {device}")
         return model
 
