@@ -41,7 +41,8 @@ jobs:
 
       - name: 🔍 代码质量检查与依赖补齐
         run: |
-          # 先安装 flake8 和全息指挥仓依赖
+          # 补充安装 ARM 系统级加速包 (numactl, jemalloc) 与前端依赖
+          sudo apt-get update && sudo apt-get install -y numactl libjemalloc-dev
           pip install flake8 streamlit altair streamlit-autorefresh
           flake8 quant_engine.py quant_transformer.py --count --select=E9,F63,F7,F82 --show-source --statistics
 
@@ -59,6 +60,9 @@ jobs:
           ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
           ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
         run: |
+          # 突破系统 IO 句柄限制，保障 32 线程池全速网络请求
+          ulimit -n 65536
+          
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             MODE="${{ github.event.inputs.run_mode }}"
           elif [[ "${{ github.event_name }}" == "schedule" ]]; then
@@ -73,7 +77,8 @@ jobs:
           
           echo "RUN_MODE=$MODE" >> $GITHUB_ENV
           if [[ "$MODE" != "test" ]]; then
-             python quant_engine.py $MODE
+             echo "🚀 启用 Jemalloc 内存池与 NUMA 节点亲和性绑定运行引擎..."
+             LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2 numactl --cpunodebind=0 --membind=0 python quant_engine.py $MODE
           fi
 
       - name: 🧠 触发深度神经代谢 (MLOps Training)
@@ -85,9 +90,11 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          # MLOps 训练阶段同样极度依赖内存分配与 NUMA 亲和性
+          ulimit -n 65536
           echo "启动 Transformer 右脑增量训练..."
           set +e
-          python train_transformer.py
+          LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2 numactl --cpunodebind=0 --membind=0 python train_transformer.py
           TRAIN_EXIT=$?
           set -e
           case $TRAIN_EXIT in
