@@ -229,9 +229,36 @@ class ComplexFeatures:
 
 class SharedDFCache:
     """基于内存映射的零拷贝DataFrame缓存，多进程可直接读取 (破解 IPC 瓶颈)"""
-    def __init__(self, cache_dir: str = "/dev/shm/quantbot" if os.path.exists("/dev/shm") else ".quantbot_data/shm"):
+    def __init__(self, cache_dir: str = "/dev/shm/quantbot" if os.path.exists("/dev/shm") else ".quantbot_data/shm", ttl_hours: int = 12):
         os.makedirs(cache_dir, exist_ok=True)
         self.cache_dir = cache_dir
+        self.ttl_seconds = ttl_hours * 3600
+        self._cleanup_stale()  # 启动时主动清理过期内存，防止 OOM
+
+    def _cleanup_stale(self):
+        """清理超过 TTL 的过期缓存文件"""
+        now = time.time()
+        try:
+            for fname in os.listdir(self.cache_dir):
+                fpath = os.path.join(self.cache_dir, fname)
+                if fname.endswith('.feather') and os.path.isfile(fpath):
+                    if now - os.path.getmtime(fpath) > self.ttl_seconds:
+                        os.remove(fpath)
+                        logger.debug(f"🧹 清理过期缓存: {fname}")
+        except Exception as e:
+            logger.debug(f"Cache cleanup error: {e}")
+
+    def get_cache_size_mb(self) -> float:
+        """监控当前缓存物理占用大小"""
+        try:
+            total = sum(
+                os.path.getsize(os.path.join(self.cache_dir, f))
+                for f in os.listdir(self.cache_dir)
+                if f.endswith('.feather')
+            )
+            return total / 1024 / 1024
+        except Exception:
+            return 0.0
 
     def get(self, key: str) -> Optional[pd.DataFrame]:
         if not FEATHER_AVAILABLE: return None
@@ -294,13 +321,32 @@ def check_macd_cross(curr: pd.Series, prev: pd.Series) -> bool:
     return prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']
 
 def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 3, fast_mode: bool = False) -> pd.DataFrame:
-    cache_key = f"{symbol}_{interval}_{period}"
+    # ✅ 修复1：对缓存键做路径安全转义，防止部分文件系统拒绝含有 '^' 或 '/' 的写入
+    safe_sym = symbol.replace('^', '_caret_').replace('/', '_slash_')
+    cache_key = f"{safe_sym}_{interval}_{period}"
     
     # 优先从跨进程共享内存提取数据，实现零拷贝
     cached_df = _SHARED_CACHE.get(cache_key)
     if cached_df is not None and not cached_df.empty:
         return cached_df.copy()
         
+    # ✅ 修复2：缓存向下兼容降维拦截（极大节省短线如 `5d` 的请求令牌）
+    if period != "1y":
+        long_key = f"{safe_sym}_{interval}_1y"
+        long_cached = _SHARED_CACHE.get(long_key)
+        if long_cached is not None and not long_cached.empty:
+            if period == "5d":
+                return long_cached.tail(5).copy()
+            elif period == "1mo":
+                cutoff = pd.Timestamp.now(tz=timezone.utc) - pd.Timedelta(days=30)
+                return long_cached[long_cached.index >= cutoff].copy()
+            elif period == "3mo":
+                cutoff = pd.Timestamp.now(tz=timezone.utc) - pd.Timedelta(days=90)
+                return long_cached[long_cached.index >= cutoff].copy()
+            elif period == "6mo":
+                cutoff = pd.Timestamp.now(tz=timezone.utc) - pd.Timedelta(days=183)
+                return long_cached[long_cached.index >= cutoff].copy()
+
     for attempt in range(retries):
         wait = _API_LIMITER.acquire()  # 精确限速，无多余等待
         try:
