@@ -17,6 +17,7 @@ import scipy.stats as stats
 import concurrent.futures
 import threading
 import multiprocessing
+from multiprocessing import Value, Lock as MPLock
 import copy
 from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
@@ -284,7 +285,7 @@ class SharedDFCache:
 _SHARED_CACHE = SharedDFCache()
 
 class TokenBucket:
-    """令牌桶限速器：精确控制API调用频率，消除不必要等待"""
+    """普通的基于线程锁的令牌桶限速器 (用于单一进程内，如独立的子进程或仅在线程池内)"""
     def __init__(self, rate: float = 5.0, capacity: float = 10.0):
         self.rate = rate
         self.capacity = capacity
@@ -298,7 +299,6 @@ class TokenBucket:
             elapsed = now - self._last_refill
             self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
             self._last_refill = now
-            
             if self._tokens >= tokens:
                 self._tokens -= tokens
                 return 0.0
@@ -308,7 +308,44 @@ class TokenBucket:
                 self._tokens = 0.0
                 return wait
 
-_API_LIMITER = TokenBucket(rate=4.0, capacity=8.0)  # 全局单例限速器
+class CrossProcessTokenBucket:
+    """跨进程安全的共享内存令牌桶：防御多进程下局部限速器翻倍溢出漏洞"""
+    def __init__(self, rate: float = 4.0, capacity: float = 8.0):
+        self.rate = rate
+        self.capacity = capacity
+        # 使用基于内存映射的 Value 和 Lock，子进程将继承或共享相同状态
+        self._tokens = Value('d', capacity)
+        self._last_refill = Value('d', time.monotonic())
+        self._lock = MPLock()
+
+    def acquire(self, tokens: float = 1.0) -> float:
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_refill.value
+            self._tokens.value = min(
+                self.capacity,
+                self._tokens.value + elapsed * self.rate
+            )
+            self._last_refill.value = now
+            
+            if self._tokens.value >= tokens:
+                self._tokens.value -= tokens
+                return 0.0
+            else:
+                wait = (tokens - self._tokens.value) / self.rate
+                time.sleep(wait)
+                self._tokens.value = 0.0
+                return wait
+
+_API_LIMITER = CrossProcessTokenBucket(rate=4.0, capacity=8.0)  # 主进程/线程池级 API 全局限速单例
+_WORKER_LOCAL_LIMITER: Optional[TokenBucket] = None  # 进程本地限速器，专门在 _cpu_calc_worker 中降频使用
+
+def _worker_pool_initializer(rate_per_worker: float, capacity: float):
+    """ProcessPoolExecutor 的子进程初始化函数，平滑注入局部分布式限速器"""
+    global _WORKER_LOCAL_LIMITER
+    _WORKER_LOCAL_LIMITER = TokenBucket(rate=rate_per_worker, capacity=capacity)
+    logger.debug(f"Worker {os.getpid()} 限速器初始化: 分配速率 {rate_per_worker:.2f} req/s")
+
 
 _DAILY_EXT_CACHE = {}; _DAILY_EXT_LOCK = threading.Lock()
 _ALT_DATA_CACHE = {}; _ALT_DATA_LOCK = threading.Lock()
@@ -321,6 +358,7 @@ def check_macd_cross(curr: pd.Series, prev: pd.Series) -> bool:
     return prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']
 
 def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 3, fast_mode: bool = False) -> pd.DataFrame:
+    global _WORKER_LOCAL_LIMITER
     # ✅ 修复1：对缓存键做路径安全转义，防止部分文件系统拒绝含有 '^' 或 '/' 的写入
     safe_sym = symbol.replace('^', '_caret_').replace('/', '_slash_')
     cache_key = f"{safe_sym}_{interval}_{period}"
@@ -347,8 +385,11 @@ def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retr
                 cutoff = pd.Timestamp.now(tz=timezone.utc) - pd.Timedelta(days=183)
                 return long_cached[long_cached.index >= cutoff].copy()
 
+    # ✅ 修复3: 自动识别执行上下文环境，优先使用子进程内安全分配的局部低配版限速器
+    limiter = _WORKER_LOCAL_LIMITER or _API_LIMITER
+
     for attempt in range(retries):
-        wait = _API_LIMITER.acquire()  # 精确限速，无多余等待
+        wait = limiter.acquire()  # 跨域安全限速
         try:
             new_df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False, timeout=8)
             if not new_df.empty:
@@ -626,17 +667,21 @@ def _robust_hurst(close_prices: np.ndarray, min_window=30, n_bootstrap=100) -> T
     safe_prices = np.maximum(close_prices, 1e-10)
     log_ret = np.diff(np.log(safe_prices[-121:])) if len(safe_prices) > 120 else np.diff(np.log(safe_prices))
     if len(log_ret) <= min_window: return 0.5, 0.0, False
-    np.random.seed(42)
+    
+    # ✅ 修复: 使用局部 Generator 替代全局 seed，零污染多进程的全局随机状态
+    rng = np.random.default_rng(seed=int(np.sum(np.abs(close_prices[-10:])) * 1e6) % (2**31))
+    
     hurst_samples = []
     for _ in range(n_bootstrap):
-        sub_len = np.random.randint(min_window, len(log_ret))
-        start = np.random.randint(0, len(log_ret) - sub_len)
+        sub_len = int(rng.integers(min_window, len(log_ret)))
+        start = int(rng.integers(0, len(log_ret) - sub_len))
         sub_ret = log_ret[start:start+sub_len]
         S = np.std(sub_ret)
         if S == 0: continue
         R = np.max(np.cumsum(sub_ret - np.mean(sub_ret))) - np.min(np.cumsum(sub_ret - np.mean(sub_ret)))
         if R <= 0: continue
         hurst_samples.append(np.log(R/S) / np.log(len(sub_ret)))
+        
     if len(hurst_samples) < 20: return 0.5, 0.0, False
     h_median, h_iqr = float(np.median(hurst_samples)), float(np.percentile(hurst_samples, 75) - np.percentile(hurst_samples, 25))
     is_reliable = bool((h_iqr < 0.15) and (abs(h_median - 0.5) > 0.1))
@@ -1042,9 +1087,19 @@ def _io_fetch_worker(sym: str) -> Optional[dict]:
     try:
         df = safe_get_history(sym, "1y", "1d", fast_mode=True)
         if len(df) < 60: return None
+        
+        # ✅ 修复：补全多周期数据拉取，消除 CPU Worker 中的空 DataFrame 缺陷
+        df_w = safe_get_history(sym, "5y", "1wk", fast_mode=True)
+        df_m = safe_get_history(sym, "5y", "1mo", fast_mode=True)
+        df_60m = safe_get_history(sym, "60d", "60m", fast_mode=True)
+        
         sentiment = safe_get_sentiment_data(sym)
         alt_data = safe_get_alt_data(sym)
-        return {'sym': sym, 'df': df, 'sentiment': sentiment, 'alt_data': alt_data}
+        return {
+            'sym': sym, 'df': df, 
+            'df_w': df_w, 'df_m': df_m, 'df_60m': df_60m,
+            'sentiment': sentiment, 'alt_data': alt_data
+        }
     except Exception as e:
         logger.debug(f"IO Fetch error for {sym}: {e}")
         return None
@@ -1056,15 +1111,26 @@ def _cpu_calc_worker(payload: dict) -> Optional[dict]:
         df = payload['df']
         ctx = payload['ctx']
         
+        # ✅ 修复：接收来自 IO 阶段的多周期真实数据
+        df_w = payload.get('df_w', pd.DataFrame())
+        df_m = payload.get('df_m', pd.DataFrame())
+        df_60m = payload.get('df_60m', pd.DataFrame())
+        
         df_ind = calculate_indicators(df)
-        stock = StockData(sym, df_ind, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), df_ind.iloc[-1], df_ind.iloc[-2], False, 0.0)
+        curr, prev = df_ind.iloc[-1], df_ind.iloc[-2]
+        
+        # ✅ 修复：计算真实的成交量异动与近期波段高点，防止因子判断失真
+        is_vol = bool((curr['Volume'] / curr['Vol_MA20'] > 1.5) and (curr['Close'] > curr['Open']))
+        swing_high_10 = float(df_ind['High'].iloc[-11:-1].max()) if len(df_ind) >= 11 else float(curr['High'])
+        
+        stock = StockData(sym, df_ind, df_w, df_m, df_60m, curr, prev, is_vol, swing_high_10)
         cf = _extract_complex_features(stock, ctx)
         alt = AltData(*payload['sentiment'][:4], *payload['alt_data'][:3], 0.0)
         seq = _get_transformer_seq(df_ind)
         
         return {
             'sym': sym, 'stock': stock, 'alt': alt, 'cf': cf, 'seq': seq, 
-            'curr': df_ind.iloc[-1], 'prev': df_ind.iloc[-2], 'news': "", 
+            'curr': curr, 'prev': prev, 'news': "", 
             'close_history': df['Close'].tail(60).values
         }
     except Exception as e:
@@ -1132,7 +1198,16 @@ def _prepare_universe_data(ctx: MarketContext) -> Tuple[List[dict], dict]:
         
     # --- 阶段 2: 多进程池纯 CPU 计算 (破解 GIL) ---
     ctx_mp = multiprocessing.get_context("forkserver") if hasattr(multiprocessing, "get_context") else None
-    pool_kwargs = {"max_workers": min(4, os.cpu_count() or 1)}
+    
+    # ✅ 完美平滑分布式限速器：计算单核配额并挂载到 initializer
+    NUM_CPU_WORKERS = min(4, os.cpu_count() or 1)
+    RATE_PER_WORKER = max(0.5, 4.0 / NUM_CPU_WORKERS)  # 防止除 0 且设定最低底线
+    
+    pool_kwargs = {
+        "max_workers": NUM_CPU_WORKERS,
+        "initializer": _worker_pool_initializer,
+        "initargs": (RATE_PER_WORKER, 4.0)
+    }
     if sys.platform != "win32" and ctx_mp:
         pool_kwargs["mp_context"] = ctx_mp
 
@@ -1496,11 +1571,30 @@ def run_backtest_engine() -> None:
         exit_revenues = exit_closes * (1 - Config.Params.SLIPPAGE - Config.Params.COMMISSION)
         returns = (exit_revenues - entry_costs) / (entry_costs + 1e-10) * np.where(gap_up > 0.03, 0.5, 1.0)
         
-        # 批量计算区间 MFE/MAE (最大高点与最小低点跨度)
+        # 批量计算区间 MFE/MAE (最大高点与最小低点跨度) - 彻底拔除列表推导式的纯 NumPy 向量化
+        start_idxs = np.minimum(e_indices + 1, max_idx + 1)
+        end_idxs = np.minimum(e_indices + d + 1, max_idx + 1)
+        valid_win = (end_idxs - start_idxs) == d
+        
+        period_h = np.full(len(e_indices), np.nan)
+        period_l = np.full(len(e_indices), np.nan)
+        
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
-            period_h = np.array([np.nanmax(h_arr[e+1:min(e+d+1, max_idx+1), c]) if e+1 <= max_idx else np.nan for e, c in zip(e_indices, sym_cols)])
-            period_l = np.array([np.nanmin(l_arr[e+1:min(e+d+1, max_idx+1), c]) if e+1 <= max_idx else np.nan for e, c in zip(e_indices, sym_cols)])
+            # 核心大批量：高级花式索引与矩阵广播，O(1) 级耗时
+            if np.any(valid_win):
+                v_starts, v_cols = start_idxs[valid_win], sym_cols[valid_win]
+                window_idx = v_starts[:, None] + np.arange(d)[None, :]
+                period_h[valid_win] = np.nanmax(h_arr[window_idx, v_cols[:, None]], axis=1)
+                period_l[valid_win] = np.nanmin(l_arr[window_idx, v_cols[:, None]], axis=1)
+            
+            # 边界小批量：末端数据截断时的安全回退
+            invalid_idxs = np.where(~valid_win)[0]
+            for i in invalid_idxs:
+                if start_idxs[i] < end_idxs[i]:
+                    sl = slice(start_idxs[i], end_idxs[i])
+                    period_h[i] = np.nanmax(h_arr[sl, sym_cols[i]])
+                    period_l[i] = np.nanmin(l_arr[sl, sym_cols[i]])
         
         # 4. 指标回填与右脑缓存投喂 (极速降维循环)
         for idx, ret in enumerate(returns):
@@ -1734,7 +1828,16 @@ def run_synthetic_stress_test() -> None:
 
     # --- 压测阶段 2: 纯 CPU 计算多进程池 ---
     ctx_mp = multiprocessing.get_context("forkserver") if hasattr(multiprocessing, "get_context") else None
-    pool_kwargs = {"max_workers": min(4, os.cpu_count() or 1)}
+    
+    # 分布式安全限速配额
+    NUM_CPU_WORKERS = min(4, os.cpu_count() or 1)
+    RATE_PER_WORKER = max(0.5, 4.0 / NUM_CPU_WORKERS)
+    
+    pool_kwargs = {
+        "max_workers": NUM_CPU_WORKERS,
+        "initializer": _worker_pool_initializer,
+        "initargs": (RATE_PER_WORKER, 4.0)
+    }
     if sys.platform != "win32" and ctx_mp:
         pool_kwargs["mp_context"] = ctx_mp
 
