@@ -236,6 +236,38 @@ class SharedDFCache:
 
 _SHARED_CACHE = SharedDFCache()
 
+class TokenBucket:
+    """令牌桶限速器：精确控制API调用频率，消除不必要等待"""
+    def __init__(self, rate: float = 5.0, capacity: float = 10.0):
+        """
+        rate: 每秒补充令牌数 (yfinance 建议 ≤5 req/s)
+        capacity: 桶容量，允许短暂突发
+        """
+        self.rate = rate
+        self.capacity = capacity
+        self._tokens = capacity
+        self._last_refill = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self, tokens: float = 1.0) -> float:
+        """获取令牌，返回实际等待时间"""
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_refill
+            self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
+            self._last_refill = now
+            
+            if self._tokens >= tokens:
+                self._tokens -= tokens
+                return 0.0
+            else:
+                wait = (tokens - self._tokens) / self.rate
+                time.sleep(wait)
+                self._tokens = 0.0
+                return wait
+
+_API_LIMITER = TokenBucket(rate=4.0, capacity=8.0)  # 全局单例限速器
+
 _DAILY_EXT_CACHE = {}; _DAILY_EXT_LOCK = threading.Lock()
 _ALT_DATA_CACHE = {}; _ALT_DATA_LOCK = threading.Lock()
 
@@ -246,7 +278,7 @@ def safe_div(num, den, cap=20.0):
 def check_macd_cross(curr: pd.Series, prev: pd.Series) -> bool:
     return prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']
 
-def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 5, fast_mode: bool = False) -> pd.DataFrame:
+def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 3, fast_mode: bool = False) -> pd.DataFrame:
     cache_key = f"{symbol}_{interval}_{period}"
     
     # 优先从跨进程共享内存提取数据，实现零拷贝
@@ -254,19 +286,19 @@ def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retr
     if cached_df is not None and not cached_df.empty:
         return cached_df.copy()
         
-    df = pd.DataFrame()
     for attempt in range(retries):
+        wait = _API_LIMITER.acquire()  # 精确限速，无多余等待
         try:
-            time.sleep(random.uniform(0.1, 0.3) if fast_mode else random.uniform(1.0, 2.0))
-            new_df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False, timeout=10)
+            new_df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False, timeout=8)
             if not new_df.empty:
                 new_df.index = pd.to_datetime(new_df.index, utc=True)
                 df = new_df[~new_df.index.duplicated(keep='last')]
                 _SHARED_CACHE.set(cache_key, df) # 写入共享内存
                 return df
-        except Exception:
-            time.sleep(2 + attempt * 2)
-    return df
+        except Exception as e:
+            backoff = (2 ** attempt) + random.uniform(0, 1)
+            time.sleep(backoff)  # 指数退避，只在真正失败时等待
+    return pd.DataFrame()
 
 def _init_ext_cache():
     global _DAILY_EXT_CACHE
@@ -488,7 +520,7 @@ def send_alert(title: str, content: str) -> None:
             
         threading.Thread(target=_send_tg, args=(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID, tg_text), daemon=False).start()
 
-# ================= 4. 特征工程 =================
+# ================= 4. 特 প্রকৌশ =================
 def get_vix_level(qqq_df: pd.DataFrame = None) -> Tuple[float, str]:
     df = safe_get_history(Config.VIX_INDEX, period="5d", interval="1d", fast_mode=True)
     vix = df['Close'].ffill().iloc[-1] if not df.empty else 18.0
@@ -1496,7 +1528,7 @@ def run_backtest_engine() -> None:
         attr_df = pd.DataFrame([{'ret': tr['ret'], **{f: 1 if f in tr.get('factors', []) else 0 for f in adv_factors + ["MACD金叉"]}} for tr in trades_with_ret])
         for f in adv_factors:
             trig, not_trig = attr_df[attr_df[f] == 1], attr_df[attr_df[f] == 0]
-            attr_report[f] = {'premium_bps': float((trig['ret'].median() - not_trig['ret'].median()) * 10000) if len(trig) > 0 and len(not_trig) > 0 else 0.0, 'corr_with_baseline': float(attr_df[f].corr(attr_df["MACD金叉"]) if len(attr_df) > 1 and not pd.isna(attr_df[f].corr(attr_df["MACD金叉"])) else 0.0), 'trigger_rate': float(len(trig) / len(attr_df)) if len(attr_df) > 0 else 0.0}
+            attr_report[f] = {'premium_bps': float((trig['ret'].median() - not_trig['ret'].median()) * 10000) if len(trig) > 0 and len(not_trig) > 0 else 0.0, 'corr_with_baseline': float(attr_df[f].corr(attr_df["MACD金叉"]) if len(attr_df) > 1 and not pd.isna(attr_df[f].corr(attr_df["MACD金叉"])) else 0.0), 'trigger_rate': float(len(trig) / len(attrdf)) if len(attr_df) > 0 else 0.0}
 
     with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: json.dump({"overall": res, "factors": f_res, "xai_importances": feature_importances_dict, "meta_weights": meta_weights_dict, "attribution": attr_report, "factor_ic": factor_ic_report}, f, indent=4)
     
