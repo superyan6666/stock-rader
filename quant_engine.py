@@ -57,10 +57,10 @@ class Config:
     VIX_INDEX: str = "^VIX" 
     
     SECTOR_MAP = {
-        'XLK': ['AAPL', 'MSFT', 'NVDA', 'AVGO', 'QCOM', 'AMD', 'INTC', 'CRM', 'ADBE', 'CSCO', 'TXN', 'INTU', 'AMAT', 'MU', 'LRCX', 'PANW', 'KLAC', 'SNPS', 'CDNS', 'NXPI', 'MRVL', 'MCHP', 'FTNT', 'CRWD'],
-        'XLY': ['AMZN', 'TSLA', 'BKNG', 'SBUX', 'MAR', 'MELI', 'LULU', 'HD', 'ROST', 'EBAY', 'TSCO', 'PDD', 'DASH', 'CPRT', 'PCAR'],
-        'XLC': ['GOOGL', 'GOOG', 'META', 'NFLX', 'CMCSA', 'TMUS', 'EA', 'TTWO', 'WBD', 'SIRI', 'CHTR'],
-        'XLV': ['AMGN', 'GILD', 'VRTX', 'REGN', 'ISRG', 'BIIB', 'ILMN', 'DXCM', 'IDXX', 'MRNA', 'ALGN', 'BMRN', 'GEHC'],
+        'XLK': ['AAPL', 'MSFT', 'NVDA', 'AVGO', 'QCOM', 'AMD', 'INTC', 'CRM', 'ADBE'],
+        'XLY': ['AMZN', 'TSLA', 'BKNG', 'SBUX', 'MAR', 'MELI', 'LULU', 'HD', 'ROST'],
+        'XLC': ['GOOGL', 'GOOG', 'META', 'NFLX', 'CMCSA', 'TMUS', 'EA', 'TTWO'],
+        'XLV': ['AMGN', 'GILD', 'VRTX', 'REGN', 'ISRG', 'BIIB', 'ILMN', 'DXCM'],
         'XLP': ['PEP', 'COST', 'MDLZ', 'KDP', 'KHC', 'MNST', 'WBA']
     }
     
@@ -97,7 +97,6 @@ class Config:
         CROWDING_PENALTY = 0.75     
         CROWDING_MIN_STOCKS = 2     
         PORTFOLIO_VALUE = 100000.0  
-        ALERT_COOLDOWN_HOURS = 24.0 
         SLIPPAGE = 0.003            
         COMMISSION = 0.0005         
         MIN_T_STAT = 1.0            
@@ -238,41 +237,7 @@ def _save_ext_cache():
             os.replace(temp_ext, Config.EXT_CACHE_FILE)
         except Exception: pass
 
-def fetch_tradingview_screener(max_tickers=150) -> list:
-    try:
-        url = "https://scanner.tradingview.com/america/scan"
-        payload = {
-            "filter": [
-                {"left": "type", "operation": "in_range", "right": ["stock"]},
-                {"left": "subtype", "operation": "in_range", "right": ["common"]},
-                {"left": "exchange", "operation": "in_range", "right": ["AMEX", "NASDAQ", "NYSE"]},
-                {"left": "close", "operation": "greater", "right": 15}, 
-                {"left": "average_volume_10d_calc", "operation": "greater", "right": 2500000}, 
-                {"left": "beta_1_year", "operation": "greater", "right": 1.1}
-            ],
-            "options": {"lang": "en"},
-            "markets": ["america"],
-            "symbols": {"query": {"types": []}, "tickers": []},
-            "columns": ["name", "close", "volume", "RelativeVolume10CG"],
-            "sort": {"sortBy": "RelativeVolume10CG", "sortOrder": "desc"},
-            "range": [0, max_tickers]
-        }
-        headers = _GLOBAL_HEADERS.copy()
-        headers["Content-Type"] = "application/json"
-        
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            tickers = []
-            for item in data.get('data', []):
-                raw_ticker = item['d'][0]
-                ticker = raw_ticker.split(':')[1] if ':' in raw_ticker else raw_ticker
-                tickers.append(ticker)
-            valid_tickers = [t.replace('.', '-') for t in tickers if len(t) <= 5]
-            return valid_tickers
-    except Exception: pass
-    return []
-
+# 🚀 获取 WSB 数据
 def fetch_global_wsb_data() -> Dict[str, float]:
     with _ALT_DATA_LOCK:
         if "WSB_ACCEL_GLOBAL" in _ALT_DATA_CACHE: return _ALT_DATA_CACHE["WSB_ACCEL_GLOBAL"]
@@ -312,6 +277,7 @@ def fetch_global_wsb_data() -> Dict[str, float]:
     with _ALT_DATA_LOCK: _ALT_DATA_CACHE["WSB_ACCEL_GLOBAL"] = wsb_accel_dict
     return wsb_accel_dict
 
+# 🚀 获取情绪与期权数据
 def safe_get_sentiment_data(symbol: str) -> Tuple[float, float, float, float]:
     _init_ext_cache()
     with _DAILY_EXT_LOCK:
@@ -337,6 +303,7 @@ def safe_get_sentiment_data(symbol: str) -> Tuple[float, float, float, float]:
     _save_ext_cache()
     return pcr, iv_skew, short_change, short_float
 
+# 🚀 获取另类因子数据
 def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
     _init_ext_cache()
     with _DAILY_EXT_LOCK:
@@ -370,6 +337,7 @@ def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
     _save_ext_cache()
     return insider_net_buy, analyst_mom, nlp_score, news_summary
 
+# 🚀 财报风控排雷
 def check_earnings_risk(symbol: str) -> bool:
     try:
         tk = yf.Ticker(symbol)
@@ -389,64 +357,7 @@ def check_earnings_risk(symbol: str) -> bool:
     except Exception: pass
     return False
 
-def get_filtered_watchlist(max_stocks: int = 150) -> list:
-    tickers = set(Config.CORE_WATCHLIST) if hasattr(Config, 'CORE_WATCHLIST') else set()
-    tv_tickers = fetch_tradingview_screener(120)
-    if tv_tickers: tickers.update(tv_tickers)
-    
-    if os.path.exists(Config.CACHE_FILE):
-        try:
-            mtime = os.path.getmtime(Config.CACHE_FILE)
-            if time.time() - mtime < 7 * 86400:
-                with open(Config.CACHE_FILE, "r", encoding="utf-8") as f:
-                    cached_tickers = json.load(f)
-                    tickers.update(cached_tickers)
-        except Exception: pass
-
-    tickers_list = list(tickers)
-    try:
-        chunk_size = 50 
-        dfs = []
-        for i in range(0, len(tickers_list), chunk_size):
-            chunk = tickers_list[i:i + chunk_size]
-            for attempt in range(3):
-                try:
-                    chunk_df = yf.download(chunk, period="5d", progress=False, threads=False, timeout=10)
-                    if not chunk_df.empty: 
-                        dfs.append(chunk_df)
-                        break
-                    else: time.sleep((attempt + 1) * 2.5)
-                except Exception: time.sleep((attempt + 1) * 3)
-            if i + chunk_size < len(tickers_list): time.sleep(random.uniform(2.0, 3.5))
-                
-        if not dfs: raise ValueError("批量下载发生全局失败。")
-        df = pd.concat(dfs, axis=1)
-        
-        if isinstance(df.columns, pd.MultiIndex):
-            close_df = df['Close'] if 'Close' in df.columns else df.xs('Close', level=0, axis=1)
-            volume_df = df['Volume'] if 'Volume' in df.columns else df.xs('Volume', level=0, axis=1)
-        else:
-            close_df, volume_df = df, pd.DataFrame(1e6, index=df.index, columns=df.columns)
-
-        available_tickers = set(close_df.columns) if isinstance(close_df, pd.DataFrame) else set()
-        
-        if len(available_tickers) > 200:
-            try:
-                temp_cache = f"{Config.CACHE_FILE}.{threading.get_ident()}.tmp"
-                with open(temp_cache, "w", encoding="utf-8") as f: json.dump(list(available_tickers), f)
-                os.replace(temp_cache, Config.CACHE_FILE)
-            except Exception: pass
-
-        closes = close_df.dropna(axis=1, how='all').ffill().iloc[-1]
-        volumes = volume_df.dropna(axis=1, how='all').mean()
-        turnovers = (closes * volumes).dropna()
-        
-        valid_turnovers = turnovers[(closes > 10.0) & (turnovers > 30_000_000)]
-        top_tickers = valid_turnovers.sort_values(ascending=False).head(max_stocks).index.tolist()
-        if top_tickers: return top_tickers
-        return list(Config.CORE_WATCHLIST)[:max_stocks] if hasattr(Config, 'CORE_WATCHLIST') else []
-    except Exception:
-        return list(Config.CORE_WATCHLIST)[:max_stocks] if hasattr(Config, 'CORE_WATCHLIST') else []
+def get_filtered_watchlist(max_stocks: int = 150) -> list: return list(Config.CORE_WATCHLIST)[:max_stocks]
 
 def load_strategy_performance_tag() -> str:
     try:
@@ -556,7 +467,6 @@ def _robust_hurst(close_prices: np.ndarray, min_window=30, n_bootstrap=100) -> T
     return h_median, h_iqr, is_reliable
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """计算核心技术指标，已彻底修复 numpy array 的 rolling 方法报错"""
     df = df.sort_index()
     df['Close'], df['Volume'] = df['Close'].ffill(), df['Volume'].ffill()
     df['Open'], df['High'], df['Low'] = df['Open'].ffill(), df['High'].ffill(), df['Low'].ffill()
@@ -1027,7 +937,7 @@ class AlpacaGateway(BaseBrokerGateway):
     def submit_order(self, symbol, side, qty, order_type, limit_price=None, client_oid=None) -> BrokerOrder:
         payload = {"symbol": symbol, "qty": str(qty), "side": side.lower(), "type": "market" if order_type == "MARKET" else "limit", "time_in_force": "day"}
         if limit_price and payload["type"] == "limit": payload["limit_price"] = str(round(limit_price, 2))
-        if client_oid: payload["client_order_id"] = client_oid # 🚀 强幂等锁
+        if client_oid: payload["client_order_id"] = client_oid # 🚀 强幂等锁防线
         resp = self.session.post(f"{self.base_url}/v2/orders", json=payload, timeout=5)
         if resp.status_code in [200, 201]: return BrokerOrder(resp.json()["id"], "OPEN", float(resp.json()["filled_qty"]), 0.0)
         return None
@@ -1103,32 +1013,7 @@ class ExecutionEngine:
                     except Exception: pass
             time.sleep(0.2)
 
-# ================= 6. 主程序入口与路由 (全量恢复) =================
-def run_tech_matrix():
-    ctx = _build_market_context()
-    prep, hist = _prepare_universe_data(ctx)
-    if not prep: return
-    
-    raw = []
-    for d in prep:
-        ml_features = _extract_ml_features(d['stock'], ctx, d['cf'], d['alt'], d['seq'].mean(axis=0)[:16])
-        score, sig, factors, black_swan = _evaluate_omni_matrix(d['stock'], ctx, d['cf'], d['alt'])
-        raw.append({'sym': d['sym'], 'curr': d['curr'], 'prev': d['prev'], 'score': score, 'sig': sig, 'factors': factors, 'ml_features': ml_features, 'news': d['news'], 'sym_sec': Config.get_sector_etf(d['sym']), 'is_bearish_div': False, 'black_swan_risk': black_swan, 'total_score': score, 'is_untradeable': False, 'ai_prob': 0.0})
-        
-    raw = _apply_ai_inference(raw, ctx)
-    reps = [{"symbol": r['sym'], "score": r['total_score'], "ai_prob": r['ai_prob'], "signals": r['sig'], "factors": r['factors'], "ml_features": r['ml_features'], "curr_close": r['curr']['Close'], "tp": r['curr']['Close']*1.1, "sl": r['curr']['Close']*0.9, "news": r['news'], "sector": r['sym_sec'], "pos_advice": "", "kelly_fraction": 0.1} for r in raw if r['total_score'] >= Config.Params.MIN_SCORE_THRESHOLD]
-    
-    if reps:
-        freps = _apply_kelly_cluster_optimization(reps, hist, 1.0, ctx)
-        _generate_and_send_matrix_report(freps, [], ctx)
-        _route_orders_to_gateway(freps, ctx)
-    else: logger.info("静默。")
-
-def run_gateway():
-    k, s, u = os.environ.get('ALPACA_API_KEY',''), os.environ.get('ALPACA_API_SECRET',''), os.environ.get('ALPACA_BASE_URL','https://paper-api.alpaca.markets')
-    ExecutionEngine(AlpacaGateway(k, s, u) if k else MockAlpacaGateway()).run()
-
-# 🛡️ 恢复：全量历史回测与淘汰赛引擎
+# ================= 6. 回测引擎与抗噪验证 =================
 def run_backtest_engine() -> None:
     log_files = [f for f in os.listdir('.') if f.startswith('backtest_log') and f.endswith('.jsonl')]
     if not log_files: logger.warning("未找到历史日志，回测取消。"); return
@@ -1323,7 +1208,6 @@ def run_backtest_engine() -> None:
         if not r: continue
         ret_arr = np.array(r)
         win_returns, loss_returns = ret_arr[ret_arr > 0], ret_arr[ret_arr < 0]
-        
         max_cons_loss, curr_cons_loss = 0, 0
         for ret in ret_arr:
             if ret < 0: curr_cons_loss += 1; max_cons_loss = max(max_cons_loss, curr_cons_loss)
@@ -1352,11 +1236,9 @@ def run_backtest_engine() -> None:
     report_md = [f"# 📈 自动量化战报与 AI 透视\n**更新:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n## ⚔️ 核心表现评估\n| 周期 | 原始胜率 | ⚡代谢演化过滤 | 均收益 | 盈亏比 | Sharpe | 胜单平均抗压(MAE) | 笔数 |\n|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"]
     for p in ['T+1', 'T+3', 'T+5']:
         d = res.get(p, {'win_rate':0,'avg_ret':0,'profit_factor':0,'sharpe':0,'avg_win_mae':0,'max_cons_loss':0,'total_trades':0})
-        
-        # 🚀 坚守防线：预计算 f-string 变量，绝不发生内外同态引号嵌套导致的 AST 树雪崩崩溃
-        ai_win_rate_val = d.get('ai_win_rate', 0.0)
-        ai_str = f"**{ai_win_rate_val*100:.1f}%**" if 'ai_win_rate' in d else "-"
-        
+        # 🚀 防崩溃：提取变量，避免 f-string 内部含有单引号字典查询
+        ai_win_val = d.get('ai_win_rate', 0.0)
+        ai_str = f"**{ai_win_val*100:.1f}%**" if 'ai_win_rate' in d else "-"
         report_md.append(f"| {p} | {d['win_rate']*100:.1f}% | {ai_str} | {d['avg_ret']*100:+.2f}% | {d['profit_factor']:.2f} | {d['sharpe']:.2f} | {d['avg_win_mae']*100:.1f}% | {d['total_trades']} |")
     
     if factor_ic_report:
@@ -1388,16 +1270,13 @@ def run_backtest_engine() -> None:
 
     with open(Config.REPORT_FILE, 'w', encoding='utf-8') as f: f.write('\n'.join(report_md))
     
-    # 🚀 坚守防线：处理第二个战报推送中的嵌套漏洞
     alert_lines = ["### 📊 **机构级回测报表 (含代谢淘汰赛)**"]
     for p, d in res.items():
-        ai_win_rate_val = d.get('ai_win_rate', 0.0)
-        ai_text = f" | ⚡代谢演化过滤: **{ai_win_rate_val*100:.1f}%**" if 'ai_win_rate' in d else ""
+        ai_win_val = d.get('ai_win_rate', 0.0)
+        ai_text = f" | ⚡代谢演化过滤: **{ai_win_val*100:.1f}%**" if 'ai_win_rate' in d else ""
         alert_lines.append(f"- **{p}:** 原始胜率 {d['win_rate']*100:.1f}%{ai_text} | 盈亏比 {d['profit_factor']:.2f}")
-        
     send_alert("策略终极回测战报 (代谢进化版)", "\n".join(alert_lines))
 
-# 🛡️ 恢复：合成数据压测引擎与辅助函数
 def _decompose_and_perturb(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     df_phase, df_noise = df.copy(), df.copy()
     c = df['Close']
@@ -1469,11 +1348,15 @@ def run_synthetic_stress_test() -> None:
     report_lines.append(f"\n**🌋 平行宇宙B：噪音爆炸 (Noise Amplified 1.5x)**\n- {_fmt(noise)}")
     send_alert("终极实战压测报告", "\n".join(report_lines))
 
-if __name__ == "__main__":
-    validate_config()
+# ================= 7. 启动与执行 =================
+def run_main_pipeline():
     m = sys.argv[1] if len(sys.argv) > 1 else "matrix"
     if m == "matrix": run_tech_matrix()
     elif m == "gateway": run_gateway()
     elif m == "backtest": run_backtest_engine()
     elif m == "stress": run_synthetic_stress_test()
     elif m == "test": send_alert("连通性测试", "全维宏观 Meta 跃迁完成！系统已开启 6 维上帝视野。")
+
+if __name__ == "__main__":
+    validate_config()
+    run_main_pipeline()
