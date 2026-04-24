@@ -358,8 +358,8 @@ def check_macd_cross(curr: pd.Series, prev: pd.Series) -> bool:
     return prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']
 
 def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 3, fast_mode: bool = False) -> pd.DataFrame:
-    global _WORKER_LOCAL_LIMITER
-    # ✅ 修复1：对缓存键做路径安全转义，防止部分文件系统拒绝含有 '^' 或 '/' 的写入
+    # ✅ 移除冗余的 global _WORKER_LOCAL_LIMITER 声明以通过 Flake8 检查
+    # 修复1：对缓存键做路径安全转义，防止部分文件系统拒绝含有 '^' 或 '/' 的写入
     safe_sym = symbol.replace('^', '_caret_').replace('/', '_slash_')
     cache_key = f"{safe_sym}_{interval}_{period}"
     
@@ -368,7 +368,7 @@ def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retr
     if cached_df is not None and not cached_df.empty:
         return cached_df.copy()
         
-    # ✅ 修复2：缓存向下兼容降维拦截（极大节省短线如 `5d` 的请求令牌）
+    # 修复2：缓存向下兼容降维拦截（极大节省短线如 `5d` 的请求令牌）
     if period != "1y":
         long_key = f"{safe_sym}_{interval}_1y"
         long_cached = _SHARED_CACHE.get(long_key)
@@ -385,7 +385,7 @@ def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retr
                 cutoff = pd.Timestamp.now(tz=timezone.utc) - pd.Timedelta(days=183)
                 return long_cached[long_cached.index >= cutoff].copy()
 
-    # ✅ 修复3: 自动识别执行上下文环境，优先使用子进程内安全分配的局部低配版限速器
+    # 修复3: 自动识别执行上下文环境，优先使用子进程内安全分配的局部低配版限速器
     limiter = _WORKER_LOCAL_LIMITER or _API_LIMITER
 
     for attempt in range(retries):
