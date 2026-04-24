@@ -93,4 +93,49 @@ AI 模型迭代版本与胜率置信度雷达图。
 
 💣 财报雷区 (Earnings Roulette)：精准探测财报周危险期，极速缩仓防爆雷。
 
+🐣 新手起步与避坑指南 (Beginner's Guide)
+
+对于刚接触 Python 或云服务器运行量化脚本的初学者，请务必牢记以下“生存法则”：
+
+1. 隔离环境是第一生命线 (虚拟环境)
+
+不要使用系统自带的 Python 运行本机！ 量化库对版本要求极度苛刻（如 Pandas、Numpy）。
+
+请务必使用 Conda 或 Miniforge 创建独立的沙盒环境：conda create -n quantbot python=3.10
+
+每次通过 SSH 登录服务器后，执行任何命令前，第一件事永远是：conda activate quantbot（看到命令行前面出现 (quantbot) 字样才算成功）。
+
+2. 硬件加速脚本只需“打一针”
+
+项目根目录下的 setup_arm_blas.sh 是用来强行压榨 ARM 物理机芯片性能的环境配置脚本。
+
+这个脚本只需要在您第一次配置这台服务器时运行一次。
+
+运行完并看到 AVAILABLE 提示后，就再也不用管它了，千万不要把它放在定时任务里每天跑。
+
+3. 别在黑框里“死等”后台任务 (终端挂起)
+
+如果您在 SSH 窗口里直接输入 python quant_engine.py matrix，一旦您的电脑休眠、断网或关掉 SSH 窗口，程序就会立刻死亡。
+
+新手推荐方式：直接在 GitHub 网页端点击 Actions 运行。
+
+进阶后台运行：如果您想在服务器上挂机全息指挥仓，请使用 nohup 命令让它脱离终端运行：
+nohup streamlit run dashboard.py --server.port 8501 --server.address 0.0.0.0 > dashboard.log 2>&1 &
+
+4. 绝对不要用手碰 .quantbot_data (数据隔离)
+
+项目运行时会自动生成一个 .quantbot_data 隐藏文件夹，里面装满了 SQLite 账本文件、内存映射文件和机器学习的 .npz 切片。
+
+警告：永远不要在程序运行期间，尝试用文本编辑器、Excel 手动去打开或修改里面的文件！
+
+这会瞬间破坏底层文件锁和内存映射，导致高频并发引擎报出致命级崩溃。如果非要查看，请通过 dashboard.py 的前端大屏观看。
+
+5. 密钥配置不要写死在代码里
+
+程序需要券商 API 和 Telegram/钉钉机器人 Token 才能进行消息推送。
+
+请不要把密码硬编码（Hardcode）写在 quant_engine.py 的文件里。
+
+正确做法是在 GitHub 仓库的 Settings -> Secrets and variables -> Actions 中配置（比如 TELEGRAM_BOT_TOKEN），系统运行时会自动抓取，保证您的资产与账户安全。
+
 "The Singularity is near. We don't predict the market, we compute its topology."
