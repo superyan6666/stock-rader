@@ -534,7 +534,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['ATR_22'] = df['TR'].rolling(22).mean()
     df['Chandelier_Exit'] = df['Highest_22'] - 2.5 * df['ATR_22']
     
-    # 🚀 物理防御：确保 numpy array 被安全的包裹为 Pandas Series，彻底免疫 'numpy.ndarray' 报错
     df['Smart_Money_Flow'] = pd.Series(clv_num / hl_diff, index=df.index).rolling(10).mean()
 
     df['Recent_Price_Surge_3d'] = (df['Close'] / df['Open'] - 1).rolling(3).max().shift(1) * 100
@@ -869,7 +868,6 @@ def _generate_and_send_matrix_report(final_reports: List[dict], final_shadow_poo
     txts = []
     for idx, r in enumerate(final_reports):
         icon = ['🥇', '🥈', '🥉'][idx] if idx < 3 else '🔸'
-        # 🚀 坚守防线：预计算 ai_display，彻底免疫 Python AST F-string 嵌套崩溃
         ai_prob = r.get('ai_prob', 0)
         ai_display = f"🔥 **{ai_prob:.1%}**" if ai_prob > 0.60 else f"{ai_prob:.1%}"
         sigs_str = "\n".join([f"- {s}" for s in r.get("signals", [])])
@@ -937,7 +935,7 @@ class AlpacaGateway(BaseBrokerGateway):
     def submit_order(self, symbol, side, qty, order_type, limit_price=None, client_oid=None) -> BrokerOrder:
         payload = {"symbol": symbol, "qty": str(qty), "side": side.lower(), "type": "market" if order_type == "MARKET" else "limit", "time_in_force": "day"}
         if limit_price and payload["type"] == "limit": payload["limit_price"] = str(round(limit_price, 2))
-        if client_oid: payload["client_order_id"] = client_oid # 🚀 强幂等锁防线
+        if client_oid: payload["client_order_id"] = client_oid
         resp = self.session.post(f"{self.base_url}/v2/orders", json=payload, timeout=5)
         if resp.status_code in [200, 201]: return BrokerOrder(resp.json()["id"], "OPEN", float(resp.json()["filled_qty"]), 0.0)
         return None
@@ -1013,7 +1011,101 @@ class ExecutionEngine:
                     except Exception: pass
             time.sleep(0.2)
 
-# ================= 6. 回测引擎与抗噪验证 =================
+# ================= 6. 主程序入口与路由 (全量恢复) =================
+def run_tech_matrix():
+    ctx = _build_market_context()
+    prep, hist = _prepare_universe_data(ctx)
+    if not prep: return
+    
+    if getattr(ctx, 'transformer_model', None) is not None:
+        try:
+            seqs = np.array([d['seq'] for d in prep]) 
+            alpha_vecs = ctx.transformer_model.extract_alpha(seqs) 
+            for i, d in enumerate(prep): d['alpha_vec'] = alpha_vecs[i]
+        except Exception as e:
+            for d in prep: d['alpha_vec'] = np.zeros(16)
+    else:
+        for d in prep: d['alpha_vec'] = np.zeros(16)
+
+    raw = []
+    for d in prep:
+        ml_features = _extract_ml_features(d['stock'], ctx, d['cf'], d['alt'], d.get('alpha_vec', np.zeros(16)))
+        score, sig, factors, black_swan = _evaluate_omni_matrix(d['stock'], ctx, d['cf'], d['alt'])
+        score, is_bearish_div, sig = _apply_market_filters(d['curr'], d['prev'], d['sym'], score, sig, [], [], [])
+        
+        raw.append({
+            'sym': d['sym'], 'curr': d['curr'], 'prev': d['prev'], 'score': score, 
+            'sig': sig, 'factors': factors, 'ml_features': ml_features, 'news': d['news'], 
+            'sym_sec': Config.get_sector_etf(d['sym']), 'is_bearish_div': is_bearish_div, 
+            'black_swan_risk': black_swan, 'total_score': score, 'is_untradeable': False, 
+            'ai_prob': 0.0
+        })
+        
+    raw = _apply_ai_inference(raw, ctx)
+    
+    reps, background_pool, all_raw_scores = [], [], []
+    for r in raw:
+        if r['total_score'] > 0: all_raw_scores.append(r['total_score'])
+        
+        tp_val, sl_val, kelly_fraction, basic_advice = _calculate_position_size(
+            StockData(r['sym'], pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), r['curr'], r['prev'], False, 0.0), 
+            ctx, r['ai_prob'], r['is_bearish_div'], r['black_swan_risk']
+        )
+
+        stock_data_pack = {
+            "symbol": r['sym'], "score": r['total_score'], "ai_prob": r['ai_prob'], "signals": r['sig'][:8], 
+            "factors": r['factors'], "ml_features": r['ml_features'],
+            "curr_close": float(r['curr']['Close']), "tp": float(tp_val), "sl": float(sl_val), 
+            "news": r['news'], "sector": r['sym_sec'], "pos_advice": basic_advice,
+            "kelly_fraction": kelly_fraction
+        }
+
+        if not r['is_untradeable'] and r['total_score'] > 0 and kelly_fraction > 0:
+            if check_earnings_risk(r['sym']):
+                r['sig'].append("💣 [财报雷区] 近5日发财报,风险极高")
+                r['total_score'] = int(r['total_score'] * 0.5)
+                stock_data_pack["score"] = r['total_score']
+            reps.append(stock_data_pack)
+        else:
+            background_pool.append(stock_data_pack)
+
+    if reps and all_raw_scores:
+        ctx.dynamic_min_score = max(Config.Params.MIN_SCORE_THRESHOLD, np.percentile(all_raw_scores, 85))
+        reps = [r for r in reps if r['score'] >= ctx.dynamic_min_score]
+        
+        groups = defaultdict(list)
+        for r in reps: groups[r["sector"]].append(r)
+        
+        for sec, stks in groups.items():
+            if hasattr(Config, 'CROWDING_EXCLUDE_SECTORS') and sec not in Config.CROWDING_EXCLUDE_SECTORS and len(stks) >= Config.Params.CROWDING_MIN_STOCKS:
+                pen = max(0.6, min(0.9, Config.Params.CROWDING_PENALTY * (1.0 + ctx.health_score * 0.3)))
+                for s in stks[1:]: s["score"] = int(s["score"] * pen)
+
+        freps = _apply_kelly_cluster_optimization(reps, hist, ctx.total_market_exposure, ctx)
+        
+        for r in freps: set_alerted(r["symbol"])
+        
+        final_symbols = {r['symbol'] for r in freps}
+        unselected_background = [s for s in background_pool if s['symbol'] not in final_symbols]
+        random.shuffle(unselected_background)
+        final_shadow_pool = unselected_background[:150]
+        
+        for r in final_shadow_pool: set_alerted(r["symbol"], is_shadow=True, shadow_data=r)
+            
+        _generate_and_send_matrix_report(freps, final_shadow_pool, ctx)
+        _route_orders_to_gateway(freps, ctx)
+    else:
+        logger.info("📭 本次矩阵扫描无标的突破 Top 15% 截面排位，宁缺毋滥，保持静默。")
+
+
+def run_gateway():
+    k = os.environ.get('ALPACA_API_KEY','')
+    s = os.environ.get('ALPACA_API_SECRET','')
+    u = os.environ.get('ALPACA_BASE_URL','https://paper-api.alpaca.markets')
+    broker = AlpacaGateway(k, s, u) if k and s else MockAlpacaGateway()
+    ExecutionEngine(broker).run()
+
+# ================= 7. 回测引擎与抗噪验证 =================
 def run_backtest_engine() -> None:
     log_files = [f for f in os.listdir('.') if f.startswith('backtest_log') and f.endswith('.jsonl')]
     if not log_files: logger.warning("未找到历史日志，回测取消。"); return
@@ -1236,7 +1328,6 @@ def run_backtest_engine() -> None:
     report_md = [f"# 📈 自动量化战报与 AI 透视\n**更新:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n## ⚔️ 核心表现评估\n| 周期 | 原始胜率 | ⚡代谢演化过滤 | 均收益 | 盈亏比 | Sharpe | 胜单平均抗压(MAE) | 笔数 |\n|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"]
     for p in ['T+1', 'T+3', 'T+5']:
         d = res.get(p, {'win_rate':0,'avg_ret':0,'profit_factor':0,'sharpe':0,'avg_win_mae':0,'max_cons_loss':0,'total_trades':0})
-        # 🚀 防崩溃：提取变量，避免 f-string 内部含有单引号字典查询
         ai_win_val = d.get('ai_win_rate', 0.0)
         ai_str = f"**{ai_win_val*100:.1f}%**" if 'ai_win_rate' in d else "-"
         report_md.append(f"| {p} | {d['win_rate']*100:.1f}% | {ai_str} | {d['avg_ret']*100:+.2f}% | {d['profit_factor']:.2f} | {d['sharpe']:.2f} | {d['avg_win_mae']*100:.1f}% | {d['total_trades']} |")
@@ -1348,15 +1439,11 @@ def run_synthetic_stress_test() -> None:
     report_lines.append(f"\n**🌋 平行宇宙B：噪音爆炸 (Noise Amplified 1.5x)**\n- {_fmt(noise)}")
     send_alert("终极实战压测报告", "\n".join(report_lines))
 
-# ================= 7. 启动与执行 =================
-def run_main_pipeline():
+if __name__ == "__main__":
+    validate_config()
     m = sys.argv[1] if len(sys.argv) > 1 else "matrix"
     if m == "matrix": run_tech_matrix()
     elif m == "gateway": run_gateway()
     elif m == "backtest": run_backtest_engine()
     elif m == "stress": run_synthetic_stress_test()
     elif m == "test": send_alert("连通性测试", "全维宏观 Meta 跃迁完成！系统已开启 6 维上帝视野。")
-
-if __name__ == "__main__":
-    validate_config()
-    run_main_pipeline()
