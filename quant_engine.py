@@ -48,6 +48,15 @@ _GLOBAL_HEADERS = {
     'Accept': 'application/json'
 }
 
+# 注入带有强效防抖与重试机制的全局 Session
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_GLOBAL_SESSION = requests.Session()
+_retry_strategy = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+_GLOBAL_SESSION.mount("https://", HTTPAdapter(max_retries=_retry_strategy, pool_connections=20, pool_maxsize=20))
+_GLOBAL_SESSION.headers.update(_GLOBAL_HEADERS)
+
 class Config:
     WEBHOOK_URL: str = os.environ.get('WEBHOOK_URL', '')
     TELEGRAM_BOT_TOKEN: str = os.environ.get('TELEGRAM_BOT_TOKEN', '')
@@ -249,12 +258,13 @@ def fetch_global_wsb_data() -> Dict[str, float]:
         except Exception: pass
     current_data = {}
     try:
-        resp = requests.get("https://tradestie.com/api/v1/apps/reddit", headers=_GLOBAL_HEADERS, timeout=10)
+        resp = _GLOBAL_SESSION.get("https://tradestie.com/api/v1/apps/reddit", timeout=10)
         if resp.status_code == 200:
             for item in resp.json():
                 tk = item.get('ticker')
                 if tk and item.get('sentiment') == 'Bullish': current_data[tk] = item.get('no_of_comments', 0)
-    except Exception: pass
+    except Exception as e:
+        logger.debug(f"WSB API 熔断保护触发: {e}")
     if current_data: history[today_str] = current_data
     sorted_dates = sorted(history.keys())
     if len(sorted_dates) > 5:
@@ -871,14 +881,34 @@ def _build_market_context() -> MarketContext:
 
 def _prepare_universe_data(ctx: MarketContext) -> Tuple[List[dict], dict]:
     prepared_data = []
-    for sym in get_filtered_watchlist(max_stocks=30):
-        df = safe_get_history(sym, "1y", "1d", fast_mode=True)
-        if len(df) < 60: continue
-        df_ind = calculate_indicators(df)
-        stock = StockData(sym, df_ind, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), df_ind.iloc[-1], df_ind.iloc[-2], False, 0.0)
-        cf = _extract_complex_features(stock, ctx)
-        alt = AltData(*safe_get_sentiment_data(sym)[:4], *safe_get_alt_data(sym)[:3], 0.0)
-        prepared_data.append({'sym': sym, 'stock': stock, 'alt': alt, 'cf': cf, 'seq': _get_transformer_seq(df_ind), 'curr': df_ind.iloc[-1], 'prev': df_ind.iloc[-2], 'news': "", 'close_history': df['Close'].tail(60).values})
+    symbols = get_filtered_watchlist(max_stocks=30)
+    logger.info(f"🚀 启动高并发特征抽取引擎，共 {len(symbols)} 个标的，开启网络防抖与死锁熔断保护...")
+    
+    def _process_single_stock(sym: str) -> Optional[dict]:
+        try:
+            df = safe_get_history(sym, "1y", "1d", fast_mode=True)
+            if len(df) < 60: return None
+            df_ind = calculate_indicators(df)
+            stock = StockData(sym, df_ind, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), df_ind.iloc[-1], df_ind.iloc[-2], False, 0.0)
+            cf = _extract_complex_features(stock, ctx)
+            alt = AltData(*safe_get_sentiment_data(sym)[:4], *safe_get_alt_data(sym)[:3], 0.0)
+            return {'sym': sym, 'stock': stock, 'alt': alt, 'cf': cf, 'seq': _get_transformer_seq(df_ind), 'curr': df_ind.iloc[-1], 'prev': df_ind.iloc[-2], 'news': "", 'close_history': df['Close'].tail(60).values}
+        except Exception as e:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=Config.Params.MAX_WORKERS * 2) as executor:
+        future_to_sym = {executor.submit(_process_single_stock, sym): sym for sym in symbols}
+        # 设置总超时与单任务等待，防止整个 Matrix 陷入网络死锁
+        for future in concurrent.futures.as_completed(future_to_sym, timeout=180.0):
+            sym = future_to_sym[future]
+            try:
+                res = future.result(timeout=45.0) 
+                if res: prepared_data.append(res)
+            except concurrent.futures.TimeoutError:
+                logger.warning(f"⚠️ [防抖熔断] 标的 {sym} API 响应死锁 (处理超时)，已被沙盒强行隔离剔除！")
+            except Exception as e:
+                logger.warning(f"⚠️ [数据异常] 标的 {sym} 获取失败，已忽略: {e}")
+
     return prepared_data, {d['sym']: d['close_history'] for d in prepared_data}
 
 def _apply_ai_inference(reports: List[dict], ctx: MarketContext) -> List[dict]:
