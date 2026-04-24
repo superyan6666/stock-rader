@@ -189,6 +189,27 @@ class MarketContext:
     meta_weights: dict = field(default_factory=dict); transformer_model: 'Any' = None  
 
 @dataclass
+class MarketContextLite:
+    """可安全跨进程序列化的纯值上下文（零 DataFrame，零锁对象）"""
+    regime: str; w_mul: float; xai_weights: dict; vix_current: float
+    macro_gravity: bool; health_score: float; dynamic_min_score: float
+    qqq_ret_20d: float; spy_vol_20d: float
+
+def _build_ctx_lite(ctx: MarketContext) -> MarketContextLite:
+    """从完整 ctx 蒸馏出可序列化的轻量版本"""
+    qqq_ret_20d, spy_vol_20d = 0.0, 15.0
+    if not ctx.qqq_df.empty and len(ctx.qqq_df) >= 20:
+        qqq_ret_20d = float((ctx.qqq_df['Close'].iloc[-1] / ctx.qqq_df['Close'].iloc[-20]) - 1.0)
+        spy_ret = ctx.qqq_df['Close'].pct_change().dropna()
+        spy_vol_20d = float(spy_ret.iloc[-20:].std() * np.sqrt(252) * 100)
+    return MarketContextLite(
+        regime=ctx.regime, w_mul=ctx.w_mul, xai_weights=ctx.xai_weights,
+        vix_current=ctx.vix_current, macro_gravity=ctx.macro_gravity,
+        qqq_ret_20d=qqq_ret_20d, spy_vol_20d=spy_vol_20d,
+        health_score=ctx.health_score, dynamic_min_score=ctx.dynamic_min_score
+    )
+
+@dataclass
 class StockData:
     sym: str; df: pd.DataFrame; df_w: pd.DataFrame; df_m: pd.DataFrame; df_60m: pd.DataFrame
     curr: pd.Series; prev: pd.Series; is_vol: bool; swing_high_10: float
@@ -685,7 +706,7 @@ def _get_transformer_seq(df_ind: pd.DataFrame, end_idx: int = -1) -> np.ndarray:
     for idx, vals in feature_mapping: seq[:, idx] = vals
     return np.nan_to_num(seq, nan=0.0, posinf=5.0, neginf=-5.0)
 
-def _extract_complex_features(stock: StockData, ctx: MarketContext) -> ComplexFeatures:
+def _extract_complex_features(stock: StockData, ctx: Any) -> ComplexFeatures:
     weekly_bullish, weekly_macd_res, fvg_lower, fvg_upper = False, 0.0, 0.0, 0.0
     aligned_w = stock.df_w
     if not aligned_w.empty and len(aligned_w) >= 40:
@@ -732,23 +753,21 @@ def _extract_complex_features(stock: StockData, ctx: MarketContext) -> ComplexFe
         if len(rsi_60m) >= 2 and rsi_60m.iloc[-1] > rsi_60m.iloc[-2] and rsi_60m.iloc[-2] < 40: rsi_60m_bounce = 1.0
             
     stock_ret = stock.df['Close'].pct_change().fillna(0)
-    beta_60d, spy_realized_vol = 1.0, 15.0 
-    if 'spy' in ctx.macro_data and not ctx.macro_data['spy'].empty and len(stock_ret) >= 60:
-        spy_ret = ctx.macro_data['spy']['Close'].pct_change().reindex(stock_ret.index).fillna(0)
-        cov_mat = np.cov(stock_ret.iloc[-60:], spy_ret.iloc[-60:])
-        if cov_mat[1,1] > 0: beta_60d = cov_mat[0, 1] / cov_mat[1, 1]
-        spy_realized_vol = spy_ret.iloc[-20:].std() * np.sqrt(252) * 100
-        
+    beta_60d = 1.0
     tlt_corr, dxy_corr = 0.0, 0.0
-    if 'tlt' in ctx.macro_data and not ctx.macro_data['tlt'].empty and len(stock_ret) >= 90:
-        tlt_ret = ctx.macro_data['tlt']['Close'].pct_change().reindex(stock_ret.index).fillna(0)
-        tlt_corr = stock_ret.iloc[-90:].corr(tlt_ret.iloc[-90:])
-    if 'dxy' in ctx.macro_data and not ctx.macro_data['dxy'].empty and len(stock_ret) >= 20:
-        dxy_ret = ctx.macro_data['dxy']['Close'].pct_change().reindex(stock_ret.index).fillna(0)
-        dxy_corr = stock_ret.iloc[-20:].corr(dxy_ret.iloc[-20:])
-        
     rs_20, pure_alpha = 0.0, 0.0
-    if not ctx.qqq_df.empty:
+    
+    # 动态适配 MarketContext (主进程) 与 MarketContextLite (子进程)
+    spy_realized_vol = getattr(ctx, 'spy_vol_20d', 15.0)
+
+    if hasattr(ctx, 'qqq_ret_20d') and len(stock.df) >= 20: 
+        # Lite Context 模式 (IPC 子进程极速计算)
+        try:
+            stock_ret_20d = float((stock.df['Close'].iloc[-1] / stock.df['Close'].iloc[-20]) - 1.0)
+            rs_20 = float((stock_ret_20d + 1.0) / (ctx.qqq_ret_20d + 1.0))
+        except Exception: pass
+    elif hasattr(ctx, 'qqq_df') and not ctx.qqq_df.empty: 
+        # Original Context 模式 (含完整 DataFrame 的精确计算)
         m_df = pd.merge(stock.df[['Close']], ctx.qqq_df[['Close']], left_index=True, right_index=True, how='inner')
         if len(m_df) >= 60:
             qqq_ret = max(m_df['Close_y'].iloc[-1] / m_df['Close_y'].iloc[-20], 0.5)
@@ -757,6 +776,20 @@ def _extract_complex_features(stock: StockData, ctx: MarketContext) -> ComplexFe
             cov_matrix = np.cov(ret_stock.iloc[-60:], ret_qqq.iloc[-60:])
             beta_local = cov_matrix[0,1] / (cov_matrix[1,1] + 1e-10) if cov_matrix[1,1] > 0 else 1.0
             pure_alpha = (ret_stock.iloc[-5:].mean() - beta_local * ret_qqq.iloc[-5:].mean()) * 252
+            
+        if 'spy' in ctx.macro_data and not ctx.macro_data['spy'].empty and len(stock_ret) >= 60:
+            spy_ret = ctx.macro_data['spy']['Close'].pct_change().reindex(stock_ret.index).fillna(0)
+            cov_mat = np.cov(stock_ret.iloc[-60:], spy_ret.iloc[-60:])
+            if cov_mat[1,1] > 0: beta_60d = cov_mat[0, 1] / cov_mat[1, 1]
+            spy_realized_vol = spy_ret.iloc[-20:].std() * np.sqrt(252) * 100
+            
+        if 'tlt' in ctx.macro_data and not ctx.macro_data['tlt'].empty and len(stock_ret) >= 90:
+            tlt_ret = ctx.macro_data['tlt']['Close'].pct_change().reindex(stock_ret.index).fillna(0)
+            tlt_corr = stock_ret.iloc[-90:].corr(tlt_ret.iloc[-90:])
+            
+        if 'dxy' in ctx.macro_data and not ctx.macro_data['dxy'].empty and len(stock_ret) >= 20:
+            dxy_ret = ctx.macro_data['dxy']['Close'].pct_change().reindex(stock_ret.index).fillna(0)
+            dxy_corr = stock_ret.iloc[-20:].corr(dxy_ret.iloc[-20:])
         
     return ComplexFeatures(
         weekly_bullish=weekly_bullish, fvg_lower=fvg_lower, fvg_upper=fvg_upper, 
@@ -768,7 +801,7 @@ def _extract_complex_features(stock: StockData, ctx: MarketContext) -> ComplexFe
         rs_20=float(rs_20), pure_alpha=float(pure_alpha)
     )
 
-def _extract_ml_features(stock: StockData, ctx: MarketContext, cf: ComplexFeatures, alt: AltData, alpha_vec: np.ndarray = None) -> dict:
+def _extract_ml_features(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: AltData, alpha_vec: np.ndarray = None) -> dict:
     macd_cross_strength = safe_div(stock.curr['MACD'] - stock.curr['Signal_Line'], abs(stock.curr['Close']) * 0.01)
     vol_surge_ratio = safe_div(stock.curr['Volume'], stock.curr['Vol_MA20'], cap=50.0)
     cmf_val, smf_val = stock.curr['CMF'], stock.curr['Smart_Money_Flow']
@@ -814,7 +847,7 @@ def _extract_ml_features(stock: StockData, ctx: MarketContext, cf: ComplexFeatur
         for i in range(1, 17): feat_dict[f"Alpha_T{i:02d}"] = 0.0
     return {f: float(np.nan_to_num(feat_dict.get(f, 0.0), nan=0.0, posinf=20.0, neginf=-20.0)) for f in Config.ALL_FACTORS}
 
-def _evaluate_omni_matrix(stock: StockData, ctx: MarketContext, cf: ComplexFeatures, alt: AltData) -> Tuple[int, List[str], List[str], bool]:
+def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: AltData) -> Tuple[int, List[str], List[str], bool]:
     triggered_list, factors_list = [], []
     theme_scores = {'TREND': 0.0, 'VOLATILITY': 0.0, 'REVERSAL': 0.0, 'QUANTUM': 0.0}
     black_swan_risk = False
@@ -823,11 +856,12 @@ def _evaluate_omni_matrix(stock: StockData, ctx: MarketContext, cf: ComplexFeatu
     def add_trigger(tag, text, pts, theme):
         fw = get_fw(tag)
         if fw > 0:
-            adj_pts = pts * ctx.w_mul * fw
-            if ctx.regime in ["bear", "hidden_bear"]:
+            adj_pts = pts * getattr(ctx, 'w_mul', 1.0) * fw
+            regime = getattr(ctx, 'regime', 'range')
+            if regime in ["bear", "hidden_bear"]:
                 if theme in ["TREND", "VOLATILITY"]: adj_pts *= 0.6  
                 elif theme == "REVERSAL": adj_pts *= 1.4
-            elif ctx.regime in ["bull", "rebound"]:
+            elif regime in ["bull", "rebound"]:
                 if theme in ["TREND", "VOLATILITY", "QUANTUM"]: adj_pts *= 1.2
             theme_scores[theme] += adj_pts
             triggered_list.append(text.format(fw=fw)); factors_list.append(tag)
@@ -861,7 +895,7 @@ def _evaluate_omni_matrix(stock: StockData, ctx: MarketContext, cf: ComplexFeatu
 
     if stock.prev['NR7'] and stock.prev['Inside_Bar'] and stock.curr['Close'] > stock.prev['High']: add_trigger("NR7极窄突破", "🎯 [极度压缩] 7日极窄压缩孕线完成向上爆破 (权:{fw:.2f}x)", 12, "VOLATILITY")
 
-    vcp_th = Config.Params.VCP_BEAR if ctx.regime in ["bear", "hidden_bear"] else Config.Params.VCP_BULL
+    vcp_th = Config.Params.VCP_BEAR if getattr(ctx, 'regime', 'range') in ["bear", "hidden_bear"] else Config.Params.VCP_BULL
     if stock.curr['Range_20'] > 0 and stock.curr['Range_20'] < stock.curr['Range_60'] * vcp_th and stock.curr['Close'] > stock.curr['SMA_50']:
         add_trigger("VCP收缩", f"🌪️ [VCP形态] 极度价格波动压缩后的放量突破 (阈值:{vcp_th} 权:{{fw:.2f}}x)", 15, "VOLATILITY")
 
@@ -906,8 +940,9 @@ def _evaluate_omni_matrix(stock: StockData, ctx: MarketContext, cf: ComplexFeatu
     if cf.monthly_inst_flow == 1.0: add_trigger("聪明钱月度净流入(月线)", "🏛️ [战略定调] 月线级别连续3个月大单资金净流入，暗池机构底仓坚如磐石 (权:{fw:.2f}x)", 10, "QUANTUM")
     if cf.rsi_60m_bounce == 1.0: add_trigger("60分钟级精准校准(RSI反弹)", "⏱️ [战术执行] 60分钟线 RSI 触底反弹，日内高频微操切入绝佳滑点位置 (权:{fw:.2f}x)", 8, "REVERSAL")
 
-    if cf.beta_60d > 1.2 and not ctx.macro_gravity: add_trigger("大盘Beta(宏观调整)", "📈 [宏观Beta动能] 宏观低压期，高Beta(>1.2)特质赋予极强上行弹性 (权:{fw:.2f}x)", 7, "TREND")
-    elif cf.beta_60d > 1.2 and ctx.macro_gravity: add_trigger("大盘Beta(宏观调整)", "⚠️ [宏观Beta反噬] 宏观引力波高压期，高Beta特质面临深度回撤风险，降权防御 (权:{fw:.2f}x)", -10, "TREND")
+    macro_gravity = getattr(ctx, 'macro_gravity', False)
+    if cf.beta_60d > 1.2 and not macro_gravity: add_trigger("大盘Beta(宏观调整)", "📈 [宏观Beta动能] 宏观低压期，高Beta(>1.2)特质赋予极强上行弹性 (权:{fw:.2f}x)", 7, "TREND")
+    elif cf.beta_60d > 1.2 and macro_gravity: add_trigger("大盘Beta(宏观调整)", "⚠️ [宏观Beta反噬] 宏观引力波高压期，高Beta特质面临深度回撤风险，降权防御 (权:{fw:.2f}x)", -10, "TREND")
 
     if cf.tlt_corr > 0.4: add_trigger("利率敏感度(TLT相关性)", "🏦 [宏观映射] 与长期国债(TLT)高度正相关，受益于无风险利率见顶预期 (权:{fw:.2f}x)", 8, "TREND")
     elif cf.tlt_corr < -0.4: add_trigger("利率敏感度(TLT相关性)", "🛡️ [宏观防御] 与长期国债(TLT)高度负相关，具备抗息避险属性 (权:{fw:.2f}x)", 6, "TREND")
@@ -918,7 +953,7 @@ def _evaluate_omni_matrix(stock: StockData, ctx: MarketContext, cf: ComplexFeatu
     if dist_52w > Config.Params.DIST_52W and cf.weekly_bullish: add_trigger("52周高点距离(动能延续)", "🏔️ [动能延续] 逼近 52 周新高且周线多头，上方无抛压阻力真空区 (权:{fw:.2f}x)", 10, "TREND")
         
     amihud_val = stock.curr['Amihud'] if pd.notna(stock.curr['Amihud']) else 0.0
-    if amihud_val > Config.Params.AMIHUD_ILLIQ and ctx.macro_gravity: add_trigger("Amihud非流动性(冲击成本)", "⚠️ [流动性枯竭] 宏观高压下 Amihud 冲击成本显著放大，极易发生踩踏被降权 (权:{fw:.2f}x)", -10, "VOLATILITY")
+    if amihud_val > Config.Params.AMIHUD_ILLIQ and macro_gravity: add_trigger("Amihud非流动性(冲击成本)", "⚠️ [流动性枯竭] 宏观高压下 Amihud 冲击成本显著放大，极易发生踩踏被降权 (权:{fw:.2f}x)", -10, "VOLATILITY")
     if cf.vrp > Config.Params.VRP_EXTREME: add_trigger("波动率风险溢价(VRP)", f"🌋 [风险溢价] VRP归一化极度飙升(溢价率>{cf.vrp*100:.1f}%)，期权市场定价极端恐慌，捕捉极值底 (权:{{fw:.2f}}x)", 12, "QUANTUM")
 
     if alt.nlp_score > Config.Params.NLP_BULL: add_trigger("舆情NLP情感极值(News_NLP)", f"📰 [舆情引擎] VADER-Lite 分析判定近期新闻呈现极度狂热 (复合得分:{alt.nlp_score:.2f} 权:{{fw:.2f}}x)", 6, "VOLATILITY")
@@ -1036,9 +1071,8 @@ def _prepare_universe_data(ctx: MarketContext) -> Tuple[List[dict], dict]:
 
     if not io_results: return [], {}
 
-    # 剔除 PyTorch 模型等不可序列化对象，只保留基础结构
-    ctx_lite = copy.copy(ctx)
-    ctx_lite.transformer_model = None
+    # ✅ 致命 IPC 隐患修复：提纯 Context 为无锁无 DataFrame 的轻量化标量对象
+    ctx_lite = _build_ctx_lite(ctx)
     for res in io_results:
         res['ctx'] = ctx_lite
         
@@ -1622,8 +1656,9 @@ def run_synthetic_stress_test() -> None:
                     for tag, imp in xai_data.items(): xai_weights[tag] = 0.0 if imp < avg_imp * 0.25 else max(0.5, min(3.0, float(imp) / avg_imp))
     except Exception: pass
     
-    metrics = {'Original': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}, 'Phase_Chaos': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}, 'Noise_Explosion': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}}
     market_ctx = MarketContext(regime="bull", regime_desc="", w_mul=1.0, xai_weights=xai_weights, vix_current=18.0, vix_desc="", vix_scalar=1.0, max_risk=0.015, macro_gravity=False, is_credit_risk_high=False, vix_inv=False, qqq_df=pd.DataFrame(), macro_data={'spy': pd.DataFrame(), 'tlt': pd.DataFrame(), 'dxy': pd.DataFrame()}, total_market_exposure=1.0, health_score=1.0, pain_warning="", dynamic_min_score=8.0)
+    
+    metrics = {'Original': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}, 'Phase_Chaos': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}, 'Noise_Explosion': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}}
     
     # --- 压测阶段 1: 异步 IO 拉取 ---
     io_results = []
@@ -1639,9 +1674,8 @@ def run_synthetic_stress_test() -> None:
         logger.warning("压测样本历史数据获取失败。")
         return
 
-    # 剔除无法序列化的模型对象
-    ctx_lite = copy.copy(market_ctx)
-    ctx_lite.transformer_model = None
+    # ✅ 同步修复: 对抗样本测试中应用纯标量 Lite 上下文
+    ctx_lite = _build_ctx_lite(market_ctx)
     for res in io_results: res['ctx'] = ctx_lite
 
     # --- 压测阶段 2: 纯 CPU 计算多进程池 ---
