@@ -1,4 +1,12 @@
 # 存储路径: quant_engine.py
+import os
+# [针对 4C24G ARM 优化] 压制底层 C 库隐式多线程，避免抢占物理核心导致严重的上下文切换
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import yfinance as yf
 import requests
 import os
@@ -35,6 +43,8 @@ except ImportError:
 
 try:
     import torch
+    # [针对 4C24G ARM 优化] 禁用 PyTorch 内部的多线程，交由外层进程池调度
+    torch.set_num_threads(1)
     from quant_transformer import QuantAlphaTransformer, train_alpha_model
     TRANSFORMER_AVAILABLE = True
 except ImportError:
@@ -121,7 +131,9 @@ class Config:
     GROUP_B_FACTORS = ADVANCED_MATH_FACTORS + ALT_DATA_FACTORS + [f for f in CORE_FACTORS if "扫盘" in f or "失衡" in f or "抢筹" in f] + TRANSFORMER_FACTORS
 
     class Params:
-        MAX_WORKERS = 8
+        # [针对 4C24G ARM 优化] 动态进程池：留出 1 个核心给系统IO和主调度器，避免 OOM 和死锁
+        import multiprocessing
+        MAX_WORKERS = min(3, multiprocessing.cpu_count() - 1) if multiprocessing.cpu_count() > 1 else 1
         MIN_SCORE_THRESHOLD = 8
         BASE_MAX_RISK = 0.015       
         CROWDING_PENALTY = 0.75     
@@ -292,15 +304,29 @@ class SharedDFCache:
         self._cleanup_stale()  # 启动时主动清理过期内存，防止 OOM
 
     def _cleanup_stale(self):
-        """清理超过 TTL 的过期缓存文件"""
+        """清理超过 TTL 的过期缓存文件，并加入激进级大内存防泄漏机制"""
+        import gc
+        import shutil
         now = time.time()
         try:
+            total_size = 0
             for fname in os.listdir(self.cache_dir):
                 fpath = os.path.join(self.cache_dir, fname)
                 if fname.endswith('.feather') and os.path.isfile(fpath):
+                    size = os.path.getsize(fpath)
+                    total_size += size
                     if now - os.path.getmtime(fpath) > self.ttl_seconds:
                         os.remove(fpath)
                         logger.debug(f"🧹 清理过期缓存: {fname}")
+                        total_size -= size
+            
+            # [针对 4C24G ARM 优化] 如果 /dev/shm 占用超过 8GB，触发紧急清空
+            if total_size > 8 * 1024 * 1024 * 1024:
+                logger.warning(f"🚨 缓存盘膨胀至 {total_size/1e9:.2f}GB，触发激进回收机制！")
+                shutil.rmtree(self.cache_dir, ignore_errors=True)
+                os.makedirs(self.cache_dir, exist_ok=True)
+            
+            gc.collect() # 强制回收内存
         except Exception as e:
             logger.debug(f"Cache cleanup error: {e}")
 
