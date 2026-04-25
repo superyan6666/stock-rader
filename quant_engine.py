@@ -617,7 +617,7 @@ def safe_get_sentiment_data(symbol: str) -> Tuple[float, float, float, float]:
     _init_ext_cache()
     with _DAILY_EXT_LOCK:
         if symbol in _DAILY_EXT_CACHE["sentiment"]: return tuple(_DAILY_EXT_CACHE["sentiment"][symbol])
-    pcr, iv_skew, short_change, short_float = 0.0, 0.0, 0.0, 0.0
+    pcr, iv_skew, short_change, short_float = 1.0, 0.0, 0.0, 0.0
     try:
         tk = yf.Ticker(symbol)
         info = tk.info
@@ -690,7 +690,17 @@ def check_earnings_risk(symbol: str) -> bool:
     except Exception: pass
     return False
 
-def get_filtered_watchlist(max_stocks: int = 150) -> list: return list(Config.CORE_WATCHLIST)[:max_stocks]
+def get_filtered_watchlist(max_stocks: int = 150) -> list: 
+    try:
+        sp500_url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+        tables = pd.read_html(sp500_url)
+        sp500_tickers = tables[0]['Symbol'].str.replace('.', '-').tolist()
+        pool = list(set(Config.CORE_WATCHLIST + sp500_tickers))
+        random.shuffle(pool)
+        return pool[:max_stocks]
+    except Exception as e:
+        logger.debug(f"抓取 S&P 500 失败: {e}，回退至核心白名单")
+        return list(Config.CORE_WATCHLIST)[:max_stocks]
 
 def load_strategy_performance_tag() -> str:
     try:
@@ -1091,7 +1101,7 @@ def _extract_ml_features(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: A
 
 def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: AltData) -> Tuple[int, List[str], List[str], bool]:
     triggered_list, factors_list = [], []
-    theme_scores = {'TREND': 0.0, 'VOLATILITY': 0.0, 'REVERSAL': 0.0, 'QUANTUM': 0.0}
+    theme_scores = {'TREND': 0.0, 'VOLATILITY': 0.0, 'REVERSAL': 0.0, 'QUANTUM': 0.0, 'SHORT': 0.0}
     black_swan_risk = False
     
     def get_fw(tag_name: str) -> float: return ctx.xai_weights.get(tag_name, 1.0)
@@ -1137,7 +1147,8 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
 
     if stock.prev['NR7'] and stock.prev['Inside_Bar'] and stock.curr['Close'] > stock.prev['High']: add_trigger("NR7极窄突破", "🎯 [极度压缩] 7日极窄压缩孕线完成向上爆破 (权:{fw:.2f}x)", 12, "VOLATILITY")
 
-    vcp_th = Config.Params.VCP_BEAR if getattr(ctx, 'regime', 'range') in ["bear", "hidden_bear"] else Config.Params.VCP_BULL
+    vix_scalar = getattr(ctx, 'vix_scalar', 1.0)
+    vcp_th = (Config.Params.VCP_BEAR if getattr(ctx, 'regime', 'range') in ["bear", "hidden_bear"] else Config.Params.VCP_BULL) * vix_scalar
     if stock.curr['Range_20'] > 0 and stock.curr['Range_20'] < stock.curr['Range_60'] * vcp_th and stock.curr['Close'] > stock.curr['SMA_50']:
         add_trigger("VCP收缩", f"🌪️ [VCP形态] 极度价格波动压缩后的放量突破 (阈值:{vcp_th} 权:{{fw:.2f}}x)", 15, "VOLATILITY")
 
@@ -1155,7 +1166,7 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
     if macd_crossed and "带量金叉(交互)" in factors_list: theme_scores['TREND'] -= min(get_fw("MACD金叉")*8, get_fw("带量金叉(交互)")*12) * 0.5 
     if cf.pure_alpha > 0.8: add_trigger("独立Alpha(脱钩)", "🪐 [独立Alpha] 强势剥离大盘Beta，爆发特质动能 (权:{fw:.2f}x)", 22, "TREND")
     if stock.curr['SuperTrend_Up'] == 1 and stock.curr['Close'] < stock.curr['EMA_20'] * 1.02: add_trigger("强势回踩", "🟢 [低吸点位] 超级趋势主升轨精准回踩 (权:{fw:.2f}x)", 10, "REVERSAL")
-    if gap_pct * 100 > max(1.5, atr_pct * 0.3) and gap_pct < 0.06: add_trigger("突破缺口", "💥 [动能爆发] 放量跳空，留下底部突破缺口 (权:{fw:.2f}x)", 8, "VOLATILITY")
+    if gap_pct * 100 > max(1.5, atr_pct * 0.3) and gap_pct < 0.06 * vix_scalar: add_trigger("突破缺口", "💥 [动能爆发] 放量跳空，留下底部突破缺口 (权:{fw:.2f}x)", 8, "VOLATILITY")
     if cf.fvg_lower > 0 and stock.curr['Low'] <= cf.fvg_upper and stock.curr['Close'] > cf.fvg_lower: add_trigger("SMC失衡区", "🧲 [SMC交易法] 精准回踩并测试前期机构失衡区(FVG) (权:{fw:.2f}x)", 15, "REVERSAL")
 
     if stock.curr['Volume'] > stock.curr['Vol_MA20'] * 2.0 and abs(stock.curr['Close'] - stock.curr['Open']) < stock.curr['ATR'] * 0.5:
@@ -1202,18 +1213,25 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
     elif alt.nlp_score < Config.Params.NLP_BEAR: add_trigger("舆情NLP情感极值(News_NLP)", f"⚠️ [舆情崩塌] 探测到新闻包含密集利空/诉讼词汇 (复合得分:{alt.nlp_score:.2f} 权:{{fw:.2f}}x)", -10, "VOLATILITY")
     if alt.wsb_accel > Config.Params.WSB_ACCEL: add_trigger("散户热度加速度(WSB_Accel)", f"🔥 [散户加速] Reddit/WSB 提及数二阶导数飙升 (加速度:{alt.wsb_accel:.0f}/日²)，游资加速抬轿 (权:{{fw:.2f}}x)", 8, "VOLATILITY")
 
-    if alt.pcr > Config.Params.PCR_BEAR: add_trigger("期权PutCall情绪(PCR)", "⚠️ [极端避险] Put/Call Ratio 爆表，期权市场极度看空避险 (权:{fw:.2f}x)", -15, "VOLATILITY"); black_swan_risk = True
+    if alt.pcr > Config.Params.PCR_BEAR: add_trigger("期权PutCall情绪(PCR)", "⚠️ [极端避险] Put/Call Ratio 爆表，期权市场极度看空避险 (权:{fw:.2f}x)", 15, "SHORT"); black_swan_risk = True
     elif 0 < alt.pcr < Config.Params.PCR_BULL: add_trigger("期权PutCall情绪(PCR)", "🔥 [极端贪婪] Put/Call Ratio 极低，期权市场聪明钱疯狂做多 (权:{fw:.2f}x)", 10, "QUANTUM")
-    if alt.iv_skew > Config.Params.IV_SKEW_BEAR: add_trigger("隐含波动率偏度(IV Skew)", "🚨 [黑天鹅警报] 看跌期权隐含波动率畸高，内幕资金正疯狂买入下行保护！ (权:{fw:.2f}x)", -20, "VOLATILITY"); black_swan_risk = True
+    if alt.iv_skew > Config.Params.IV_SKEW_BEAR: add_trigger("隐含波动率偏度(IV Skew)", "🚨 [黑天鹅警报] 看跌期权隐含波动率畸高，内幕资金正疯狂买入下行保护！ (权:{fw:.2f}x)", 20, "SHORT"); black_swan_risk = True
     elif alt.iv_skew < Config.Params.IV_SKEW_BULL: add_trigger("隐含波动率偏度(IV Skew)", "🚀 [上行爆发] 看涨期权隐含波动率压倒性占优，主力预期剧烈向上重估 (权:{fw:.2f}x)", 12, "QUANTUM")
     if alt.short_change > Config.Params.SHORT_SQZ_CHG and alt.short_float > Config.Params.SHORT_SQZ_FLT and stock.curr['Close'] > stock.curr['EMA_20']: add_trigger("做空兴趣突变(轧空)", "💥 [轧空引擎] 近期做空兴趣激增且技术面多头，随时触发空头踩踏平仓的 Short Squeeze (权:{fw:.2f}x)", 15, "QUANTUM")
 
     # 宏观引力场惩罚项
     if ctx.is_credit_risk_high:
-        add_trigger("宏观重力场(Credit_Risk)", "🚨 [系统性风险] 信用债市场出现剧烈抛售，根据量化上帝视角，此处必须降权避险 (权:{fw:.2f}x)", -15, "VOLATILITY")
+        add_trigger("宏观重力场(Credit_Risk)", "🚨 [系统性风险] 信用债市场出现剧烈抛售，根据量化上帝视角，此处必须降权避险 (权:{fw:.2f}x)", 15, "SHORT")
         
-    saturated_theme_sum = sum([50.0 * (1 - np.exp(-raw_s / 25.0)) for raw_s in theme_scores.values()])
-    final_score_saturated = 100.0 * (1 - np.exp(-saturated_theme_sum / 50.0))
+    # [架构优化] Soft-Clipping 抑制动量多重共线性
+    if theme_scores['TREND'] > 40:
+        theme_scores['TREND'] = 40 + np.log1p(theme_scores['TREND'] - 40) * 10
+        
+    positive_themes = ['TREND', 'VOLATILITY', 'REVERSAL', 'QUANTUM']
+    saturated_theme_sum = sum([50.0 * (1 - np.exp(-theme_scores[t] / 25.0)) for t in positive_themes if theme_scores[t] > 0])
+    short_penalty = 50.0 * (1 - np.exp(-theme_scores['SHORT'] / 25.0)) if theme_scores['SHORT'] > 0 else 0.0
+    
+    final_score_saturated = 100.0 * (1 - np.exp(-saturated_theme_sum / 50.0)) - short_penalty
     if alt.pcr > Config.Params.PCR_BEAR or alt.iv_skew > Config.Params.IV_SKEW_BEAR or ctx.is_credit_risk_high: black_swan_risk = True
         
     return int(final_score_saturated), triggered_list, factors_list, black_swan_risk
