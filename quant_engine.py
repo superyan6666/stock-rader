@@ -1114,6 +1114,7 @@ def _extract_ml_features(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: A
         for i in range(1, 17): feat_dict[f"Alpha_T{i:02d}"] = 0.0
     return {f: float(np.nan_to_num(feat_dict.get(f, 0.0), nan=0.0, posinf=20.0, neginf=-20.0)) for f in Config.ALL_FACTORS}
 
+def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: AltData) -> Tuple[float, List[str], List[str], bool]:
     triggered_list, factors_list = [], []
     theme_scores = {'TREND': 0.0, 'VOLATILITY': 0.0, 'REVERSAL': 0.0, 'QUANTUM': 0.0, 'SHORT': 0.0}
     sub_theme_scores = defaultdict(list)
