@@ -34,6 +34,7 @@ except ImportError:
     FEATHER_AVAILABLE = False
 
 try:
+    import torch
     from quant_transformer import QuantAlphaTransformer, train_alpha_model
     TRANSFORMER_AVAILABLE = True
 except ImportError:
@@ -1437,7 +1438,7 @@ def _apply_kelly_cluster_optimization(reports: List[dict], pd_dict, exp, ctx):
 
 class ExecutionEngine:
     """智能执行引擎：支持订单拆解(Slicing)、防滑点保护与异步 TCA 归因"""
-    def __init__(self, broker: BaseBrokerGateway):
+    def __init__(self, broker: Any):
         self.broker = broker
         self.ledger = OrderLedger(Config.ORDER_DB_PATH)
         self.is_running = True
