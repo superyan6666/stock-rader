@@ -58,9 +58,13 @@ _GLOBAL_HEADERS = {
     'Accept': 'application/json'
 }
 
-import aiohttp
 import asyncio
-from aiohttp import ClientTimeout, TCPConnector
+try:
+    import aiohttp
+    from aiohttp import ClientTimeout, TCPConnector
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    AIOHTTP_AVAILABLE = False
 
 # 注入带有强效防抖与重试机制的全局 Session
 from requests.adapters import HTTPAdapter
@@ -240,11 +244,13 @@ class ComplexFeatures:
 
 class AsyncSessionManager:
     """针对 ARM 优化的高并发异步 Session 管理器，具备指数级退避与连接池池化能力"""
-    _session: Optional[aiohttp.ClientSession] = None
+    _session: 'Any' = None
 
     @classmethod
-    async def get_session(cls) -> aiohttp.ClientSession:
-        if cls._session is None or cls._session.closed:
+    async def get_session(cls) -> 'Any':
+        if not AIOHTTP_AVAILABLE:
+            return None
+        if cls._session is None or getattr(cls._session, 'closed', True):
             # 针对高频 IO 优化连接池，限制单域并发防止触发 429
             connector = TCPConnector(limit_per_host=10, ttl_dns_cache=300, use_dns_cache=True)
             timeout = ClientTimeout(total=15, connect=5)
@@ -254,7 +260,7 @@ class AsyncSessionManager:
 
     @classmethod
     async def close(cls):
-        if cls._session:
+        if cls._session and AIOHTTP_AVAILABLE:
             await cls._session.close()
             cls._session = None
 
