@@ -134,7 +134,7 @@ class Config:
         # [针对 4C24G ARM 优化] 动态进程池：留出 1 个核心给系统IO和主调度器，避免 OOM 和死锁
         import multiprocessing
         MAX_WORKERS = min(3, multiprocessing.cpu_count() - 1) if multiprocessing.cpu_count() > 1 else 1
-        MIN_SCORE_THRESHOLD = 11.0
+        MIN_SCORE_THRESHOLD = 9.5
         BASE_MAX_RISK = 0.015       
         CROWDING_PENALTY = 0.75     
         CROWDING_MIN_STOCKS = 2     
@@ -1166,7 +1166,7 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
     if allow_breakout and pd.notna(stock.curr['AVWAP']) and stock.curr['Close'] > stock.curr['AVWAP'] and stock.prev['Close'] <= stock.curr['AVWAP']: add_trigger("AVWAP突破", "⚓ [筹码夺回] 强势站上AVWAP锚定成本核心区 (权:{fw:.2f}x)", 12, "TREND", "MOMENTUM_BURST")
 
     kc_w, bb_w = stock.curr['KC_Upper'] - stock.curr['KC_Lower'], stock.curr['BB_Upper'] - stock.curr['BB_Lower']
-    if bb_w < kc_w and stock.curr['Close'] > stock.curr['KC_Upper'] and stock.curr['Volume'] > stock.curr['Vol_MA20'] * 1.3: 
+    if bb_w < kc_w and stock.curr['Close'] > stock.curr['KC_Upper'] and stock.curr['Volume'] > stock.curr['Vol_MA20'] * 1.5: 
         s_ratio = (kc_w - bb_w) / (stock.curr['ATR'] + 1e-10)
         add_trigger("TTM Squeeze ON", f"📦 [波动压缩] 多头强爆发下的 TTM Squeeze 向上突破确认 (比率:{s_ratio:.2f} 权:{{fw:.2f}}x)", 8 + int(s_ratio*10), "VOLATILITY")
 
@@ -2234,7 +2234,7 @@ def run_historical_replay(days: int = 252) -> None:
                     score, is_bearish_div, sig = _apply_market_filters(curr, prev, sym, score, sig, [], [], [])
                     
                     if score >= Config.Params.MIN_SCORE_THRESHOLD:
-                        daily_trades.append({'symbol': sym, 'score': score, 'signals': sig, 'factors': factors, 'tp': float(curr['Close'] + 3.0 * curr['ATR']), 'sl': float(curr['Close'] - 1.5 * curr['ATR'])})
+                        daily_trades.append({'symbol': sym, 'score': score, 'signals': sig, 'factors': factors, 'tp': float(curr['Close'] + 2.5 * curr['ATR']), 'sl': float(curr['Close'] - 1.5 * curr['ATR'])})
             except Exception: pass
             
         if daily_trades:
