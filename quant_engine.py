@@ -2099,6 +2099,8 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                 # --- [AGENT_FITNESS_SCORE] 输出 ---
                 fitness_score = (sharpe * 10.0) + (total_ret * 100.0) - abs(max_dd * 50.0)
                 print(f"\n[AGENT_FITNESS_SCORE]: {fitness_score:.4f}\n")
+                with open(os.path.join(Config.DATA_DIR, "fitness_score.txt"), "w") as f:
+                    f.write(f"[AGENT_FITNESS_SCORE]: {fitness_score:.4f}")
 
     with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: json.dump({"overall": res, "factors": f_res, "xai_importances": feature_importances_dict, "meta_weights": meta_weights_dict, "attribution": attr_report, "factor_ic": factor_ic_report, "portfolio": portfolio_metrics}, f, indent=4)
     

@@ -3,6 +3,9 @@ name: Tickeron Pro AI Bot
 run-name: 🤖 Quant Engine 运行状态 - ${{ github.event.inputs.run_mode || '自动调度 (Schedule)' }}
 
 on:
+  push:
+    branches:
+      - evolution-loop
   schedule:
     - cron: '45 20 * * 1-5'   
     - cron: '0 23 * * 5'
@@ -17,6 +20,7 @@ on:
           - test
           - matrix
           - backtest
+          - replay
 
 concurrency:
   group: bot-running-group
@@ -65,6 +69,8 @@ jobs:
           
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             MODE="${{ github.event.inputs.run_mode }}"
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            MODE="replay"
           elif [[ "${{ github.event_name }}" == "schedule" ]]; then
             UTC_H=$(date -u +%-H)
             UTC_D=$(date -u +%-u)
@@ -103,6 +109,32 @@ jobs:
             3) echo "::warning title=MLOps 冠军拦截::新模型未能击败线上模型，已被物理销毁，保留旧权重。" ;;
             *) echo "::error title=MLOps 训练崩溃::神经代谢中枢发生异常 (Exit Code: $TRAIN_EXIT)，请排查！" && exit 1 ;;
           esac
+
+      - name: 📡 回传适应度评分给造物主
+        if: ${{ env.RUN_MODE == 'replay' && always() }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
+            # 提取包含 FITNESS_SCORE 的日志
+            if [[ -f .quantbot_data/fitness_score.txt ]]; then
+              SCORE=$(cat .quantbot_data/fitness_score.txt)
+            else
+              SCORE="[AGENT_FITNESS_SCORE]: 未生成"
+            fi
+            
+            if [[ "$SCORE" == "[AGENT_FITNESS_SCORE]: 未生成" ]]; then
+              # 如果没有在文件中，就尝试告诉用户去查看 Actions 跑出的控制台日志
+              TEXT="🚀 Gen-1 变异重播结束！未能从日志中提取出 Fitness Score，请直接查看 GitHub Actions 控制台输出的最后几行！"
+            else
+              TEXT="🚀 进化变异回测完成！\n$SCORE\n\n请将分数发回给 Agent 进行下一轮突变！"
+            fi
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=$TEXT" \
+              --data-urlencode "parse_mode=Markdown"
+          fi
 
       - name: 📦 上传核心阵列制品 (Artifacts - 仅供云端遥测查阅)
         if: always()
