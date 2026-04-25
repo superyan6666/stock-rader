@@ -1,27 +1,3 @@
-.quantbot_data/
-*.tmp
-
-__pycache__/
-*.py[cod]
-*$py.class
-
-venv/
-env/
-.env
-
-quantbot_config.json
-.env.local
-
-backtest_log_*.jsonl
-
-# 业务运行时日志（不忽略 data/ 源码包）
-logs/
-*.csv
-*.db
-*.sqlite3
-# 多媒体产物（若有）
-output_images/
-output_videos/
 
 # ==========================================
 # 1. QuantBot 3.0 核心数据与缓存 (Core Data)

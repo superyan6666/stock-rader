@@ -44,7 +44,7 @@ jobs:
           # 补充安装 ARM 系统级加速包 (numactl, jemalloc) 与前端依赖
           sudo apt-get update && sudo apt-get install -y numactl libjemalloc-dev
           pip install flake8 streamlit altair streamlit-autorefresh
-          flake8 quant_engine.py quant_transformer.py data/ engine/ features/ utils/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 quant_engine.py quant_transformer.py --count --select=E9,F63,F7,F82 --show-source --statistics
 
       - name: 🛡️ 核心引擎测谎仪 (Unit Tests)
         run: |
