@@ -113,10 +113,9 @@ jobs:
       - name: 📡 回传适应度评分给造物主
         if: ${{ env.RUN_MODE == 'replay' && always() }}
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: |
-          if [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
+          if [[ -n "$WEBHOOK_URL" ]]; then
             # 提取包含 FITNESS_SCORE 的日志
             if [[ -f .quantbot_data/fitness_score.txt ]]; then
               SCORE=$(cat .quantbot_data/fitness_score.txt)
@@ -126,14 +125,22 @@ jobs:
             
             if [[ "$SCORE" == "[AGENT_FITNESS_SCORE]: 未生成" ]]; then
               # 如果没有在文件中，就尝试告诉用户去查看 Actions 跑出的控制台日志
-              TEXT="🚀 Gen-1 变异重播结束！未能从日志中提取出 Fitness Score，请直接查看 GitHub Actions 控制台输出的最后几行！"
+              TEXT="## 🚀 Gen-1 变异重播结束！\n\n未能从日志中提取出 Fitness Score，请直接查看 GitHub Actions 控制台输出的最后几行！"
             else
-              TEXT="🚀 进化变异回测完成！\n$SCORE\n\n请将分数发回给 Agent 进行下一轮突变！"
+              TEXT="## 🚀 进化变异回测完成！\n\n**$SCORE**\n\n请将分数发回给 Agent 进行下一轮突变！"
             fi
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=$TEXT" \
-              --data-urlencode "parse_mode=Markdown"
+            
+            curl -s -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"msgtype\": \"markdown\",
+                \"markdown\": {
+                  \"title\": \"【AI】进化分数出炉\",
+                  \"text\": \"$TEXT\"
+                }
+              }"
+          else
+            echo "::warning title=Webhook 未配置::找不到 WEBHOOK_URL 密钥，无法发送钉钉消息。"
           fi
 
       - name: 📦 上传核心阵列制品 (Artifacts - 仅供云端遥测查阅)
