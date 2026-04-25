@@ -134,7 +134,7 @@ class Config:
         # [针对 4C24G ARM 优化] 动态进程池：留出 1 个核心给系统IO和主调度器，避免 OOM 和死锁
         import multiprocessing
         MAX_WORKERS = min(3, multiprocessing.cpu_count() - 1) if multiprocessing.cpu_count() > 1 else 1
-        MIN_SCORE_THRESHOLD = 9.0
+        MIN_SCORE_THRESHOLD = 10.0
         BASE_MAX_RISK = 0.015       
         CROWDING_PENALTY = 0.75     
         CROWDING_MIN_STOCKS = 2     
@@ -1888,6 +1888,8 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
     
     e_indices = np.array([t['_e_idx'] for t in valid_trades])
     sym_cols = np.array([t['_s_col'] for t in valid_trades])
+    tp_arr = np.array([t.get('tp', np.inf) for t in valid_trades])
+    sl_arr = np.array([t.get('sl', -np.inf) for t in valid_trades])
     
     # 2. 向量化入场计算
     entry_idxs = np.minimum(e_indices + 1, max_idx)
@@ -1897,6 +1899,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
     # 布尔掩码剔除无效或停牌数据
     valid_mask = (entry_opens > 0) & ~np.isnan(entry_opens) & ~np.isnan(prev_closes)
     e_indices, sym_cols = e_indices[valid_mask], sym_cols[valid_mask]
+    tp_arr, sl_arr = tp_arr[valid_mask], sl_arr[valid_mask]
     entry_opens, prev_closes = entry_opens[valid_mask], prev_closes[valid_mask]
     valid_trades = [valid_trades[i] for i in range(len(valid_trades)) if valid_mask[i]]
     
@@ -1911,10 +1914,8 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
     for d in [1, 3, 5]:
         exit_idxs = np.minimum(e_indices + d, max_idx)
         
-        # 提取出场价格与收益
+        # 提取出场价格
         exit_closes = c_arr[exit_idxs, sym_cols]
-        exit_revenues = exit_closes * (1 - Config.Params.SLIPPAGE - Config.Params.COMMISSION)
-        returns = (exit_revenues - entry_costs) / (entry_costs + 1e-10) * np.where(gap_up > 0.03, 0.5, 1.0)
         
         # 批量计算区间 MFE/MAE (最大高点与最小低点跨度) - 彻底拔除列表推导式的纯 NumPy 向量化
         start_idxs = np.minimum(e_indices + 1, max_idx + 1)
@@ -1937,9 +1938,21 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             invalid_idxs = np.where(~valid_win)[0]
             for i in invalid_idxs:
                 if start_idxs[i] < end_idxs[i]:
-                    sl = slice(start_idxs[i], end_idxs[i])
-                    period_h[i] = np.nanmax(h_arr[sl, sym_cols[i]])
-                    period_l[i] = np.nanmin(l_arr[sl, sym_cols[i]])
+                    sl_slice = slice(start_idxs[i], end_idxs[i])
+                    period_h[i] = np.nanmax(h_arr[sl_slice, sym_cols[i]])
+                    period_l[i] = np.nanmin(l_arr[sl_slice, sym_cols[i]])
+        
+        # --- 🚀 Gen-3: 注入底层动态止盈止损 (TP/SL) 截断引擎 ---
+        actual_exit_prices = exit_closes.copy()
+        hit_sl = period_l <= sl_arr
+        hit_tp = period_h >= tp_arr
+        
+        # 防止缺口套利：如果买入价已经低于 SL，则按最低价结算
+        actual_exit_prices = np.where(hit_sl, np.minimum(sl_arr, entry_opens), actual_exit_prices)
+        actual_exit_prices = np.where(~hit_sl & hit_tp, np.maximum(tp_arr, entry_opens), actual_exit_prices)
+        
+        exit_revenues = actual_exit_prices * (1 - Config.Params.SLIPPAGE - Config.Params.COMMISSION)
+        returns = (exit_revenues - entry_costs) / (entry_costs + 1e-10) * np.where(gap_up > 0.03, 0.5, 1.0)
         
         # 4. 指标回填与右脑缓存投喂 (极速降维循环)
         for idx, ret in enumerate(returns):
@@ -2020,9 +2033,15 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             lgbm_params = dict(n_estimators=60, max_depth=3, learning_rate=0.05, class_weight='balanced', random_state=42)
             
             for train_idx, val_idx in TimeSeriesSplit(n_splits=3).split(X_scaled_df):
-                if active_A: oof_pred_A[val_idx] = LGBMClassifier(**lgbm_params).fit(X_A[train_idx], y_all_class[train_idx]).predict_proba(X_A[val_idx])[:, 1]
+                if active_A: 
+                    X = X_A[train_idx]
+                    if X.shape[1] > 0: oof_pred_A[val_idx] = LGBMClassifier(**lgbm_params).fit(X, y_all_class[train_idx]).predict_proba(X_A[val_idx])[:, 1]
+                    else: oof_pred_A[val_idx] = 0.5
                 else: oof_pred_A[val_idx] = 0.5
-                if active_B: oof_pred_B[val_idx] = LGBMClassifier(**lgbm_params).fit(X_B[train_idx], y_all_class[train_idx]).predict_proba(X_B[val_idx])[:, 1]
+                if active_B: 
+                    X = X_B[train_idx]
+                    if X.shape[1] > 0: oof_pred_B[val_idx] = LGBMClassifier(**lgbm_params).fit(X, y_all_class[train_idx]).predict_proba(X_B[val_idx])[:, 1]
+                    else: oof_pred_B[val_idx] = 0.5
                 else: oof_pred_B[val_idx] = 0.5
                 
             valid_meta_idx = np.where(oof_pred_A > 0)[0]
@@ -2033,7 +2052,8 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             else:
                 meta_clf = LogisticRegression(class_weight='balanced').fit(np.column_stack([oof_pred_A, oof_pred_B, vix_all, cred_all, term_all, pcr_all]), y_all_class)
 
-            final_base_A, final_base_B = LGBMClassifier(**lgbm_params).fit(X_A, y_all_class) if active_A else None, LGBMClassifier(**lgbm_params).fit(X_B, y_all_class) if active_B else None
+            final_base_A = LGBMClassifier(**lgbm_params).fit(X_A, y_all_class) if active_A and X_A.shape[1] > 0 else None
+            final_base_B = LGBMClassifier(**lgbm_params).fit(X_B, y_all_class) if active_B and X_B.shape[1] > 0 else None
             with open(Config.MODEL_FILE, 'wb') as f: pickle.dump({'version': Config.MODEL_VERSION, 'active_factors': active_factors_list, 'active_A': active_A, 'active_B': active_B, 'scaler': scaler, 'base_A': final_base_A, 'base_B': final_base_B, 'meta': meta_clf, 'n_features_in_': len(active_factors_list)}, f)
             
             combined_imp = np.zeros(len(Config.ALL_FACTORS))
@@ -2202,6 +2222,7 @@ def run_historical_replay(days: int = 252) -> None:
                 dt_idx = sym_ind.index.get_loc(dt)
                 if isinstance(dt_idx, int) and dt_idx > 100:
                     curr, prev = sym_ind.iloc[dt_idx], sym_ind.iloc[dt_idx-1]
+                    if curr['Vol_MA20'] < 500000: continue
                     is_vol = bool((curr['Volume'] / (curr['Vol_MA20']+1e-9) > 1.5) and (curr['Close'] > curr['Open']))
                     swing_high_10 = float(sym_ind['High'].iloc[dt_idx-10:dt_idx].max())
                     
