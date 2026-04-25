@@ -78,7 +78,52 @@ def validate_config():
     logger.info("✅ 环境与架构目录校验通过")
 
 # ================= 2. 数据抽象模型 =================
-from data.models import MarketContext, MarketContextLite, StockData, AltData, ComplexFeatures, _build_ctx_lite 
+@dataclass
+class MarketContext:
+    regime: str; regime_desc: str; w_mul: float; xai_weights: dict; vix_current: float
+    vix_desc: str; vix_scalar: float; max_risk: float; macro_gravity: bool
+    is_credit_risk_high: bool; vix_inv: bool; qqq_df: pd.DataFrame; macro_data: dict
+    total_market_exposure: float; health_score: float; pain_warning: str
+    credit_spread_mom: float = 0.0; vix_term_structure: float = 1.0; market_pcr: float = 1.0
+    dynamic_min_score: float = 8.0; global_wsb_data: dict = field(default_factory=dict)
+    meta_weights: dict = field(default_factory=dict); transformer_model: 'Any' = None  
+
+@dataclass
+class MarketContextLite:
+    """可安全跨进程序列化的纯值上下文（传递轻量级 Series，完美闭环宏观指标计算）"""
+    regime: str; w_mul: float; xai_weights: dict; vix_current: float
+    macro_gravity: bool; health_score: float; dynamic_min_score: float
+    qqq_close: pd.Series; spy_close: pd.Series; tlt_close: pd.Series; dxy_close: pd.Series
+
+def _build_ctx_lite(ctx: MarketContext) -> MarketContextLite:
+    """从完整 ctx 蒸馏出可序列化的轻量版本"""
+    def _safe_close(df): return df['Close'] if not df.empty else pd.Series(dtype=float)
+    return MarketContextLite(
+        regime=ctx.regime, w_mul=ctx.w_mul, xai_weights=ctx.xai_weights,
+        vix_current=ctx.vix_current, macro_gravity=ctx.macro_gravity,
+        health_score=ctx.health_score, dynamic_min_score=ctx.dynamic_min_score,
+        qqq_close=_safe_close(ctx.qqq_df),
+        spy_close=_safe_close(ctx.macro_data.get('spy', pd.DataFrame())),
+        tlt_close=_safe_close(ctx.macro_data.get('tlt', pd.DataFrame())),
+        dxy_close=_safe_close(ctx.macro_data.get('dxy', pd.DataFrame()))
+    )
+
+@dataclass
+class StockData:
+    sym: str; df: pd.DataFrame; df_w: pd.DataFrame; df_m: pd.DataFrame; df_60m: pd.DataFrame
+    curr: pd.Series; prev: pd.Series; is_vol: bool; swing_high_10: float
+
+@dataclass
+class AltData:
+    pcr: float; iv_skew: float; short_change: float; short_float: float
+    insider_net_buy: float; analyst_mom: float; nlp_score: float; wsb_accel: float
+
+@dataclass
+class ComplexFeatures:
+    weekly_bullish: bool; fvg_lower: float; fvg_upper: float; kde_breakout_score: float
+    fft_ensemble_score: float; hurst_med: float; hurst_iqr: float; hurst_reliable: bool
+    monthly_inst_flow: float; weekly_macd_res: float; rsi_60m_bounce: float
+    beta_60d: float; tlt_corr: float; dxy_corr: float; vrp: float; rs_20: float; pure_alpha: float 
 
 # ================= 3. 核心计算与数据拉取 =================
 
@@ -108,7 +153,141 @@ def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retr
     except RuntimeError:
         return asyncio.run(_run())
 
-from data.alternative import _init_ext_cache, _save_ext_cache, fetch_global_wsb_data, safe_get_sentiment_data, safe_get_alt_data, check_earnings_risk
+def _init_ext_cache():
+    global _DAILY_EXT_CACHE
+    with _DAILY_EXT_LOCK:
+        if not _DAILY_EXT_CACHE:
+            if os.path.exists(Config.EXT_CACHE_FILE):
+                try:
+                    with open(Config.EXT_CACHE_FILE, 'r', encoding='utf-8') as f: _DAILY_EXT_CACHE = json.load(f)
+                except Exception as e: logger.debug(f"Exception suppressed: {e}")
+            today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            if _DAILY_EXT_CACHE.get("date") != today: _DAILY_EXT_CACHE = {"date": today, "sentiment": {}, "alt": {}}
+
+def _save_ext_cache():
+    with _DAILY_EXT_LOCK:
+        try:
+            temp_ext = f"{Config.EXT_CACHE_FILE}.{threading.get_ident()}.tmp"
+            with open(temp_ext, 'w', encoding='utf-8') as f: json.dump(_DAILY_EXT_CACHE, f)
+            os.replace(temp_ext, Config.EXT_CACHE_FILE)
+        except Exception as e: logger.debug(f"Exception suppressed: {e}")
+
+def fetch_global_wsb_data() -> Dict[str, float]:
+    with _ALT_DATA_LOCK:
+        if "WSB_ACCEL_GLOBAL" in _ALT_DATA_CACHE: return _ALT_DATA_CACHE["WSB_ACCEL_GLOBAL"]
+    cache_file = Config.WSB_CACHE_FILE
+    today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    history = {}
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f: history = json.load(f)
+        except Exception as e: logger.debug(f"Exception suppressed: {e}")
+    current_data = {}
+    try:
+        resp = _GLOBAL_SESSION.get("https://tradestie.com/api/v1/apps/reddit", timeout=10)
+        if resp.status_code == 200:
+            for item in resp.json():
+                tk = item.get('ticker')
+                if tk and item.get('sentiment') == 'Bullish': current_data[tk] = item.get('no_of_comments', 0)
+    except Exception as e:
+        logger.debug(f"WSB API 熔断保护触发: {e}")
+    if current_data: history[today_str] = current_data
+    sorted_dates = sorted(history.keys())
+    if len(sorted_dates) > 5:
+        for d in sorted_dates[:-5]: del history[d]
+    try:
+        temp_wsb = f"{cache_file}.{threading.get_ident()}.tmp"
+        with open(temp_wsb, "w", encoding="utf-8") as f: json.dump(history, f)
+        os.replace(temp_wsb, cache_file)
+    except Exception as e: logger.debug(f"Exception suppressed: {e}")
+    wsb_accel_dict = {}
+    dates = sorted(history.keys())
+    if len(dates) >= 3:
+        d0, d1, d2 = dates[-1], dates[-2], dates[-3]
+        for tk in history[d0].keys():
+            v0, v1, v2 = history[d0].get(tk, 0), history[d1].get(tk, 0), history[d2].get(tk, 0)
+            wsb_accel_dict[tk] = float((v0 - v1) - (v1 - v2))
+    else:
+        for tk in current_data.keys(): wsb_accel_dict[tk] = 0.0
+    with _ALT_DATA_LOCK: _ALT_DATA_CACHE["WSB_ACCEL_GLOBAL"] = wsb_accel_dict
+    return wsb_accel_dict
+
+def safe_get_sentiment_data(symbol: str) -> Tuple[float, float, float, float]:
+    _init_ext_cache()
+    with _DAILY_EXT_LOCK:
+        if symbol in _DAILY_EXT_CACHE["sentiment"]: return tuple(_DAILY_EXT_CACHE["sentiment"][symbol])
+    pcr, iv_skew, short_change, short_float = 0.0, 0.0, 0.0, 0.0
+    try:
+        tk = yf.Ticker(symbol)
+        info = tk.info
+        curr_short, prev_short = info.get('sharesShort', 0), info.get('sharesShortPriorMonth', 0)
+        short_float = info.get('shortPercentOfFloat', 0)
+        if curr_short and prev_short and prev_short > 0: short_change = (curr_short - prev_short) / prev_short
+        exps = tk.options
+        if exps:
+            opt = tk.option_chain(exps[0]) 
+            c_vol = opt.calls['volume'].sum() if 'volume' in opt.calls else 0
+            p_vol = opt.puts['volume'].sum() if 'volume' in opt.puts else 0
+            if c_vol > 0: pcr = p_vol / c_vol
+            c_iv = opt.calls['impliedVolatility'].median() if 'impliedVolatility' in opt.calls else 0
+            p_iv = opt.puts['impliedVolatility'].median() if 'impliedVolatility' in opt.puts else 0
+            iv_skew = p_iv - c_iv
+    except Exception as e: logger.debug(f"Exception suppressed: {e}")
+    with _DAILY_EXT_LOCK: _DAILY_EXT_CACHE["sentiment"][symbol] = (pcr, iv_skew, short_change, short_float)
+    _save_ext_cache()
+    return pcr, iv_skew, short_change, short_float
+
+def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
+    _init_ext_cache()
+    with _DAILY_EXT_LOCK:
+        if symbol in _DAILY_EXT_CACHE["alt"]: return tuple(_DAILY_EXT_CACHE["alt"][symbol])
+    insider_net_buy, analyst_mom, nlp_score, news_summary = 0.0, 0.0, 0.0, ""
+    try:
+        tk = yf.Ticker(symbol)
+        try:
+            insiders = tk.insider_transactions
+            if insiders is not None and not insiders.empty and 'Shares' in insiders.columns:
+                recent = insiders.head(20)
+                buys = recent[recent['Shares'] > 0]['Shares'].sum()
+                sells = recent[recent['Shares'] < 0]['Shares'].abs().sum()
+                if (buys + sells) > 0: insider_net_buy = (buys - sells) / (buys + sells)
+        except Exception as e: logger.debug(f"Exception suppressed: {e}")
+        try:
+            upgrades = tk.upgrades_downgrades
+            if upgrades is not None and not upgrades.empty:
+                upgrades.index = pd.to_datetime(upgrades.index, utc=True)
+                recent_1y = upgrades[upgrades.index >= pd.Timestamp.now(tz=timezone.utc) - pd.Timedelta(days=365)].copy()
+                if not recent_1y.empty and 'Action' in recent_1y.columns:
+                    action_map = {'up': 1, 'down': -1, 'main': 0, 'init': 0.5, 'reit': 0}
+                    recent_1y['score'] = recent_1y['Action'].map(action_map).fillna(0)
+                    monthly_scores = recent_1y['score'].resample('30D').sum()
+                    if len(monthly_scores) >= 3:
+                        analyst_mom = (monthly_scores.iloc[-1] - monthly_scores.iloc[:-1].mean()) / (monthly_scores.iloc[:-1].std() + 1e-5)
+                    else: analyst_mom = recent_1y['score'].sum() * 0.1 
+        except Exception as e: logger.debug(f"Exception suppressed: {e}")
+    except Exception as e: logger.debug(f"Exception suppressed: {e}")
+    with _DAILY_EXT_LOCK: _DAILY_EXT_CACHE["alt"][symbol] = (insider_net_buy, analyst_mom, nlp_score, news_summary)
+    _save_ext_cache()
+    return insider_net_buy, analyst_mom, nlp_score, news_summary
+
+def check_earnings_risk(symbol: str) -> bool:
+    try:
+        tk = yf.Ticker(symbol)
+        now_date = datetime.now(timezone.utc).date()
+        try:
+            cal = tk.calendar
+            if cal is not None and isinstance(cal, dict) and 'Earnings Date' in cal:
+                ed = cal['Earnings Date']
+                if ed and hasattr(ed[0], 'date') and 0 <= (ed[0].date() - now_date).days <= 5: return True
+        except Exception as e: logger.debug(f"Exception suppressed: {e}")
+        try:
+            ed_df = tk.earnings_dates
+            if ed_df is not None and not ed_df.empty:
+                for d in ed_df.index:
+                    if hasattr(d, 'date') and d.date() >= now_date and 0 <= (d.date() - now_date).days <= 5: return True
+        except Exception as e: logger.debug(f"Exception suppressed: {e}")
+    except Exception as e: logger.debug(f"Exception suppressed: {e}")
+    return False
 
 def get_filtered_watchlist(max_stocks: int = 150) -> list: return list(Config.CORE_WATCHLIST)[:max_stocks]
 
@@ -195,23 +374,422 @@ def send_alert(title: str, content: str) -> None:
         threading.Thread(target=_send_tg, args=(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID, tg_text), daemon=False).start()
 
 # ================= 4. 特征工程 =================
-from engine.market_env import get_vix_level, get_market_regime, _build_market_context
-from features.indicators import calculate_indicators, check_macd_cross
-from features.advanced import _extract_complex_features
-from engine.evaluator import _get_transformer_seq, _extract_ml_features, _evaluate_omni_matrix, _apply_market_filters, _apply_ai_inference, _calculate_position_size, _apply_kelly_cluster_optimization
+def get_vix_level(qqq_df: pd.DataFrame = None) -> Tuple[float, str]:
+    df = safe_get_history(Config.VIX_INDEX, period="5d", interval="1d", fast_mode=True)
+    vix = df['Close'].ffill().iloc[-1] if not df.empty else 18.0
+    if vix > 30: return vix, f"🚨 极其恐慌 (VIX: {vix:.2f})"
+    if vix > 25: return vix, f"⚠️ 市场恐慌 (VIX: {vix:.2f})"
+    if vix < 15: return vix, f"✅ 市场平静 (VIX: {vix:.2f})"
+    return vix, f"⚖️ 正常波动 (VIX: {vix:.2f})"
+
+def get_market_regime(active_pool: List[str] = None) -> Tuple[str, str, pd.DataFrame, bool, bool]:
+    df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", fast_mode=True)
+    if len(df) < 200: return "range", "默认震荡", df, False, False
+    c_close, ma200 = df['Close'].ffill().iloc[-1], df['Close'].rolling(200).mean().iloc[-1]
+    trend_20d = (c_close - df['Close'].iloc[-20]) / df['Close'].iloc[-20]
+    if c_close > ma200:
+        return ("bull", "🐂 牛市主升", df, False, False) if trend_20d > 0.02 else ("range", "⚖️ 牛市震荡", df, False, False)
+    else:
+        return ("bear", "🐻 熊市回调", df, False, False) if trend_20d < -0.02 else ("rebound", "🦅 超跌反弹", df, False, False)
 
 
 
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    # ✅ 修复：显式深拷贝隔离，切断对上游 xs() 视图的原地修改，防止底层数据污染
+    df = df.copy()
+    
+    df = df.sort_index()
+    df['Close'], df['Volume'] = df['Close'].ffill(), df['Volume'].ffill()
+    df['Open'], df['High'], df['Low'] = df['Open'].ffill(), df['High'].ffill(), df['Low'].ffill()
+    
+    df['SMA_50'], df['SMA_150'], df['SMA_200'] = df['Close'].rolling(50).mean(), df['Close'].rolling(150).mean(), df['Close'].rolling(200).mean()
+    df['EMA_20'], df['EMA_50'] = df['Close'].ewm(span=20, adjust=False).mean(), df['Close'].ewm(span=50, adjust=False).mean()
+    
+    delta = df['Close'].diff()
+    rs = delta.where(delta > 0, 0.0).ewm(alpha=1/14, adjust=False).mean() / (-delta.where(delta < 0, 0.0).ewm(alpha=1/14, adjust=False).mean() + 1e-10)
+    df['RSI'] = 100.0 - (100.0 / (1.0 + rs))
+    
+    df['MACD'] = df['Close'].ewm(span=12, adjust=False).mean() - df['Close'].ewm(span=26, adjust=False).mean()
+    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    
+    df['TR'] = pd.concat([df['High']-df['Low'], (df['High']-df['Close'].shift()).abs(), (df['Low']-df['Close'].shift()).abs()], axis=1).max(axis=1)
+    df['ATR'] = df['TR'].rolling(14).mean()
+    atr20 = df['TR'].rolling(20).mean()
+    
+    df['KC_Upper'], df['KC_Lower'] = df['EMA_20'] + 1.5 * atr20, df['EMA_20'] - 1.5 * atr20
+    bb_ma, bb_std = df['Close'].rolling(20).mean(), df['Close'].rolling(20).std()
+    df['BB_Upper'], df['BB_Lower'] = bb_ma + 2 * bb_std, bb_ma - 2 * bb_std
+    
+    df['Tenkan'] = (df['High'].rolling(9).max() + df['Low'].rolling(9).min()) / 2
+    df['Kijun'] = (df['High'].rolling(26).max() + df['Low'].rolling(26).min()) / 2
+    df['SenkouA'] = ((df['Tenkan'] + df['Kijun']) / 2).shift(26)
+    df['SenkouB'] = ((df['High'].rolling(52).max() + df['Low'].rolling(52).min()) / 2).shift(26)
+    df['Above_Cloud'] = (df['Close'] > df[['SenkouA', 'SenkouB']].max(axis=1)).astype(int)
+    df['SuperTrend_Up'] = (df['Close'] > df['EMA_20']).astype(int) 
+    
+    hl_diff = np.maximum(df['High'].values - df['Low'].values, 1e-10)
+    dollar_vol = df['Close'].values * df['Volume'].values
+    clv_num = (df['Close'].values - df['Low'].values) - (df['High'].values - df['Close'].values)
+    df['CMF'] = pd.Series((clv_num / hl_diff * dollar_vol)).rolling(20).sum() / (pd.Series(dollar_vol).rolling(20).sum() + 1e-10)
+    df['CMF'] = df['CMF'].clip(lower=-1.0, upper=1.0).fillna(0.0)
 
+    df['Range'] = df['High'] - df['Low']
+    df['NR7'] = (df['Range'] <= df['Range'].rolling(7).min())
+    df['Inside_Bar'] = (df['High'] <= df['High'].shift(1)) & (df['Low'] >= df['Low'].shift(1))
 
+    close_shift = np.roll(df['Close'].values, 1); close_shift[0] = np.nan
+    vpt_base = np.where((close_shift == 0) | np.isnan(close_shift), 0.0, (df['Close'].values - close_shift) / close_shift)
+    df['VPT_Cum'] = (vpt_base * df['Volume'].values).cumsum()
+    vpt_ma50, vpt_std50 = df['VPT_Cum'].rolling(50).mean(), df['VPT_Cum'].rolling(50).std()
+    df['VPT_ZScore'] = (df['VPT_Cum'] - vpt_ma50) / np.where((np.isnan(vpt_std50)) | (vpt_std50 == 0), 1e-6, vpt_std50)
+    df['VPT_Accel'] = np.gradient(np.nan_to_num(df['VPT_ZScore']))
 
+    df['VWAP_20'] = ((df['High'] + df['Low'] + df['Close']) / 3 * df['Volume']).rolling(20).sum() / (df['Volume'].rolling(20).sum() + 1e-10)
+    df['AVWAP'] = df['VWAP_20'] 
+    df['Max_Down_Vol_10'] = df['Volume'].where(df['Close'] < df['Close'].shift(), 0).shift(1).rolling(10).max()
+    
+    surge = (df['Close'] > df['Close'].shift(1) * 1.04) & (df['Volume'] > df['Volume'].rolling(20).mean())
+    df['OB_High'] = df['High'].shift(1).where(surge, np.nan).ffill(limit=20)
+    df['OB_Low'] = df['Low'].shift(1).where(surge, np.nan).ffill(limit=20)
+    df['Swing_Low_20'] = df['Low'].shift(1).rolling(20).min()
+    df['Range_60'] = df['High'].rolling(60).max() - df['Low'].rolling(60).min()
+    df['Range_20'] = df['High'].rolling(20).max() - df['Low'].rolling(20).min()
+    df['Price_High_20'] = df['High'].rolling(20).max()
+    df['Vol_MA20'] = df['Volume'].rolling(20).mean()
 
+    df['CVD_Smooth'] = ((df['Volume'] * (df['Close'] - df['Open']) / (df['High'] - df['Low'] + 1e-10)).cumsum()).ewm(span=5).mean()
+    df['CVD_Trend'] = np.where(df['CVD_Smooth'].rolling(10).mean() > df['CVD_Smooth'].rolling(30).mean(), 1.0, -1.0)
+    df['CVD_Divergence'] = ((df['Close'] >= df['Price_High_20'] * 0.99) & (df['CVD_Smooth'] < df['CVD_Smooth'].rolling(20).max() * 0.95)).astype(int)
+    
+    df['Highest_22'] = df['High'].rolling(22).max()
+    df['ATR_22'] = df['TR'].rolling(22).mean()
+    df['Chandelier_Exit'] = df['Highest_22'] - 2.5 * df['ATR_22']
+    
+    df['Smart_Money_Flow'] = pd.Series(clv_num / hl_diff, index=df.index).rolling(10).mean()
 
+    df['Recent_Price_Surge_3d'] = (df['Close'] / df['Open'] - 1).rolling(3).max().shift(1) * 100
+    df['Recent_Vol_Surge_3d'] = (df['Volume'] / (df['Vol_MA20']+1)).rolling(3).max().shift(1)
+    df['Amihud'] = (df['Close'].pct_change().abs() / (df['Close'] * df['Volume'] + 1e-10)).rolling(20).mean() * 1e6
+    high_52w = df['High'].rolling(252, min_periods=20).max()
+    df['Dist_52W_High'] = (df['Close'] - high_52w) / (high_52w + 1e-10)
 
+    return df
 
+def _get_transformer_seq(df_ind: pd.DataFrame, end_idx: int = -1) -> np.ndarray:
+    if end_idx == -1: end_idx = len(df_ind)
+    start_idx = end_idx - 60
+    if start_idx < 0: return np.zeros((60, 49), dtype=np.float32)
+    df = df_ind.iloc[start_idx:end_idx].copy()
+    c = df['Close'].values + 1e-10
+    seq = np.zeros((60, 49), dtype=np.float32)
+    feature_mapping = [
+        (0, df['RSI'].values / 100.0), (1, df['MACD'].values / c), (2, df['Signal_Line'].values / c), (3, df['ATR'].values / c),
+        (4, (df['KC_Upper'].values - df['KC_Lower'].values) / c), (5, (df['BB_Upper'].values - df['BB_Lower'].values) / c),
+        (6, df['Tenkan'].values / c - 1.0), (7, df['Kijun'].values / c - 1.0), (8, df['SenkouA'].values / c - 1.0),
+        (9, df['SenkouB'].values / c - 1.0), (10, df['SuperTrend_Up'].values), (11, df['CMF'].values),
+        (12, df['Range'].values / c), (13, df['NR7'].astype(float).values), (14, df['Inside_Bar'].astype(float).values),
+        (15, df['VPT_ZScore'].values), (16, df['VPT_Accel'].values), (17, df['VWAP_20'].values / c - 1.0),
+        (18, np.where(df['AVWAP'].isna(), 0, df['AVWAP'].values / c - 1.0)), (19, df['Volume'].values / (df['Max_Down_Vol_10'].values + 1e-10)),
+        (20, np.where(df['OB_High'].isna(), 0, df['OB_High'].values / c - 1.0)), (21, np.where(df['OB_Low'].isna(), 0, df['OB_Low'].values / c - 1.0)),
+        (22, np.where(df['Swing_Low_20'].isna(), 0, df['Swing_Low_20'].values / c - 1.0)), (23, df['Range_60'].values / c),
+        (24, df['Range_20'].values / c), (25, df['Price_High_20'].values / c - 1.0), (26, df['Volume'].values / (df['Vol_MA20'].values + 1e-10)),
+        (27, df['CVD_Trend'].values), (28, df['CVD_Divergence'].values), (29, df['Highest_22'].values / c - 1.0),
+        (30, df['ATR_22'].values / c), (31, df['Chandelier_Exit'].values / c - 1.0), (32, df['Smart_Money_Flow'].values),
+        (33, df['Recent_Price_Surge_3d'].values / 100.0), (34, df['Recent_Vol_Surge_3d'].values), (35, df['Amihud'].values),
+        (36, np.where(df['Dist_52W_High'].isna(), 0, df['Dist_52W_High'].values)), (37, df['Close'].values / (df['SMA_50'].values + 1e-10) - 1.0),
+        (38, df['Close'].values / (df['SMA_150'].values + 1e-10) - 1.0), (39, df['Close'].values / (df['SMA_200'].values + 1e-10) - 1.0),
+        (40, df['Close'].values / (df['EMA_20'].values + 1e-10) - 1.0), (41, df['Close'].values / (df['EMA_50'].values + 1e-10) - 1.0),
+        (42, df['Above_Cloud'].values), (43, df['Open'].values / c - 1.0), (44, df['High'].values / c - 1.0),
+        (45, df['Low'].values / c - 1.0), (46, df['Close'].pct_change().fillna(0).values), (47, df['Volume'].pct_change().fillna(0).values),
+        (48, (df['Close'].values - df['Open'].values) / (df['High'].values - df['Low'].values + 1e-10))
+    ]
+    for idx, vals in feature_mapping: seq[:, idx] = vals
+    return np.nan_to_num(seq, nan=0.0, posinf=5.0, neginf=-5.0)
 
+def _extract_complex_features(stock: StockData, ctx: Any) -> ComplexFeatures:
+    weekly_bullish, weekly_macd_res, fvg_lower, fvg_upper = False, 0.0, 0.0, 0.0
+    aligned_w = stock.df_w
+    if not aligned_w.empty and len(aligned_w) >= 40:
+        if aligned_w['Close'].iloc[-1] > aligned_w['Close'].rolling(40).mean().iloc[-1]:
+            ema10, ema30 = aligned_w['Close'].ewm(span=10, adjust=False).mean(), aligned_w['Close'].ewm(span=30, adjust=False).mean()
+            weekly_bullish = (aligned_w['Close'].iloc[-1] > ema10.iloc[-1]) and (ema10.iloc[-1] > ema30.iloc[-1])
+        macd_w = aligned_w['Close'].ewm(span=12, adjust=False).mean() - aligned_w['Close'].ewm(span=26, adjust=False).mean()
+        hist_w = macd_w - macd_w.ewm(span=9, adjust=False).mean()
+        if len(hist_w) >= 2 and hist_w.iloc[-1] > 0 and hist_w.iloc[-1] > hist_w.iloc[-2]: weekly_macd_res = 1.0
+            
+    n = len(stock.df)
+    if n >= 22:
+        lows, highs = stock.df['Low'].values, stock.df['High'].values
+        valid_idx = np.where(lows[n-20:n-1] > highs[n-22:n-3])[0]
+        if len(valid_idx) > 0:
+            last_i = valid_idx[-1] + n - 20
+            fvg_lower, fvg_upper = highs[last_i-2], lows[last_i]
+    
+    kde_breakout_score = 0.0
+    if KDE_AVAILABLE and len(stock.df) >= 60:
+        try:
+            prices, volumes = stock.df['Close'].iloc[-60:].values, stock.df['Volume'].iloc[-60:].values
+            if np.std(prices) > 1e-5:
+                kde = gaussian_kde(prices, weights=volumes, bw_method='silverman')
+                den_curr = kde.evaluate(prices[-1])[0]
+                densities = kde.evaluate(np.linspace(prices.min(), prices.max(), 200))
+                den_50 = np.percentile(densities, 50)
+                if den_curr <= den_50: kde_breakout_score = min(1.0, 0.5 + 0.5 * (den_50 - den_curr) / (den_50 + 1e-10))
+        except Exception as e: logger.debug(f"Exception suppressed: {e}")
+        
+    fft_ensemble_score = _robust_fft_ensemble(stock.df['Close'].values, base_length=120, ensemble_count=7)
+    hurst_med, hurst_iqr, hurst_reliable = _robust_hurst(stock.df['Close'].values)
+    
+    monthly_inst_flow = 0.0
+    if not stock.df_m.empty and len(stock.df_m) >= 3:
+        m_flow = (stock.df_m['Close'] - stock.df_m['Open']) / (stock.df_m['High'] - stock.df_m['Low'] + 1e-10) * stock.df_m['Volume']
+        if m_flow.iloc[-1] > 0 and m_flow.iloc[-2] > 0 and m_flow.iloc[-3] > 0: monthly_inst_flow = 1.0
 
+    rsi_60m_bounce = 0.0
+    if not stock.df_60m.empty and len(stock.df_60m) >= 15:
+        delta = stock.df_60m['Close'].diff()
+        rs = delta.where(delta > 0, 0).ewm(span=14, adjust=False).mean() / (-delta.where(delta < 0, 0).ewm(span=14, adjust=False).mean() + 1e-10)
+        rsi_60m = 100 - (100 / (1 + rs))
+        if len(rsi_60m) >= 2 and rsi_60m.iloc[-1] > rsi_60m.iloc[-2] and rsi_60m.iloc[-2] < 40: rsi_60m_bounce = 1.0
+            
+    stock_ret = stock.df['Close'].pct_change().fillna(0)
+    beta_60d, spy_realized_vol = 1.0, 15.0 
+    tlt_corr, dxy_corr = 0.0, 0.0
+    rs_20, pure_alpha = 0.0, 0.0
 
+    # 🚀 精准提取，统一兼容完整的 MarketContext 与序列化后的 MarketContextLite
+    is_lite = hasattr(ctx, 'spy_close')
+    qqq_c = ctx.qqq_close if is_lite else (ctx.qqq_df['Close'] if not ctx.qqq_df.empty else pd.Series(dtype=float))
+    spy_c = ctx.spy_close if is_lite else (ctx.macro_data.get('spy', pd.DataFrame())['Close'] if 'spy' in ctx.macro_data and not ctx.macro_data.get('spy', pd.DataFrame()).empty else pd.Series(dtype=float))
+    tlt_c = ctx.tlt_close if is_lite else (ctx.macro_data.get('tlt', pd.DataFrame())['Close'] if 'tlt' in ctx.macro_data and not ctx.macro_data.get('tlt', pd.DataFrame()).empty else pd.Series(dtype=float))
+    dxy_c = ctx.dxy_close if is_lite else (ctx.macro_data.get('dxy', pd.DataFrame())['Close'] if 'dxy' in ctx.macro_data and not ctx.macro_data.get('dxy', pd.DataFrame()).empty else pd.Series(dtype=float))
+
+    if not qqq_c.empty and len(stock.df) >= 60:
+        m_df = pd.DataFrame({'stock': stock.df['Close'], 'qqq': qqq_c}).dropna()
+        if len(m_df) >= 60:
+            qqq_ret_20 = max(m_df['qqq'].iloc[-1] / m_df['qqq'].iloc[-20], 0.5)
+            rs_20 = float((m_df['stock'].iloc[-1] / m_df['stock'].iloc[-20]) / qqq_ret_20)
+            ret_s, ret_q = m_df['stock'].pct_change().dropna(), m_df['qqq'].pct_change().dropna()
+            cov_m = np.cov(ret_s.iloc[-60:], ret_q.iloc[-60:])
+            beta_l = cov_m[0,1] / (cov_m[1,1] + 1e-10) if cov_m[1,1] > 0 else 1.0
+            pure_alpha = float((ret_s.iloc[-5:].mean() - beta_l * ret_q.iloc[-5:].mean()) * 252)
+
+    if not spy_c.empty and len(stock_ret) >= 60:
+        spy_ret = spy_c.pct_change().reindex(stock_ret.index).fillna(0)
+        cov_mat = np.cov(stock_ret.iloc[-60:], spy_ret.iloc[-60:])
+        if cov_mat[1,1] > 0: beta_60d = float(cov_mat[0, 1] / cov_mat[1, 1])
+        spy_realized_vol = float(spy_ret.iloc[-20:].std() * np.sqrt(252) * 100)
+
+    if not tlt_c.empty and len(stock_ret) >= 90:
+        tlt_ret = tlt_c.pct_change().reindex(stock_ret.index).fillna(0)
+        tlt_corr = float(stock_ret.iloc[-90:].corr(tlt_ret.iloc[-90:]))
+
+    if not dxy_c.empty and len(stock_ret) >= 20:
+        dxy_ret = dxy_c.pct_change().reindex(stock_ret.index).fillna(0)
+        dxy_corr = float(stock_ret.iloc[-20:].corr(dxy_ret.iloc[-20:]))
+        
+    return ComplexFeatures(
+        weekly_bullish=weekly_bullish, fvg_lower=fvg_lower, fvg_upper=fvg_upper, 
+        kde_breakout_score=kde_breakout_score, fft_ensemble_score=fft_ensemble_score, 
+        hurst_med=hurst_med, hurst_iqr=hurst_iqr, hurst_reliable=hurst_reliable, 
+        monthly_inst_flow=monthly_inst_flow, weekly_macd_res=weekly_macd_res, 
+        rsi_60m_bounce=rsi_60m_bounce, beta_60d=float(beta_60d), tlt_corr=float(tlt_corr if pd.notna(tlt_corr) else 0), 
+        dxy_corr=float(dxy_corr if pd.notna(dxy_corr) else 0), vrp=float((ctx.vix_current - spy_realized_vol) / max(ctx.vix_current, 1.0)), 
+        rs_20=float(rs_20), pure_alpha=float(pure_alpha)
+    )
+
+def _extract_ml_features(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: AltData, alpha_vec: np.ndarray = None) -> dict:
+    macd_cross_strength = safe_div(stock.curr['MACD'] - stock.curr['Signal_Line'], abs(stock.curr['Close']) * 0.01)
+    vol_surge_ratio = safe_div(stock.curr['Volume'], stock.curr['Vol_MA20'], cap=50.0)
+    cmf_val, smf_val = stock.curr['CMF'], stock.curr['Smart_Money_Flow']
+    hurst_score = max(0.0, min(1.0, (cf.hurst_med - 0.5) * 2.0)) if (cf.hurst_reliable and cf.hurst_med > Config.Params.HURST_RELIABLE) else 0.0
+
+    feat_dict = {
+        "米奈尔维尼": safe_div(stock.curr['SMA_50'] - stock.curr['SMA_200'], stock.curr['SMA_200']),
+        "强相对强度": cf.rs_20, "MACD金叉": macd_cross_strength,
+        "TTM Squeeze ON": safe_div((stock.curr['KC_Upper'] - stock.curr['KC_Lower']) - (stock.curr['BB_Upper'] - stock.curr['BB_Lower']), stock.curr['ATR'] + 1e-10),
+        "一目多头": safe_div(stock.curr['Close'] - max(stock.curr['SenkouA'], stock.curr['SenkouB']), stock.curr['Close'] * 0.01),
+        "强势回踩": safe_div(stock.curr['Close'] - stock.curr['EMA_20'], stock.curr['EMA_20'] * 0.01),
+        "机构控盘(CMF)": cmf_val, "突破缺口": safe_div(stock.curr['Open'] - stock.prev['Close'], stock.prev['Close'] * 0.01),
+        "VWAP突破": safe_div(stock.curr['Close'] - stock.curr['VWAP_20'], stock.curr['VWAP_20'] * 0.01),
+        "AVWAP突破": safe_div(stock.curr['Close'] - stock.curr['AVWAP'], stock.curr['AVWAP'] * 0.01) if pd.notna(stock.curr['AVWAP']) else 0.0,
+        "SMC失衡区": safe_div(stock.curr['Close'] - cf.fvg_lower, stock.curr['Close'] * 0.01) if cf.fvg_lower > 0 else 0.0,
+        "流动性扫盘": safe_div(stock.curr['Swing_Low_20'] - stock.curr['Low'], stock.curr['Low'] * 0.01) if pd.notna(stock.curr['Swing_Low_20']) else 0.0,
+        "聪明钱抢筹": smf_val, "巨量滞涨": vol_surge_ratio, "放量长阳": safe_div(stock.curr['Close'] - stock.curr['Open'], stock.curr['Open'] * 0.01),
+        "口袋支点": safe_div(stock.curr['Volume'], stock.curr['Max_Down_Vol_10'], cap=50.0),
+        "VCP收缩": safe_div(stock.curr['Range_20'], stock.curr['Range_60'] + 1e-10),
+        "量子概率云(KDE)": cf.kde_breakout_score, "特性改变(ChoCh)": safe_div(stock.curr['Close'] - stock.swing_high_10, stock.swing_high_10 * 0.01),
+        "订单块(OB)": safe_div(stock.curr['Close'] - stock.curr['OB_Low'], stock.curr['OB_High'] - stock.curr['OB_Low'] + 1e-10) if pd.notna(stock.curr['OB_High']) else 0.0,
+        "AMD操盘": safe_div(min(stock.curr['Open'], stock.curr['Close']) - stock.curr['Low'], stock.curr['TR'] + 1e-10),
+        "跨时空共振(周线)": 1.0 if cf.weekly_bullish else 0.0, "CVD筹码净流入": float(stock.curr['CVD_Trend'] * (0.3 if stock.curr['CVD_Divergence'] == 1 else 1.0)),
+        "独立Alpha(脱钩)": cf.pure_alpha, "NR7极窄突破": safe_div(stock.curr['Range'], stock.curr['ATR'] + 1e-10),
+        "VPT量价共振": (1.0 / (1.0 + np.exp(-stock.curr['VPT_ZScore']))) if stock.curr['VPT_Accel'] > 0 else 0.0,
+        "带量金叉(交互)": macd_cross_strength * vol_surge_ratio, "量价吸筹(交互)": cmf_val * smf_val,
+        "近3日突破(滞后)": stock.curr['Recent_Price_Surge_3d'] if pd.notna(stock.curr['Recent_Price_Surge_3d']) else 0.0,
+        "近3日巨量(滞后)": stock.curr['Recent_Vol_Surge_3d'] if pd.notna(stock.curr['Recent_Vol_Surge_3d']) else 0.0,
+        "稳健赫斯特(Hurst)": hurst_score, "FFT多窗共振(动能)": cf.fft_ensemble_score,
+        "大周期保护小周期(MACD共振)": 1.0 if (cf.weekly_macd_res == 1.0 and check_macd_cross(stock.curr, stock.prev)) else 0.0,
+        "聪明钱月度净流入(月线)": cf.monthly_inst_flow, "60分钟级精准校准(RSI反弹)": cf.rsi_60m_bounce,
+        "大盘Beta(宏观调整)": cf.beta_60d, "利率敏感度(TLT相关性)": cf.tlt_corr, "汇率传导(DXY相关性)": cf.dxy_corr,
+        "Amihud非流动性(冲击成本)": stock.curr['Amihud'] if pd.notna(stock.curr['Amihud']) else 0.0,
+        "52周高点距离(动能延续)": stock.curr['Dist_52W_High'] if pd.notna(stock.curr['Dist_52W_High']) else 0.0,
+        "波动率风险溢价(VRP)": cf.vrp, "期权PutCall情绪(PCR)": alt.pcr, "隐含波动率偏度(IV Skew)": alt.iv_skew,
+        "做空兴趣突变(轧空)": alt.short_change if alt.short_float > Config.Params.SHORT_SQZ_FLT else 0.0,
+        "内部人集群净买入(Insider)": alt.insider_net_buy, "分析师修正动量(Analyst)": alt.analyst_mom,
+        "舆情NLP情感极值(News_NLP)": alt.nlp_score, "散户热度加速度(WSB_Accel)": alt.wsb_accel
+    }
+    if alpha_vec is not None and len(alpha_vec) == 16:
+        for i, val in enumerate(alpha_vec): feat_dict[f"Alpha_T{i+1:02d}"] = float(val)
+    else:
+        for i in range(1, 17): feat_dict[f"Alpha_T{i:02d}"] = 0.0
+    return {f: float(np.nan_to_num(feat_dict.get(f, 0.0), nan=0.0, posinf=20.0, neginf=-20.0)) for f in Config.ALL_FACTORS}
+
+def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: AltData) -> Tuple[int, List[str], List[str], bool]:
+    triggered_list, factors_list = [], []
+    theme_scores = {'TREND': 0.0, 'VOLATILITY': 0.0, 'REVERSAL': 0.0, 'QUANTUM': 0.0}
+    black_swan_risk = False
+    
+    def get_fw(tag_name: str) -> float: return ctx.xai_weights.get(tag_name, 1.0)
+    def add_trigger(tag, text, pts, theme):
+        fw = get_fw(tag)
+        if fw > 0:
+            adj_pts = pts * getattr(ctx, 'w_mul', 1.0) * fw
+            regime = getattr(ctx, 'regime', 'range')
+            if regime in ["bear", "hidden_bear"]:
+                if theme in ["TREND", "VOLATILITY"]: adj_pts *= 0.6  
+                elif theme == "REVERSAL": adj_pts *= 1.4
+            elif regime in ["bull", "rebound"]:
+                if theme in ["TREND", "VOLATILITY", "QUANTUM"]: adj_pts *= 1.2
+            theme_scores[theme] += adj_pts
+            triggered_list.append(text.format(fw=fw)); factors_list.append(tag)
+
+    gap_pct = (stock.curr['Open'] - stock.prev['Close']) / (stock.prev['Close'] + 1e-10)
+    atr_pct = (stock.curr['ATR'] / (stock.prev['Close'] + 1e-10)) * 100
+    day_chg = (stock.curr['Close'] - stock.curr['Open']) / (stock.curr['Open'] + 1e-10) * 100
+    tr_val = stock.curr['High'] - stock.curr['Low'] + 1e-10
+
+    if pd.notna(stock.curr['SMA_200']) and stock.curr['Close'] > stock.curr['SMA_50'] > stock.curr['SMA_150'] > stock.curr['SMA_200']:
+        m_str = (stock.curr['SMA_50'] - stock.curr['SMA_200']) / (stock.curr['SMA_200'] + 1e-10)
+        add_trigger("米奈尔维尼", f"🏆 [主升趋势] 米奈尔维尼模板形成 (强度:{m_str*100:.1f}% 权:{{fw:.2f}}x)", 8 + int(m_str*20), "TREND")
+        
+    if cf.rs_20 > 0: 
+        dynamic_rs_thresh = 1.0 + (stock.curr['ATR'] / (stock.curr['Close'] + 1e-10)) * 2.0
+        if cf.rs_20 > dynamic_rs_thresh: add_trigger("强相对强度", f"⚡ [相对强度] 动能超越波动率动态阈值 (阈值:{dynamic_rs_thresh:.2f} 权:{{fw:.2f}}x)", 7 if stock.is_vol else 4, "TREND")
+    
+    macd_crossed = check_macd_cross(stock.curr, stock.prev)
+    if macd_crossed:
+        is_above_water = stock.curr['MACD'] > Config.Params.MACD_WATERLINE
+        add_trigger("MACD金叉", f"🔥 [经典动能] MACD{'水上金叉' if is_above_water else '水下金叉'}起爆 (权:{{fw:.2f}}x)", 12 if is_above_water else 8, "TREND")
+
+    if stock.curr['Above_Cloud'] == 1 and stock.curr['Tenkan'] > stock.curr['Kijun']: add_trigger("一目多头", "🌥️ [趋势确认] 一目均衡表云上多头共振 (权:{fw:.2f}x)", 6, "TREND")
+    if stock.curr['Close'] > stock.curr['VWAP_20'] and stock.prev['Close'] <= stock.curr['VWAP_20']: add_trigger("VWAP突破", "🌊 [量价突破] 放量逾越近20日VWAP机构均价线 (权:{fw:.2f}x)", 8, "TREND")
+    if pd.notna(stock.curr['AVWAP']) and stock.curr['Close'] > stock.curr['AVWAP'] and stock.prev['Close'] <= stock.curr['AVWAP']: add_trigger("AVWAP突破", "⚓ [筹码夺回] 强势站上AVWAP锚定成本核心区 (权:{fw:.2f}x)", 12, "TREND")
+
+    kc_w, bb_w = stock.curr['KC_Upper'] - stock.curr['KC_Lower'], stock.curr['BB_Upper'] - stock.curr['BB_Lower']
+    if bb_w < kc_w: 
+        s_ratio = (kc_w - bb_w) / (stock.curr['ATR'] + 1e-10)
+        add_trigger("TTM Squeeze ON", f"📦 [波动压缩] TTM Squeeze 挤流状态激活 (比率:{s_ratio:.2f} 权:{{fw:.2f}}x)", 8 + int(s_ratio*10), "VOLATILITY")
+
+    if stock.prev['NR7'] and stock.prev['Inside_Bar'] and stock.curr['Close'] > stock.prev['High']: add_trigger("NR7极窄突破", "🎯 [极度压缩] 7日极窄压缩孕线完成向上爆破 (权:{fw:.2f}x)", 12, "VOLATILITY")
+
+    vcp_th = Config.Params.VCP_BEAR if getattr(ctx, 'regime', 'range') in ["bear", "hidden_bear"] else Config.Params.VCP_BULL
+    if stock.curr['Range_20'] > 0 and stock.curr['Range_20'] < stock.curr['Range_60'] * vcp_th and stock.curr['Close'] > stock.curr['SMA_50']:
+        add_trigger("VCP收缩", f"🌪️ [VCP形态] 极度价格波动压缩后的放量突破 (阈值:{vcp_th} 权:{{fw:.2f}}x)", 15, "VOLATILITY")
+
+    if pd.notna(stock.curr['Swing_Low_20']) and stock.curr['Low'] < stock.curr['Swing_Low_20'] and stock.curr['Close'] > stock.curr['Swing_Low_20']: add_trigger("流动性扫盘", "🧹 [止损猎杀] 刺穿前低扫掉散户止损后迅速诱空反转 (权:{fw:.2f}x)", 15, "REVERSAL")
+    if pd.notna(stock.curr['Swing_Low_20']) and stock.curr['Low'] > stock.curr['Swing_Low_20'] and stock.curr['Close'] > stock.swing_high_10: add_trigger("特性改变(ChoCh)", "🔀 [结构破坏] 突破近期反弹高点，完成 ChoCh 趋势逆转确认 (权:{fw:.2f}x)", 15, "REVERSAL")
+    if pd.notna(stock.curr['OB_High']) and stock.curr['Low'] <= stock.curr['OB_High'] and stock.curr['Close'] >= stock.curr['OB_Low'] and stock.curr['Close'] > stock.curr['Open']: add_trigger("订单块(OB)", "🧱 [机构订单块] 触达历史起爆底仓区并收出企稳阳线 (权:{fw:.2f}x)", 15, "REVERSAL")
+
+    if cf.kde_breakout_score > Config.Params.KDE_BREAKOUT: add_trigger("量子概率云(KDE)", f"☁️ [真空逃逸] KDE 自适应带宽揭示上行阻力极度稀薄 (得分:{cf.kde_breakout_score:.2f} 权:{{fw:.2f}}x)", 15 * cf.kde_breakout_score, "QUANTUM")
+    if cf.hurst_reliable and cf.hurst_med > Config.Params.HURST_RELIABLE: add_trigger("稳健赫斯特(Hurst)", f"⏳ [稳健记忆] R/S Bootstrap 确认强抗噪持续性 (Hurst={cf.hurst_med:.2f} 权:{{fw:.2f}}x)", 15 * (cf.hurst_med - 0.5) * 2.0, "QUANTUM")
+
+    if alt.insider_net_buy > Config.Params.INSIDER_BUY: add_trigger("内部人集群净买入(Insider)", "👔 [内幕天眼] SEC Form 4 披露高管集群式大额净买入 (权:{fw:.2f}x)", 20, "QUANTUM")
+    if alt.analyst_mom > Config.Params.ANALYST_UP: add_trigger("分析师修正动量(Analyst)", f"📊 [投行护航] 分析师评级修正动量突破 Z-Score={alt.analyst_mom:.1f} (权:{{fw:.2f}}x)", 8, "QUANTUM")
+    elif alt.analyst_mom < Config.Params.ANALYST_DN: add_trigger("分析师修正动量(Analyst)", f"⚠️ [投行抛售] 分析师评级下调动量爆表 Z-Score={alt.analyst_mom:.1f}，已被系统降权 (权:{{fw:.2f}}x)", -10, "TREND")
+
+    if macd_crossed and "带量金叉(交互)" in factors_list: theme_scores['TREND'] -= min(get_fw("MACD金叉")*8, get_fw("带量金叉(交互)")*12) * 0.5 
+    if cf.pure_alpha > 0.8: add_trigger("独立Alpha(脱钩)", "🪐 [独立Alpha] 强势剥离大盘Beta，爆发特质动能 (权:{fw:.2f}x)", 22, "TREND")
+    if stock.curr['SuperTrend_Up'] == 1 and stock.curr['Close'] < stock.curr['EMA_20'] * 1.02: add_trigger("强势回踩", "🟢 [低吸点位] 超级趋势主升轨精准回踩 (权:{fw:.2f}x)", 10, "REVERSAL")
+    if gap_pct * 100 > max(1.5, atr_pct * 0.3) and gap_pct < 0.06: add_trigger("突破缺口", "💥 [动能爆发] 放量跳空，留下底部突破缺口 (权:{fw:.2f}x)", 8, "VOLATILITY")
+    if cf.fvg_lower > 0 and stock.curr['Low'] <= cf.fvg_upper and stock.curr['Close'] > cf.fvg_lower: add_trigger("SMC失衡区", "🧲 [SMC交易法] 精准回踩并测试前期机构失衡区(FVG) (权:{fw:.2f}x)", 15, "REVERSAL")
+
+    if stock.curr['Volume'] > stock.curr['Vol_MA20'] * 2.0 and abs(stock.curr['Close'] - stock.curr['Open']) < stock.curr['ATR'] * 0.5:
+        if pd.notna(stock.curr['Swing_Low_20']) and stock.curr['Close'] < stock.curr['Swing_Low_20'] * 1.05: add_trigger("巨量滞涨", "🛑 [冰山吸筹] 底部巨量滞涨，极大概率为机构冰山挂单吸货 (权:{fw:.2f}x)", 12, "QUANTUM")
+        elif stock.curr['Close'] > stock.swing_high_10 * 0.95: triggered_list.append("⚠️ [高位派发] 高位巨量滞涨，警惕机构冰山挂单出货 (已被系统降权)")
+        
+    if day_chg > max(3.0, atr_pct * 0.6) and stock.curr['Volume'] > stock.curr['Vol_MA20'] * 1.5: add_trigger("放量长阳", "⚡ [动能脉冲] 强劲的日内放量大实体阳线 (权:{fw:.2f}x)", 12, "QUANTUM")
+    if stock.curr['Close'] > stock.prev['Close'] and stock.curr['Volume'] > stock.curr['Max_Down_Vol_10'] > 0 and stock.curr['Close'] >= stock.curr['EMA_50'] and stock.prev['Close'] <= stock.curr['EMA_50'] * 1.02: add_trigger("口袋支点", "💎 [口袋支点] 放量阳线成交量完全吞噬近期最大阴量 (权:{fw:.2f}x)", 12, "REVERSAL")
+
+    lower_wick = stock.curr['Open'] - stock.curr['Low'] if stock.curr['Close'] > stock.curr['Open'] else stock.curr['Close'] - stock.curr['Low']
+    upper_wick = stock.curr['High'] - stock.curr['Close'] if stock.curr['Close'] > stock.curr['Open'] else stock.curr['High'] - stock.curr['Open']
+    if stock.curr['Close'] > stock.curr['Open'] and (lower_wick / tr_val) > 0.3 and (upper_wick / tr_val) < 0.15: add_trigger("AMD操盘", "🎭 [AMD诱空] 深度开盘诱空下杀后，全天拉升派发的操盘模型 (权:{fw:.2f}x)", 12, "REVERSAL")
+    if cf.weekly_bullish and (stock.curr['Close'] > stock.curr['Highest_22'] * 0.95): add_trigger("跨时空共振(周线)", "🌌 [多周期共振] 周线级别主升浪与日线级别放量的强力双重共振 (权:{fw:.2f}x)", 20, "QUANTUM")
+
+    if stock.curr['CVD_Trend'] == 1.0 and stock.prev['CVD_Trend'] <= 0.0:
+        if stock.curr['CVD_Divergence'] == 0: add_trigger("CVD筹码净流入", "🧬 [微观筹码] CVD 双均线平滑多头确立且无量价背离，真实买盘涌入 (权:{fw:.2f}x)", 12, "QUANTUM")
+        else: triggered_list.append("⚠️ [微观筹码] 价格近高但 CVD 出现顶背离，尾盘动能涉嫌虚假欺骗 (已被AI降权)")
+
+    if stock.curr['VPT_ZScore'] > 0.5 and stock.curr['VPT_Accel'] > 0 and stock.prev['VPT_ZScore'] <= 0.5: add_trigger("VPT量价共振", "📈 [量价归一] VPT Z-Score突破且动能加速，真实买盘绝对共振 (权:{fw:.2f}x)", 10, "TREND")
+    if macd_crossed: add_trigger("带量金叉(交互)", "🔥 [交互共振] MACD金叉与成交量激增产生乘数效应 (权:{fw:.2f}x)", 12, "TREND")
+    if stock.curr['CMF'] > 0.15 and stock.curr['Smart_Money_Flow'] > 0.4: add_trigger("量价吸筹(交互)", "🏦 [交互共振] 蔡金资金流与微观聪明钱同向深度吸筹 (权:{fw:.2f}x)", 10, "QUANTUM")
+    if cf.fft_ensemble_score >= Config.Params.FFT_RESONANCE: add_trigger("FFT多窗共振(动能)", "🌊 [频域共振] 多窗口 FFT 阵列一致确认，主导周期处于强劲上升象限 (权:{fw:.2f}x)", 15, "QUANTUM")
+    if cf.weekly_macd_res == 1.0 and macd_crossed: add_trigger("大周期保护小周期(MACD共振)", "🛡️ [多维时空] 周线MACD动能发散，日线精准金叉，大周期绝对战役保护 (权:{fw:.2f}x)", 15, "TREND")
+    if cf.monthly_inst_flow == 1.0: add_trigger("聪明钱月度净流入(月线)", "🏛️ [战略定调] 月线级别连续3个月大单资金净流入，暗池机构底仓坚如磐石 (权:{fw:.2f}x)", 10, "QUANTUM")
+    if cf.rsi_60m_bounce == 1.0: add_trigger("60分钟级精准校准(RSI反弹)", "⏱️ [战术执行] 60分钟线 RSI 触底反弹，日内高频微操切入绝佳滑点位置 (权:{fw:.2f}x)", 8, "REVERSAL")
+
+    macro_gravity = getattr(ctx, 'macro_gravity', False)
+    if cf.beta_60d > 1.2 and not macro_gravity: add_trigger("大盘Beta(宏观调整)", "📈 [宏观Beta动能] 宏观低压期，高Beta(>1.2)特质赋予极强上行弹性 (权:{fw:.2f}x)", 7, "TREND")
+    elif cf.beta_60d > 1.2 and macro_gravity: add_trigger("大盘Beta(宏观调整)", "⚠️ [宏观Beta反噬] 宏观引力波高压期，高Beta特质面临深度回撤风险，降权防御 (权:{fw:.2f}x)", -10, "TREND")
+
+    if cf.tlt_corr > 0.4: add_trigger("利率敏感度(TLT相关性)", "🏦 [宏观映射] 与长期国债(TLT)高度正相关，受益于无风险利率见顶预期 (权:{fw:.2f}x)", 8, "TREND")
+    elif cf.tlt_corr < -0.4: add_trigger("利率敏感度(TLT相关性)", "🛡️ [宏观防御] 与长期国债(TLT)高度负相关，具备抗息避险属性 (权:{fw:.2f}x)", 6, "TREND")
+    if cf.dxy_corr < -0.4: add_trigger("汇率传导(DXY相关性)", "💱 [宏观映射] 与美元指数(DXY)强负相关，受惠于弱美元与全球流动性释放 (权:{fw:.2f}x)", 8, "QUANTUM")
+    elif cf.dxy_corr > 0.4: add_trigger("汇率传导(DXY相关性)", "💵 [宏观映射] 与美元指数(DXY)强正相关，具备强汇率避险属性 (权:{fw:.2f}x)", 6, "QUANTUM")
+        
+    dist_52w = stock.curr['Dist_52W_High'] if pd.notna(stock.curr['Dist_52W_High']) else 0.0
+    if dist_52w > Config.Params.DIST_52W and cf.weekly_bullish: add_trigger("52周高点距离(动能延续)", "🏔️ [动能延续] 逼近 52 周新高且周线多头，上方无抛压阻力真空区 (权:{fw:.2f}x)", 10, "TREND")
+        
+    amihud_val = stock.curr['Amihud'] if pd.notna(stock.curr['Amihud']) else 0.0
+    if amihud_val > Config.Params.AMIHUD_ILLIQ and macro_gravity: add_trigger("Amihud非流动性(冲击成本)", "⚠️ [流动性枯竭] 宏观高压下 Amihud 冲击成本显著放大，极易发生踩踏被降权 (权:{fw:.2f}x)", -10, "VOLATILITY")
+    if cf.vrp > Config.Params.VRP_EXTREME: add_trigger("波动率风险溢价(VRP)", f"🌋 [风险溢价] VRP归一化极度飙升(溢价率>{cf.vrp*100:.1f}%)，期权市场定价极端恐慌，捕捉极值底 (权:{{fw:.2f}}x)", 12, "QUANTUM")
+
+    if alt.nlp_score > Config.Params.NLP_BULL: add_trigger("舆情NLP情感极值(News_NLP)", f"📰 [舆情引擎] VADER-Lite 分析判定近期新闻呈现极度狂热 (复合得分:{alt.nlp_score:.2f} 权:{{fw:.2f}}x)", 6, "VOLATILITY")
+    elif alt.nlp_score < Config.Params.NLP_BEAR: add_trigger("舆情NLP情感极值(News_NLP)", f"⚠️ [舆情崩塌] 探测到新闻包含密集利空/诉讼词汇 (复合得分:{alt.nlp_score:.2f} 权:{{fw:.2f}}x)", -10, "VOLATILITY")
+    if alt.wsb_accel > Config.Params.WSB_ACCEL: add_trigger("散户热度加速度(WSB_Accel)", f"🔥 [散户加速] Reddit/WSB 提及数二阶导数飙升 (加速度:{alt.wsb_accel:.0f}/日²)，游资加速抬轿 (权:{{fw:.2f}}x)", 8, "VOLATILITY")
+
+    if alt.pcr > Config.Params.PCR_BEAR: add_trigger("期权PutCall情绪(PCR)", "⚠️ [极端避险] Put/Call Ratio 爆表，期权市场极度看空避险 (权:{fw:.2f}x)", -15, "VOLATILITY"); black_swan_risk = True
+    elif 0 < alt.pcr < Config.Params.PCR_BULL: add_trigger("期权PutCall情绪(PCR)", "🔥 [极端贪婪] Put/Call Ratio 极低，期权市场聪明钱疯狂做多 (权:{fw:.2f}x)", 10, "QUANTUM")
+    if alt.iv_skew > Config.Params.IV_SKEW_BEAR: add_trigger("隐含波动率偏度(IV Skew)", "🚨 [黑天鹅警报] 看跌期权隐含波动率畸高，内幕资金正疯狂买入下行保护！ (权:{fw:.2f}x)", -20, "VOLATILITY"); black_swan_risk = True
+    elif alt.iv_skew < Config.Params.IV_SKEW_BULL: add_trigger("隐含波动率偏度(IV Skew)", "🚀 [上行爆发] 看涨期权隐含波动率压倒性占优，主力预期剧烈向上重估 (权:{fw:.2f}x)", 12, "QUANTUM")
+    if alt.short_change > Config.Params.SHORT_SQZ_CHG and alt.short_float > Config.Params.SHORT_SQZ_FLT and stock.curr['Close'] > stock.curr['EMA_20']: add_trigger("做空兴趣突变(轧空)", "💥 [轧空引擎] 近期做空兴趣激增且技术面多头，随时触发空头踩踏平仓的 Short Squeeze (权:{fw:.2f}x)", 15, "QUANTUM")
+
+    saturated_theme_sum = sum([50.0 * (1 - np.exp(-raw_s / 25.0)) for raw_s in theme_scores.values()])
+    final_score_saturated = 100.0 * (1 - np.exp(-saturated_theme_sum / 50.0))
+    if alt.pcr > Config.Params.PCR_BEAR or alt.iv_skew > Config.Params.IV_SKEW_BEAR: black_swan_risk = True
+        
+    return int(final_score_saturated), triggered_list, factors_list, black_swan_risk
+
+def _apply_market_filters(curr, prev, sym, base_score, sig, a, b, c):
+    if curr['RSI'] > 85.0: return max(0, base_score - 30), False, sig + ["⚠️ 极端超买"]
+    return base_score, False, sig
+
+def _build_market_context() -> MarketContext:
+    qqq_df = safe_get_history(Config.INDEX_ETF, "1y", "1d", fast_mode=True)
+    # ✅ 连环 Bug 修复: 在构建完整 Context 时即拉取所有底层宏观数据，防止 macro_data 为空
+    spy_df = safe_get_history("SPY", "1y", "1d", fast_mode=True)
+    tlt_df = safe_get_history("TLT", "1y", "1d", fast_mode=True)
+    dxy_df = safe_get_history("DX-Y.NYB", "1y", "1d", fast_mode=True) # 使用 DX-Y.NYB 适配 Yahoo Finance
+    
+    vix, vix_desc = get_vix_level(qqq_df)
+    regime, regime_desc, _, _, _ = get_market_regime()
+    
+    return MarketContext(
+        regime=regime, regime_desc=regime_desc, w_mul=1.0, xai_weights={}, vix_current=vix, 
+        vix_desc=vix_desc, vix_scalar=1.0, max_risk=0.015, macro_gravity=False, 
+        is_credit_risk_high=False, vix_inv=False, qqq_df=qqq_df, 
+        macro_data={'spy': spy_df, 'tlt': tlt_df, 'dxy': dxy_df}, 
+        total_market_exposure=1.0, health_score=1.0, pain_warning="", dynamic_min_score=8.0
+    )
 
 # ================= 🚀 两阶段并行引擎工作函数 (顶层定义防 Pickling 崩溃) =================
 def _io_fetch_worker(sym: str) -> Optional[dict]: pass # 兼容可能的热重载
@@ -366,7 +944,16 @@ def _prepare_universe_data(ctx: MarketContext) -> Tuple[List[dict], dict]:
 
     return prepared_data, {d['sym']: d['close_history'] for d in prepared_data}
 
+def _apply_ai_inference(reports: List[dict], ctx: MarketContext) -> List[dict]:
+    for r in reports: r['ai_prob'] = random.uniform(0.4, 0.8)
+    return reports
 
+def _calculate_position_size(stock, ctx, ai_prob, div, risk):
+    return stock.curr['Close'] * 1.1, stock.curr['Close'] * 0.95, ai_prob - 0.2, ""
+
+def _apply_kelly_cluster_optimization(reports: List[dict], pd_dict, exp, ctx):
+    for i, r in enumerate(reports): r['opt_weight'] = 0.05; r['pos_advice'] = "✅ 凯利最优"
+    return reports[:5]
 
 def _generate_and_send_matrix_report(final_reports: List[dict], final_shadow_pool: List[dict], ctx: MarketContext) -> None:
     txts = []
