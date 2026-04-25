@@ -188,7 +188,8 @@ class Config:
     def get_sector_etf(symbol: str) -> str:
         for etf, symbols in Config.SECTOR_MAP.items():
             if symbol in symbols: return etf
-        return Config.INDEX_ETF
+        # [行业黑洞修复] 未知股票不再归入免责的 QQQ，而是归入通用外围板块，接受统一的拥挤度惩罚
+        return "SP500_WILD"
 
 def datetime_to_str(): return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
@@ -797,11 +798,20 @@ def get_market_regime(active_pool: List[str] = None) -> Tuple[str, str, pd.DataF
     df = safe_get_history(Config.INDEX_ETF, period="1y", interval="1d", fast_mode=True)
     if len(df) < 200: return "range", "默认震荡", df, False, False
     c_close, ma200 = df['Close'].ffill().iloc[-1], df['Close'].rolling(200).mean().iloc[-1]
+    ma50 = df['Close'].rolling(50).mean().iloc[-1]
     trend_20d = (c_close - df['Close'].iloc[-20]) / df['Close'].iloc[-20]
+    
+    # [提前防御] 如果 20日动能跌超 -4% 或者跌破 50日均线，直接切入隐性熊市，无需等待 200日均线破位
+    if trend_20d < -0.04 or c_close < ma50:
+        if c_close > ma200:
+            return ("hidden_bear", "⚠️ 隐性熊市 (短线动能破位)", df, False, False)
+        else:
+            return ("bear", "🐻 熊市深调 (全线空头)", df, False, False) if trend_20d < -0.02 else ("rebound", "🦅 超跌反弹", df, False, False)
+            
     if c_close > ma200:
         return ("bull", "🐂 牛市主升", df, False, False) if trend_20d > 0.02 else ("range", "⚖️ 牛市震荡", df, False, False)
-    else:
-        return ("bear", "🐻 熊市回调", df, False, False) if trend_20d < -0.02 else ("rebound", "🦅 超跌反弹", df, False, False)
+    
+    return ("range", "⚖️ 默认震荡", df, False, False)
 
 def _robust_fft_ensemble(close_prices: np.ndarray, base_length=120, ensemble_count=7) -> float:
     if len(close_prices) < base_length + (ensemble_count // 2) * 5: return 0.0
@@ -1262,12 +1272,18 @@ def _build_market_context() -> MarketContext:
         credit_spread_mom = float(ratio.pct_change(20).iloc[-1]) # 20日动量
         if credit_spread_mom < -0.02: credit_risk_high = True # 信用收缩警报
     
+    exp = 1.0
+    if regime == "bear": exp = 0.3
+    elif regime == "hidden_bear": exp = 0.5
+    elif regime == "rebound": exp = 0.6
+    if credit_risk_high: exp *= 0.5
+
     return MarketContext(
         regime=regime, regime_desc=regime_desc, w_mul=1.0, xai_weights={}, vix_current=vix, 
         vix_desc=vix_desc, vix_scalar=1.0, max_risk=0.015, macro_gravity=credit_risk_high, 
         is_credit_risk_high=credit_risk_high, vix_inv=False, qqq_df=qqq_df, 
         macro_data={'spy': spy_df, 'tlt': tlt_df, 'dxy': dxy_df, 'hyg': hyg_df, 'iei': iei_df}, 
-        total_market_exposure=0.5 if credit_risk_high else 1.0, 
+        total_market_exposure=exp, 
         health_score=0.6 if credit_risk_high else 1.0, 
         pain_warning="🚨 [宏观重力] 探测到信用利差急剧扩大，系统已进入防御态势" if credit_risk_high else "", 
         credit_spread_mom=credit_spread_mom, dynamic_min_score=8.5 if credit_risk_high else 8.0
@@ -1387,8 +1403,8 @@ def _stress_test_cpu_worker(payload: dict) -> dict:
 # ================= 数据预备引擎 (异步升级版: IO/CPU 解锁) =================
 async def _prepare_universe_data_async(ctx: MarketContext) -> Tuple[List[dict], dict]:
     prepared_data = []
-    symbols = get_filtered_watchlist(max_stocks=30)
-    logger.info(f"🚀 启动架构终极版: asyncio 与 多进程配合的混合动力引擎...")
+    symbols = get_filtered_watchlist(max_stocks=200)
+    logger.info(f"🚀 启动架构终极版: asyncio 与 多进程配合的混合动力引擎 (扫描数: {len(symbols)})...")
     
     # --- 阶段 1: 极高并发异步 IO 拉取 (彻底抛弃线程池) ---
     tasks = [_io_fetch_worker_async(sym) for sym in symbols]
@@ -1462,17 +1478,25 @@ def _apply_ai_inference(reports: List[dict], ctx: MarketContext) -> List[dict]:
     return reports
 
 def _calculate_position_size(stock: StockData, ctx: MarketContext, ai_prob: float, div: float, risk: float):
-    """风控决策引擎: 从固定比例升级为基于 ATR 的波动率动态停损"""
+    """风控决策引擎: 从固定比例升级为基于 ATR 与吊灯线 (Chandelier Exit) 的动态移动止损"""
     c = stock.curr['Close']
-    atr = stock.curr.get('ATR', c * 0.02) # 缺省使用 2% 波动
+    atr = stock.curr.get('ATR', c * 0.02) if pd.notna(stock.curr.get('ATR')) else c * 0.02
     
-    # 动态止盈止损：根据波幅设定 3.5x 空间止盈，2.0x 空间止损
+    # 动态止盈：设定 3.5x 极限空间止盈
     tp_price = c + (atr * 3.5)
-    sl_price = c - (atr * 2.0)
+    
+    # [利润回撤防线] 结合硬底线止损与吊灯移动止损
+    hard_sl = c - (atr * 2.0)
+    chandelier_sl = stock.curr.get('Chandelier_Exit', hard_sl)
+    if pd.isna(chandelier_sl) or chandelier_sl == 0.0: chandelier_sl = hard_sl
+    
+    # 取硬底线与吊灯线中较高的一个作为最终防线，实现只进不退的动态利润锁定
+    sl_price = max(hard_sl, chandelier_sl)
     
     # 根据趋势强度修正胜率预估
     adj_prob = ai_prob
-    if c > stock.curr['SMA_200']: adj_prob += 0.03 # 顺大势加分
+    sma_200 = stock.curr.get('SMA_200', 0)
+    if pd.notna(sma_200) and c > sma_200: adj_prob += 0.03 # 顺大势加分
     
     return float(tp_price), float(sl_price), float(adj_prob), ""
 
@@ -1495,60 +1519,7 @@ def _apply_kelly_cluster_optimization(reports: List[dict], pd_dict, exp, ctx):
     final_pool = sorted(reports, key=lambda x: x.get('ai_prob', 0) * 100.0 + x.get('score', 0), reverse=True)[:5]
     return final_pool
 
-class ExecutionEngine:
-    """智能执行引擎：支持订单拆解(Slicing)、防滑点保护与异步 TCA 归因"""
-    def __init__(self, broker: Any):
-        self.broker = broker
-        self.ledger = OrderLedger(Config.ORDER_DB_PATH)
-        self.is_running = True
-        self.slice_interval = 60  # 每 60 秒尝试执行一个切片
 
-    def run(self):
-        logger.info(f"🚀 智能执行网关启动 [模式: TWAP-Lite + 盘口保护] | 路由: {type(self.broker).__name__}")
-        while self.is_running:
-            # 1. 处理待提交的原始订单（进行切片化）
-            for _, r in self.ledger.fetch_status(['PENDING_SUBMIT']).iterrows():
-                try:
-                    total_qty = r['qty']
-                    # 智能拆分逻辑：如果金额较大，拆分为 5 个切片执行
-                    num_slices = 5 if (total_qty * r['arrival_price'] > 500) else 1
-                    slice_qty = round(total_qty / num_slices, 4)
-                    
-                    for i in range(num_slices):
-                        slice_id = f"{r['client_oid']}_S{i}"
-                        # 将子订单注入待执行队列 (此处简化为直接循环，实际可入库)
-                        logger.info(f"分片执行 [{i+1}/{num_slices}]: {r['symbol']} {slice_qty} 股")
-                        bo = self.broker.submit_order(r['symbol'], r['side'], slice_qty, 'MARKET', client_oid=slice_id)
-                        if bo:
-                            self._record_tca(r, bo, i, num_slices)
-                        time.sleep(self.slice_interval / num_slices)
-                    
-                    self.ledger.update(r['client_oid'], 'FILLED')
-                except Exception as e:
-                    logger.error(f"❌ 执行异常: {e}")
-                    self.ledger.update(r['client_oid'], 'REJECTED')
-            
-            time.sleep(5)
-
-    def _record_tca(self, orig_order, broker_order, slice_idx, total_slices):
-        """记录详细的交易成本分析(TCA)"""
-        try:
-            # 模拟获取执行价格 (实际应从 broker_order 获取)
-            exec_price = broker_order.avg_fill_price if broker_order.avg_fill_price > 0 else orig_order['arrival_price']
-            slippage = (exec_price - orig_order['arrival_price']) / (orig_order['arrival_price'] + 1e-10) * 10000
-            
-            tca_data = {
-                "ts": datetime_to_str(),
-                "symbol": orig_order['symbol'],
-                "side": orig_order['side'],
-                "slice": f"{slice_idx+1}/{total_slices}",
-                "arrival_price": orig_order['arrival_price'],
-                "execution_price": exec_price,
-                "slippage_bps": round(slippage, 2)
-            }
-            with open(Config.TCA_LOG_PATH, 'a') as f:
-                f.write(json.dumps(tca_data) + '\n')
-        except Exception: pass
 
 def _generate_and_send_matrix_report(final_reports: List[dict], final_shadow_pool: List[dict], ctx: MarketContext) -> None:
     txts = []
@@ -1586,8 +1557,9 @@ def _route_orders_to_gateway(final_reports: List[dict], ctx: MarketContext) -> N
                     alloc_usd = Config.Params.PORTFOLIO_VALUE * ctx.total_market_exposure * r['opt_weight']
                     qty = round(alloc_usd / max(r['curr_close'], 1e-10), 4)
                     if qty > 0:
-                        conn.execute('''INSERT INTO orders (client_oid, symbol, side, qty, order_type, arrival_price, status) VALUES (?, ?, 'BUY', ?, 'MKT', ?, 'PENDING_SUBMIT')''', (f"QB_{uuid.uuid4().hex[:8]}", r['symbol'], qty, r['curr_close']))
-                        logger.info(f"📡 [网关路由] 成功下下发 {r['symbol']} BUY 指令: {qty} 股 -> PENDING_SUBMIT")
+                        limit_p = round(r['curr_close'] * 1.002, 2)
+                        conn.execute('''INSERT INTO orders (client_oid, symbol, side, qty, order_type, limit_price, arrival_price, status) VALUES (?, ?, 'BUY', ?, 'LMT', ?, ?, 'PENDING_SUBMIT')''', (f"QB_{uuid.uuid4().hex[:8]}", r['symbol'], qty, limit_p, r['curr_close']))
+                        logger.info(f"📡 [网关路由] 成功下发 {r['symbol']} BUY 指令: {qty} 股 -> PENDING_SUBMIT (Pegged Limit: {limit_p})")
     except Exception as e: logger.error(f"❌ [网关路由] IPC 致命错误: {e}")
 
 # ================= 5. 实盘执行网关 (Execution Gateway) =================
@@ -1682,8 +1654,8 @@ class ExecutionEngine:
         while self.is_running:
             for _, r in self.ledger.fetch_status(['PENDING_SUBMIT']).iterrows():
                 try:
-                    logger.info(f"📤 提交: {r['side']} {r['qty']} {r['symbol']}")
-                    bo = self.broker.submit_order(r['symbol'], r['side'], r['qty'], 'MKT', client_oid=r['client_oid'])
+                    logger.info(f"📤 提交: {r['side']} {r['qty']} {r['symbol']} ({r['order_type']} 限价: {r.get('limit_price', 'MKT')})")
+                    bo = self.broker.submit_order(r['symbol'], r['side'], r['qty'], r['order_type'], limit_price=r.get('limit_price'), client_oid=r['client_oid'])
                     self.ledger.update(r['client_oid'], bo.status if bo else 'REJECTED', boid=bo.broker_oid if bo else None)
                 except Exception: self.ledger.update(r['client_oid'], 'REJECTED')
             for _, r in self.ledger.fetch_status(['OPEN']).iterrows():
@@ -1725,20 +1697,19 @@ def run_tech_matrix():
     for r in raw:
         if r['total_score'] > 0: all_raw_scores.append(r['total_score'])
         
-        tp_val, sl_val, kelly_fraction, basic_advice = _calculate_position_size(
+        tp_val, sl_val, adj_prob, basic_advice = _calculate_position_size(
             StockData(r['sym'], pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), r['curr'], r['prev'], False, 0.0), 
             ctx, r['ai_prob'], r['is_bearish_div'], r['black_swan_risk']
         )
 
         stock_data_pack = {
-            "symbol": r['sym'], "score": r['total_score'], "ai_prob": r['ai_prob'], "signals": r['sig'][:8], 
+            "symbol": r['sym'], "score": r['total_score'], "ai_prob": adj_prob, "signals": r['sig'][:8], 
             "factors": r['factors'], "ml_features": r['ml_features'],
             "curr_close": float(r['curr']['Close']), "tp": float(tp_val), "sl": float(sl_val), 
-            "news": r['news'], "sector": r['sym_sec'], "pos_advice": basic_advice,
-            "kelly_fraction": kelly_fraction
+            "news": r['news'], "sector": r['sym_sec'], "pos_advice": basic_advice
         }
 
-        if not r['is_untradeable'] and r['total_score'] > 0 and kelly_fraction > 0:
+        if not r['is_untradeable'] and r['total_score'] > 0 and adj_prob > 0:
             if check_earnings_risk(r['sym']):
                 r['sig'].append("💣 [财报雷区] 近5日发财报,风险极高")
                 r['total_score'] = int(r['total_score'] * 0.5)
