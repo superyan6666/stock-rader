@@ -857,7 +857,9 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['Close'], df['Volume'] = df['Close'].ffill(), df['Volume'].ffill()
     df['Open'], df['High'], df['Low'] = df['Open'].ffill(), df['High'].ffill(), df['Low'].ffill()
     
-    df['SMA_50'], df['SMA_150'], df['SMA_200'] = df['Close'].rolling(50).mean(), df['Close'].rolling(150).mean(), df['Close'].rolling(200).mean()
+    df['SMA_50'] = df['Close'].rolling(50, min_periods=10).mean()
+    df['SMA_150'] = df['Close'].rolling(150, min_periods=30).mean()
+    df['SMA_200'] = df['Close'].rolling(200, min_periods=40).mean()
     df['EMA_20'], df['EMA_50'] = df['Close'].ewm(span=20, adjust=False).mean(), df['Close'].ewm(span=50, adjust=False).mean()
     
     delta = df['Close'].diff()
@@ -1275,12 +1277,9 @@ def _build_market_context() -> MarketContext:
 async def _io_fetch_worker_async(sym: str) -> Optional[dict]:
     """[异步版] 阶段1: 纯 IO 并行拉取工作节点"""
     try:
-        # yfinance 是同步库，使用 to_thread 避免阻塞主事件循环
-        # 并发拉取 4 个不同周期的 K 线数据
+        # [IO 优化] 仅拉取长周期基础日线与短周期小时线，切断冗余并发网络风暴
         hist_tasks = [
-            asyncio.to_thread(safe_get_history, sym, "1y", "1d", True),
-            asyncio.to_thread(safe_get_history, sym, "5y", "1wk", True),
-            asyncio.to_thread(safe_get_history, sym, "5y", "1mo", True),
+            asyncio.to_thread(safe_get_history, sym, "5y", "1d", True),
             asyncio.to_thread(safe_get_history, sym, "60d", "60m", True)
         ]
         
@@ -1291,13 +1290,23 @@ async def _io_fetch_worker_async(sym: str) -> Optional[dict]:
         ]
         
         results = await asyncio.gather(*hist_tasks, *other_tasks)
-        df, df_w, df_m, df_60m, sentiment, alt_data = results
+        df_5y, df_60m, sentiment, alt_data = results
         
-        if len(df) < 60: return None
+        if df_5y is None or len(df_5y) < 60: return None
+        
+        # [CPU 本地重采样] 用 Pandas 内存换网络 IO，速度提升极高
+        try:
+            df_w = df_5y.resample('W').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
+            df_m = df_5y.resample('ME').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
+        except Exception:
+            df_w, df_m = pd.DataFrame(), pd.DataFrame()
+            
+        # [IPO 保护] 让主 df 获得完整 5y 历史，为 SMA_200 提供充足纵深计算
+        df = df_5y.copy()
         
         return {
             'sym': sym, 'df': df, 
-            'df_w': df_w, 'df_m': df_m, 'df_60m': df_60m,
+            'df_w': df_w, 'df_m': df_m, 'df_60m': df_60m if df_60m is not None else pd.DataFrame(),
             'sentiment': sentiment, 'alt_data': alt_data
         }
     except Exception as e:
