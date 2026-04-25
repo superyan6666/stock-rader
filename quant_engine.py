@@ -1491,8 +1491,8 @@ def _apply_kelly_cluster_optimization(reports: List[dict], pd_dict, exp, ctx):
         r['opt_weight'] = k_weight
         r['pos_advice'] = f"✅ 凯利权重: {k_weight*100:.1f}%"
         
-    # 按 AI 胜率排序，保留前 5 名最强标的
-    final_pool = sorted(reports, key=lambda x: x['ai_prob'], reverse=True)[:5]
+    # [架构优化] AI 右脑与量化左脑的集成排序 (Ensemble)
+    final_pool = sorted(reports, key=lambda x: x.get('ai_prob', 0) * 100.0 + x.get('score', 0), reverse=True)[:5]
     return final_pool
 
 class ExecutionEngine:
@@ -1757,6 +1757,7 @@ def run_tech_matrix():
         for sec, stks in groups.items():
             if hasattr(Config, 'CROWDING_EXCLUDE_SECTORS') and sec not in Config.CROWDING_EXCLUDE_SECTORS and len(stks) >= Config.Params.CROWDING_MIN_STOCKS:
                 pen = max(0.6, min(0.9, Config.Params.CROWDING_PENALTY * (1.0 + ctx.health_score * 0.3)))
+                stks.sort(key=lambda x: x["score"], reverse=True)
                 for s in stks[1:]: s["score"] = int(s["score"] * pen)
 
         freps = _apply_kelly_cluster_optimization(reps, hist, ctx.total_market_exposure, ctx)
