@@ -1,7 +1,7 @@
 .quantbot_data/
 *.tmp
 
-pycache/
+__pycache__/
 *.py[cod]
 *$py.class
 
@@ -14,8 +14,7 @@ quantbot_config.json
 
 backtest_log_*.jsonl
 
-# 业务数据与日志
-data/
+# 业务运行时日志（不忽略 data/ 源码包）
 logs/
 *.csv
 *.db
