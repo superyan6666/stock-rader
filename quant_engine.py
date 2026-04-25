@@ -49,9 +49,13 @@ warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 # ================= 1. 日志与全局配置管理 =================
-from utils.logger import logger
-from utils.exceptions import DataFetchError, FallbackWarning
-from config import Config, _GLOBAL_HEADERS
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+logger = logging.getLogger("QuantBot")
+
+_GLOBAL_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'application/json'
+}
 
 # 注入带有强效防抖与重试机制的全局 Session
 from requests.adapters import HTTPAdapter
@@ -62,6 +66,107 @@ _retry_strategy = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500,
 _GLOBAL_SESSION.mount("https://", HTTPAdapter(max_retries=_retry_strategy, pool_connections=20, pool_maxsize=20))
 _GLOBAL_SESSION.headers.update(_GLOBAL_HEADERS)
 
+class Config:
+    WEBHOOK_URL: str = os.environ.get('WEBHOOK_URL', '')
+    TELEGRAM_BOT_TOKEN: str = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+    TELEGRAM_CHAT_ID: str = os.environ.get('TELEGRAM_CHAT_ID', '')
+    DINGTALK_KEYWORD: str = "AI"
+    INDEX_ETF: str = "QQQ" 
+    VIX_INDEX: str = "^VIX" 
+    
+    SECTOR_MAP = {
+        'XLK': ['AAPL', 'MSFT', 'NVDA', 'AVGO', 'QCOM', 'AMD', 'INTC', 'CRM', 'ADBE'],
+        'XLY': ['AMZN', 'TSLA', 'BKNG', 'SBUX', 'MAR', 'MELI', 'LULU', 'HD', 'ROST'],
+        'XLC': ['GOOGL', 'GOOG', 'META', 'NFLX', 'CMCSA', 'TMUS', 'EA', 'TTWO'],
+        'XLV': ['AMGN', 'GILD', 'VRTX', 'REGN', 'ISRG', 'BIIB', 'ILMN', 'DXCM'],
+        'XLP': ['PEP', 'COST', 'MDLZ', 'KDP', 'KHC', 'MNST', 'WBA']
+    }
+    
+    LOG_PREFIX: str = "backtest_log_"
+    # ✅ 修复：将所有核心文件路径强绑定至 DATA_DIR 目录，对齐 GitHub Artifacts 与 Dashboard
+    DATA_DIR: str = ".quantbot_data"
+    STATS_FILE: str = os.path.join(DATA_DIR, "strategy_stats.json")
+    REPORT_FILE: str = os.path.join(DATA_DIR, "backtest_report.md")
+    EXT_CACHE_FILE: str = os.path.join(DATA_DIR, "daily_ext_cache.json")
+    ORDER_DB_PATH: str = os.path.join(DATA_DIR, "order_state.db") 
+    TCA_LOG_PATH: str = os.path.join(DATA_DIR, "tca_history.jsonl")
+    
+    CACHE_FILE: str = "tickers_cache.json"
+    ALERT_CACHE_FILE: str = "alert_history.json"
+    MODEL_FILE: str = "scoring_model.pkl"
+    WSB_CACHE_FILE: str = "wsb_history.json"  
+    CUSTOM_CONFIG_FILE: str = "quantbot_config.json" 
+    MODEL_VERSION: str = "3.0" 
+
+    CORE_WATCHLIST: list = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO", "AMD", "QCOM", "JPM", "V", "MA", "UNH", "JNJ", "XOM", "PG", "HD", "COST", "ABBV", "CRM", "NFLX", "ADBE", "NOW", "UBER", "INTU", "IBM", "ISRG", "SYK", "SPY", "QQQ", "IWM", "DIA"]
+    CROWDING_EXCLUDE_SECTORS: list = [INDEX_ETF] 
+
+    CORE_FACTORS = ["米奈尔维尼", "强相对强度", "MACD金叉", "TTM Squeeze ON", "一目多头", "强势回踩", "机构控盘(CMF)", "突破缺口", "VWAP突破", "AVWAP突破", "SMC失衡区", "流动性扫盘", "聪明钱抢筹", "巨量滞涨", "放量长阳", "口袋支点", "VCP收缩", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘", "跨时空共振(周线)"]
+    ADVANCED_MATH_FACTORS = ["量子概率云(KDE)", "稳健赫斯特(Hurst)", "FFT多窗共振(动能)", "CVD筹码净流入", "独立Alpha(脱钩)", "NR7极窄突破", "VPT量价共振", "大盘Beta(宏观调整)", "利率敏感度(TLT相关性)", "汇率传导(DXY相关性)", "Amihud非流动性(冲击成本)", "波动率风险溢价(VRP)"]
+    INTERACTION_FACTORS = ["带量金叉(交互)", "量价吸筹(交互)", "近3日突破(滞后)", "近3日巨量(滞后)", "大周期保护小周期(MACD共振)", "60分钟级精准校准(RSI反弹)", "52周高点距离(动能延续)"]
+    ALT_DATA_FACTORS = ["聪明钱月度净流入(月线)", "期权PutCall情绪(PCR)", "隐含波动率偏度(IV Skew)", "做空兴趣突变(轧空)", "内部人集群净买入(Insider)", "分析师修正动量(Analyst)", "舆情NLP情感极值(News_NLP)", "散户热度加速度(WSB_Accel)"]
+    TRANSFORMER_FACTORS = [f"Alpha_T{i:02d}" for i in range(1, 17)]
+    ALL_FACTORS = CORE_FACTORS + ADVANCED_MATH_FACTORS + INTERACTION_FACTORS + ALT_DATA_FACTORS + TRANSFORMER_FACTORS
+    GROUP_A_FACTORS = CORE_FACTORS + ["聪明钱月度净流入(月线)", "大盘Beta(宏观调整)", "利率敏感度(TLT相关性)", "汇率传导(DXY相关性)", "52周高点距离(动能延续)", "内部人集群净买入(Insider)", "分析师修正动量(Analyst)"] + [f for f in INTERACTION_FACTORS if "共振" in f or "滞后" in f]
+    GROUP_B_FACTORS = ADVANCED_MATH_FACTORS + ALT_DATA_FACTORS + [f for f in CORE_FACTORS if "扫盘" in f or "失衡" in f or "抢筹" in f] + TRANSFORMER_FACTORS
+
+    class Params:
+        MAX_WORKERS = 8
+        MIN_SCORE_THRESHOLD = 8
+        BASE_MAX_RISK = 0.015       
+        CROWDING_PENALTY = 0.75     
+        CROWDING_MIN_STOCKS = 2     
+        PORTFOLIO_VALUE = 100000.0  
+        SLIPPAGE = 0.003            
+        COMMISSION = 0.0005         
+        MIN_T_STAT = 1.0            
+        PCR_BEAR = 1.5           
+        PCR_BULL = 0.5           
+        IV_SKEW_BEAR = 0.08      
+        IV_SKEW_BULL = -0.05     
+        SHORT_SQZ_CHG = 0.10     
+        SHORT_SQZ_FLT = 0.05     
+        VRP_EXTREME = 0.25       
+        WSB_ACCEL = 20.0         
+        ANALYST_UP = 1.5         
+        ANALYST_DN = -1.5        
+        NLP_BULL = 0.5           
+        NLP_BEAR = -0.5          
+        INSIDER_BUY = 0.5        
+        AMIHUD_ILLIQ = 0.5       
+        DIST_52W = -0.05         
+        KDE_BREAKOUT = 0.5       
+        HURST_RELIABLE = 0.65    
+        FFT_RESONANCE = 0.71     
+        VCP_BULL = 0.5           
+        VCP_BEAR = 0.4           
+        MACD_WATERLINE = 0.0     
+
+        @classmethod
+        def load_overrides(cls):
+            if os.path.exists(Config.CUSTOM_CONFIG_FILE):
+                try:
+                    with open(Config.CUSTOM_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                        custom_cfg = json.load(f)
+                        for k, v in custom_cfg.items():
+                            if hasattr(cls, k):
+                                orig_val = getattr(cls, k)
+                                if isinstance(orig_val, bool): setattr(cls, k, str(v).lower() in ['true', '1', 'yes', 't'])
+                                elif isinstance(orig_val, (int, float, str)):
+                                    try: setattr(cls, k, type(orig_val)(v))
+                                    except: pass
+                                else: setattr(cls, k, v)
+                except Exception: pass
+
+    @classmethod
+    def get_current_log_file(cls) -> str:
+        return f"{cls.LOG_PREFIX}{datetime.now(timezone.utc).strftime('%Y_%m')}.jsonl"
+
+    @staticmethod
+    def get_sector_etf(symbol: str) -> str:
+        for etf, symbols in Config.SECTOR_MAP.items():
+            if symbol in symbols: return etf
+        return Config.INDEX_ETF
 
 def datetime_to_str(): return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
@@ -127,31 +232,250 @@ class ComplexFeatures:
 
 # ================= 3. 核心计算与数据拉取 =================
 
-from data.cache_manager import _SHARED_CACHE, TokenBucket, CrossProcessTokenBucket, _API_LIMITER, _WORKER_LOCAL_LIMITER, worker_pool_initializer
-from data.async_fetcher import safe_get_history_async
-import asyncio
-import aiohttp
+class SharedDFCache:
+    """基于内存映射的零拷贝DataFrame缓存，多进程可直接读取 (破解 IPC 瓶颈)"""
+    def __init__(self, cache_dir: str = "/dev/shm/quantbot" if os.path.exists("/dev/shm") else ".quantbot_data/shm", ttl_hours: int = 12):
+        os.makedirs(cache_dir, exist_ok=True)
+        self.cache_dir = cache_dir
+        self.ttl_seconds = ttl_hours * 3600
+        self._cleanup_stale()  # 启动时主动清理过期内存，防止 OOM
+
+    def _cleanup_stale(self):
+        """清理超过 TTL 的过期缓存文件"""
+        now = time.time()
+        try:
+            for fname in os.listdir(self.cache_dir):
+                fpath = os.path.join(self.cache_dir, fname)
+                if fname.endswith('.feather') and os.path.isfile(fpath):
+                    if now - os.path.getmtime(fpath) > self.ttl_seconds:
+                        os.remove(fpath)
+                        logger.debug(f"🧹 清理过期缓存: {fname}")
+        except Exception as e:
+            logger.debug(f"Cache cleanup error: {e}")
+
+    def get_cache_size_mb(self) -> float:
+        """监控当前缓存物理占用大小"""
+        try:
+            total = sum(
+                os.path.getsize(os.path.join(self.cache_dir, f))
+                for f in os.listdir(self.cache_dir)
+                if f.endswith('.feather')
+            )
+            return total / 1024 / 1024
+        except Exception:
+            return 0.0
+
+    def get(self, key: str) -> Optional[pd.DataFrame]:
+        if not FEATHER_AVAILABLE: return None
+        path = os.path.join(self.cache_dir, f"{key}.feather")
+        if os.path.exists(path):
+            try:
+                # feather 支持零拷贝读取，耗时极低，完美适配多进程共享
+                return feather.read_feather(path, memory_map=True)
+            except Exception as e:
+                logger.debug(f"Cache read error for {key}: {e}")
+        return None
+
+    def set(self, key: str, df: pd.DataFrame):
+        if not FEATHER_AVAILABLE: return
+        path = os.path.join(self.cache_dir, f"{key}.feather")
+        tmp = path + ".tmp"
+        try:
+            feather.write_feather(df, tmp)
+            os.replace(tmp, path)  # 原子级写入，防多进程竞态
+        except Exception as e:
+            logger.debug(f"Cache write error for {key}: {e}")
+
+_SHARED_CACHE = SharedDFCache()
+
+class TokenBucket:
+    """普通的基于线程锁的令牌桶限速器 (用于单一进程内，如独立的子进程或仅在线程池内)"""
+    def __init__(self, rate: float = 5.0, capacity: float = 10.0):
+        self.rate = rate
+        self.capacity = capacity
+        self._tokens = capacity
+        self._last_refill = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self, tokens: float = 1.0) -> float:
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_refill
+            self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
+            self._last_refill = now
+            if self._tokens >= tokens:
+                self._tokens -= tokens
+                return 0.0
+            else:
+                wait = (tokens - self._tokens) / self.rate
+                time.sleep(wait)
+                self._tokens = 0.0
+                return wait
+
+class CrossProcessTokenBucket:
+    """跨进程安全的共享内存令牌桶：防御多进程下局部限速器翻倍溢出漏洞"""
+    def __init__(self, rate: float = 4.0, capacity: float = 8.0):
+        self.rate = rate
+        self.capacity = capacity
+        # 使用基于内存映射的 Value 和 Lock，子进程将继承或共享相同状态
+        self._tokens = Value('d', capacity)
+        self._last_refill = Value('d', time.monotonic())
+        self._lock = MPLock()
+
+    def acquire(self, tokens: float = 1.0) -> float:
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_refill.value
+            self._tokens.value = min(
+                self.capacity,
+                self._tokens.value + elapsed * self.rate
+            )
+            self._last_refill.value = now
+            
+            if self._tokens.value >= tokens:
+                self._tokens.value -= tokens
+                return 0.0
+            else:
+                wait = (tokens - self._tokens.value) / self.rate
+                time.sleep(wait)
+                self._tokens.value = 0.0
+                return wait
+
+_API_LIMITER = CrossProcessTokenBucket(rate=4.0, capacity=8.0)  # 主进程/线程池级 API 全局限速单例
+_WORKER_LOCAL_LIMITER: Optional[TokenBucket] = None  # 进程本地限速器，专门在 _cpu_calc_worker 中降频使用
 
 def _worker_pool_initializer(rate_per_worker: float, capacity: float):
-    worker_pool_initializer(rate_per_worker, capacity)
+    """ProcessPoolExecutor 的子进程初始化函数，平滑注入局部分布式限速器"""
+    global _WORKER_LOCAL_LIMITER
+    _WORKER_LOCAL_LIMITER = TokenBucket(rate=rate_per_worker, capacity=capacity)
+    logger.debug(f"Worker {os.getpid()} 限速器初始化: 分配速率 {rate_per_worker:.2f} req/s")
+
 
 _DAILY_EXT_CACHE = {}; _DAILY_EXT_LOCK = threading.Lock()
 _ALT_DATA_CACHE = {}; _ALT_DATA_LOCK = threading.Lock()
 
-from features.math_ops import safe_div, _robust_fft_ensemble, _robust_hurst
+def safe_div(num, den, cap=20.0):
+    if pd.isna(num) or pd.isna(den) or den == 0: return 0.0
+    return max(min(num / den, cap), -cap)
 
 def check_macd_cross(curr: pd.Series, prev: pd.Series) -> bool:
     return prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']
 
-def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 3, fast_mode: bool = False) -> pd.DataFrame:
-    async def _run():
-        async with aiohttp.ClientSession() as session:
-            return await safe_get_history_async(session, symbol, period, interval, retries, fast_mode)
+def _fetch_from_alpaca(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    """使用 Alpaca Data v2 API 拉取行情"""
+    api_key = os.environ.get('ALPACA_API_KEY', '')
+    api_secret = os.environ.get('ALPACA_API_SECRET', '')
+    
+    if not api_key or not api_secret:
+        return pd.DataFrame()
+        
+    # Alpaca 时限映射 (粗略换算，Alpaca 使用 RFC3339 格式的 start/end)
+    now = datetime.now(timezone.utc)
+    if period.endswith('d'): days = int(period[:-1])
+    elif period.endswith('mo'): days = int(period[:-2]) * 30
+    elif period.endswith('y'): days = int(period[:-1]) * 365
+    else: days = 365
+    
+    start_time = (now - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_time = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+    
+    # timeframe 映射: 1d -> 1Day, 60m -> 1Hour, 1wk -> 1Week
+    if interval == '1d': timeframe = '1Day'
+    elif interval == '60m' or interval == '1h': timeframe = '1Hour'
+    elif interval == '1wk': timeframe = '1Week'
+    elif interval == '1mo': timeframe = '1Month'
+    else: timeframe = '1Day'
+
+    url = f"https://data.alpaca.markets/v2/stocks/bars"
+    params = {
+        "symbols": symbol,
+        "timeframe": timeframe,
+        "start": start_time,
+        "end": end_time,
+        "limit": 10000,
+        "adjustment": "all" # 处理拆股除息
+    }
+    headers = {
+        "APCA-API-KEY-ID": api_key,
+        "APCA-API-SECRET-KEY": api_secret,
+        "Accept": "application/json"
+    }
+
     try:
-        loop = asyncio.get_running_loop()
-        return asyncio.run_coroutine_threadsafe(_run(), loop).result()
-    except RuntimeError:
-        return asyncio.run(_run())
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json().get('bars', {}).get(symbol, [])
+            if not data: return pd.DataFrame()
+            
+            df = pd.DataFrame(data)
+            # 格式化映射: t->Date, o->Open, h->High, l->Low, c->Close, v->Volume
+            df.rename(columns={'t': 'Date', 'o': 'Open', 'h': 'High', 'l': 'Low', 'c': 'Close', 'v': 'Volume'}, inplace=True)
+            df['Date'] = pd.to_datetime(df['Date'])
+            df.set_index('Date', inplace=True)
+            # 仅保留核心列
+            return df[['Open', 'High', 'Low', 'Close', 'Volume']]
+        elif resp.status_code == 422:
+            # 某些指数/非股票数据，Alpaca不提供，静默返回空以触发 Fallback
+            pass
+        else:
+            logger.debug(f"Alpaca API 异常: {resp.status_code} - {resp.text}")
+    except Exception as e:
+        logger.debug(f"Alpaca 请求失败: {e}")
+        
+    return pd.DataFrame()
+
+
+def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 3, fast_mode: bool = False) -> pd.DataFrame:
+    # 修复1：对缓存键做路径安全转义，防止部分文件系统拒绝含有 '^' 或 '/' 的写入
+    safe_sym = symbol.replace('^', '_caret_').replace('/', '_slash_')
+    cache_key = f"{safe_sym}_{interval}_{period}"
+    
+    # 优先从跨进程共享内存提取数据，实现零拷贝
+    cached_df = _SHARED_CACHE.get(cache_key)
+    if cached_df is not None and not cached_df.empty:
+        return cached_df.copy()
+        
+    # 修复2：缓存向下兼容降维拦截（极大节省短线如 `5d` 的请求令牌）
+    if period != "1y":
+        long_key = f"{safe_sym}_{interval}_1y"
+        long_cached = _SHARED_CACHE.get(long_key)
+        if long_cached is not None and not long_cached.empty:
+            if period == "5d":
+                return long_cached.tail(5).copy()
+            elif period == "1mo":
+                cutoff = pd.Timestamp.now(tz=timezone.utc) - pd.Timedelta(days=30)
+                return long_cached[long_cached.index >= cutoff].copy()
+            elif period == "3mo":
+                cutoff = pd.Timestamp.now(tz=timezone.utc) - pd.Timedelta(days=90)
+                return long_cached[long_cached.index >= cutoff].copy()
+            elif period == "6mo":
+                cutoff = pd.Timestamp.now(tz=timezone.utc) - pd.Timedelta(days=183)
+                return long_cached[long_cached.index >= cutoff].copy()
+
+    # 修复3: 自动识别执行上下文环境，优先使用子进程内安全分配的局部低配版限速器
+    limiter = _WORKER_LOCAL_LIMITER or _API_LIMITER
+
+    for attempt in range(retries):
+        wait = limiter.acquire()  # 跨域安全限速
+        try:
+            # ✅ 优先级 1 改进：尝试使用高性能 Alpaca Data API
+            new_df = _fetch_from_alpaca(symbol, period, interval)
+            
+            # 若 Alpaca 拉取失败（如没有配置密钥、遇到宏观指数 ^VIX），自动安全回退 (Fallback) 降级至 yfinance
+            if new_df.empty:
+                logger.debug(f"🔄 [降级路由] Alpaca 未返回 {symbol} 数据，安全切换至 yfinance 通道。")
+                new_df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False, timeout=8)
+                if not new_df.empty:
+                    new_df.index = pd.to_datetime(new_df.index, utc=True)
+            
+            if not new_df.empty:
+                df = new_df[~new_df.index.duplicated(keep='last')]
+                _SHARED_CACHE.set(cache_key, df) # 写入共享内存
+                return df
+        except Exception as e:
+            backoff = (2 ** attempt) + random.uniform(0, 1)
+            time.sleep(backoff)  # 指数退避，只在真正失败时等待
+    return pd.DataFrame()
 
 def _init_ext_cache():
     global _DAILY_EXT_CACHE
@@ -160,7 +484,7 @@ def _init_ext_cache():
             if os.path.exists(Config.EXT_CACHE_FILE):
                 try:
                     with open(Config.EXT_CACHE_FILE, 'r', encoding='utf-8') as f: _DAILY_EXT_CACHE = json.load(f)
-                except Exception as e: logger.debug(f"Exception suppressed: {e}")
+                except Exception: pass
             today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
             if _DAILY_EXT_CACHE.get("date") != today: _DAILY_EXT_CACHE = {"date": today, "sentiment": {}, "alt": {}}
 
@@ -170,7 +494,7 @@ def _save_ext_cache():
             temp_ext = f"{Config.EXT_CACHE_FILE}.{threading.get_ident()}.tmp"
             with open(temp_ext, 'w', encoding='utf-8') as f: json.dump(_DAILY_EXT_CACHE, f)
             os.replace(temp_ext, Config.EXT_CACHE_FILE)
-        except Exception as e: logger.debug(f"Exception suppressed: {e}")
+        except Exception: pass
 
 def fetch_global_wsb_data() -> Dict[str, float]:
     with _ALT_DATA_LOCK:
@@ -181,7 +505,7 @@ def fetch_global_wsb_data() -> Dict[str, float]:
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r", encoding="utf-8") as f: history = json.load(f)
-        except Exception as e: logger.debug(f"Exception suppressed: {e}")
+        except Exception: pass
     current_data = {}
     try:
         resp = _GLOBAL_SESSION.get("https://tradestie.com/api/v1/apps/reddit", timeout=10)
@@ -199,7 +523,7 @@ def fetch_global_wsb_data() -> Dict[str, float]:
         temp_wsb = f"{cache_file}.{threading.get_ident()}.tmp"
         with open(temp_wsb, "w", encoding="utf-8") as f: json.dump(history, f)
         os.replace(temp_wsb, cache_file)
-    except Exception as e: logger.debug(f"Exception suppressed: {e}")
+    except Exception: pass
     wsb_accel_dict = {}
     dates = sorted(history.keys())
     if len(dates) >= 3:
@@ -232,7 +556,7 @@ def safe_get_sentiment_data(symbol: str) -> Tuple[float, float, float, float]:
             c_iv = opt.calls['impliedVolatility'].median() if 'impliedVolatility' in opt.calls else 0
             p_iv = opt.puts['impliedVolatility'].median() if 'impliedVolatility' in opt.puts else 0
             iv_skew = p_iv - c_iv
-    except Exception as e: logger.debug(f"Exception suppressed: {e}")
+    except Exception: pass
     with _DAILY_EXT_LOCK: _DAILY_EXT_CACHE["sentiment"][symbol] = (pcr, iv_skew, short_change, short_float)
     _save_ext_cache()
     return pcr, iv_skew, short_change, short_float
@@ -251,7 +575,7 @@ def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
                 buys = recent[recent['Shares'] > 0]['Shares'].sum()
                 sells = recent[recent['Shares'] < 0]['Shares'].abs().sum()
                 if (buys + sells) > 0: insider_net_buy = (buys - sells) / (buys + sells)
-        except Exception as e: logger.debug(f"Exception suppressed: {e}")
+        except Exception: pass
         try:
             upgrades = tk.upgrades_downgrades
             if upgrades is not None and not upgrades.empty:
@@ -264,8 +588,8 @@ def safe_get_alt_data(symbol: str) -> Tuple[float, float, float, str]:
                     if len(monthly_scores) >= 3:
                         analyst_mom = (monthly_scores.iloc[-1] - monthly_scores.iloc[:-1].mean()) / (monthly_scores.iloc[:-1].std() + 1e-5)
                     else: analyst_mom = recent_1y['score'].sum() * 0.1 
-        except Exception as e: logger.debug(f"Exception suppressed: {e}")
-    except Exception as e: logger.debug(f"Exception suppressed: {e}")
+        except Exception: pass
+    except Exception: pass
     with _DAILY_EXT_LOCK: _DAILY_EXT_CACHE["alt"][symbol] = (insider_net_buy, analyst_mom, nlp_score, news_summary)
     _save_ext_cache()
     return insider_net_buy, analyst_mom, nlp_score, news_summary
@@ -279,14 +603,14 @@ def check_earnings_risk(symbol: str) -> bool:
             if cal is not None and isinstance(cal, dict) and 'Earnings Date' in cal:
                 ed = cal['Earnings Date']
                 if ed and hasattr(ed[0], 'date') and 0 <= (ed[0].date() - now_date).days <= 5: return True
-        except Exception as e: logger.debug(f"Exception suppressed: {e}")
+        except Exception: pass
         try:
             ed_df = tk.earnings_dates
             if ed_df is not None and not ed_df.empty:
                 for d in ed_df.index:
                     if hasattr(d, 'date') and d.date() >= now_date and 0 <= (d.date() - now_date).days <= 5: return True
-        except Exception as e: logger.debug(f"Exception suppressed: {e}")
-    except Exception as e: logger.debug(f"Exception suppressed: {e}")
+        except Exception: pass
+    except Exception: pass
     return False
 
 def get_filtered_watchlist(max_stocks: int = 150) -> list: return list(Config.CORE_WATCHLIST)[:max_stocks]
@@ -299,7 +623,7 @@ def load_strategy_performance_tag() -> str:
                 t3 = stats.get("overall", {}).get("T+3", {})
                 if t3 and t3.get('total_trades', 0) > 0:
                     return f"**📈 策略验证:** 胜率 {t3.get('win_rate',0):.1%} | AI {t3.get('ai_win_rate',0):.1%} | 盈亏比 {t3.get('profit_factor',0):.2f}"
-    except Exception as e: logger.debug(f"Exception suppressed: {e}")
+    except Exception: pass
     return ""
 
 def get_alert_cache() -> dict:
@@ -309,7 +633,7 @@ def get_alert_cache() -> dict:
             with open(Config.ALERT_CACHE_FILE, 'r') as f:
                 data = json.load(f)
                 if isinstance(data.get("matrix"), dict): cache = data
-    except Exception as e: logger.debug(f"Exception suppressed: {e}")
+    except Exception: pass
     return cache
 
 def set_alerted(sym: str, is_shadow: bool = False, shadow_data: dict = None):
@@ -324,7 +648,7 @@ def set_alerted(sym: str, is_shadow: bool = False, shadow_data: dict = None):
         tmp = f"{Config.ALERT_CACHE_FILE}.{threading.get_ident()}.tmp"
         with open(tmp, 'w') as f: json.dump(cache, f)
         os.replace(tmp, Config.ALERT_CACHE_FILE)
-    except Exception as e: logger.debug(f"Exception suppressed: {e}")
+    except Exception: pass
 
 # 🚀 钉钉推送修复核心：植入关键词，剥离匿名函数，加入报错拦截
 def send_alert(title: str, content: str) -> None:
@@ -392,7 +716,51 @@ def get_market_regime(active_pool: List[str] = None) -> Tuple[str, str, pd.DataF
     else:
         return ("bear", "🐻 熊市回调", df, False, False) if trend_20d < -0.02 else ("rebound", "🦅 超跌反弹", df, False, False)
 
+def _robust_fft_ensemble(close_prices: np.ndarray, base_length=120, ensemble_count=7) -> float:
+    if len(close_prices) < base_length + (ensemble_count // 2) * 5: return 0.0
+    votes = []
+    for offset in range(ensemble_count):
+        win_len = base_length + (offset - ensemble_count//2) * 5
+        segment = close_prices[-win_len:]
+        if np.isnan(segment).any() or np.all(segment == segment[0]): continue
+        fft_res = np.fft.fft(segment - np.mean(segment))
+        freqs = np.fft.fftfreq(win_len)
+        pos_mask = (freqs > 0.01) & (freqs < 0.2)
+        if not np.any(pos_mask): continue
+        pos_idx = np.where(pos_mask)[0]
+        peak_idx = pos_idx[np.argmax(np.abs(fft_res[pos_idx]))]
+        phase = np.angle(fft_res[peak_idx])
+        t = win_len - 1
+        dom_freq = freqs[peak_idx]
+        current_phase = (2 * np.pi * dom_freq * t + phase) % (2 * np.pi)
+        if 0 < current_phase < np.pi: votes.append(1.0)
+        else: votes.append(-1.0)
+    if not votes: return 0.0
+    return float(sum(votes) / len(votes))
 
+def _robust_hurst(close_prices: np.ndarray, min_window=30, n_bootstrap=100) -> Tuple[float, float, bool]:
+    safe_prices = np.maximum(close_prices, 1e-10)
+    log_ret = np.diff(np.log(safe_prices[-121:])) if len(safe_prices) > 120 else np.diff(np.log(safe_prices))
+    if len(log_ret) <= min_window: return 0.5, 0.0, False
+    
+    # ✅ 修复: 使用局部 Generator 替代全局 seed，零污染多进程的全局随机状态
+    rng = np.random.default_rng(seed=int(np.sum(np.abs(close_prices[-10:])) * 1e6) % (2**31))
+    
+    hurst_samples = []
+    for _ in range(n_bootstrap):
+        sub_len = int(rng.integers(min_window, len(log_ret)))
+        start = int(rng.integers(0, len(log_ret) - sub_len))
+        sub_ret = log_ret[start:start+sub_len]
+        S = np.std(sub_ret)
+        if S == 0: continue
+        R = np.max(np.cumsum(sub_ret - np.mean(sub_ret))) - np.min(np.cumsum(sub_ret - np.mean(sub_ret)))
+        if R <= 0: continue
+        hurst_samples.append(np.log(R/S) / np.log(len(sub_ret)))
+        
+    if len(hurst_samples) < 20: return 0.5, 0.0, False
+    h_median, h_iqr = float(np.median(hurst_samples)), float(np.percentile(hurst_samples, 75) - np.percentile(hurst_samples, 25))
+    is_reliable = bool((h_iqr < 0.15) and (abs(h_median - 0.5) > 0.1))
+    return h_median, h_iqr, is_reliable
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # ✅ 修复：显式深拷贝隔离，切断对上游 xs() 视图的原地修改，防止底层数据污染
@@ -535,7 +903,7 @@ def _extract_complex_features(stock: StockData, ctx: Any) -> ComplexFeatures:
                 densities = kde.evaluate(np.linspace(prices.min(), prices.max(), 200))
                 den_50 = np.percentile(densities, 50)
                 if den_curr <= den_50: kde_breakout_score = min(1.0, 0.5 + 0.5 * (den_50 - den_curr) / (den_50 + 1e-10))
-        except Exception as e: logger.debug(f"Exception suppressed: {e}")
+        except Exception: pass
         
     fft_ensemble_score = _robust_fft_ensemble(stock.df['Close'].values, base_length=120, ensemble_count=7)
     hurst_med, hurst_iqr, hurst_reliable = _robust_hurst(stock.df['Close'].values)
@@ -792,20 +1160,19 @@ def _build_market_context() -> MarketContext:
     )
 
 # ================= 🚀 两阶段并行引擎工作函数 (顶层定义防 Pickling 崩溃) =================
-def _io_fetch_worker(sym: str) -> Optional[dict]: pass # 兼容可能的热重载
-
-async def _io_fetch_worker_async(session: aiohttp.ClientSession, sym: str) -> Optional[dict]:
-    """阶段1: 纯 IO 拉取工作节点 (Async)"""
+def _io_fetch_worker(sym: str) -> Optional[dict]:
+    """阶段1: 纯 IO 拉取工作节点"""
     try:
-        df = await safe_get_history_async(session, sym, "1y", "1d", fast_mode=True)
+        df = safe_get_history(sym, "1y", "1d", fast_mode=True)
         if len(df) < 60: return None
         
-        df_w = await safe_get_history_async(session, sym, "5y", "1wk", fast_mode=True)
-        df_m = await safe_get_history_async(session, sym, "5y", "1mo", fast_mode=True)
-        df_60m = await safe_get_history_async(session, sym, "60d", "60m", fast_mode=True)
+        # ✅ 修复：补全多周期数据拉取，消除 CPU Worker 中的空 DataFrame 缺陷
+        df_w = safe_get_history(sym, "5y", "1wk", fast_mode=True)
+        df_m = safe_get_history(sym, "5y", "1mo", fast_mode=True)
+        df_60m = safe_get_history(sym, "60d", "60m", fast_mode=True)
         
-        sentiment = await asyncio.to_thread(safe_get_sentiment_data, sym)
-        alt_data = await asyncio.to_thread(safe_get_alt_data, sym)
+        sentiment = safe_get_sentiment_data(sym)
+        alt_data = safe_get_alt_data(sym)
         return {
             'sym': sym, 'df': df, 
             'df_w': df_w, 'df_m': df_m, 'df_60m': df_60m,
@@ -847,11 +1214,9 @@ def _cpu_calc_worker(payload: dict) -> Optional[dict]:
     except Exception as e:
         return None
 
-def _stress_test_io_worker(sym: str): pass
-
-async def _stress_test_io_worker_async(session: aiohttp.ClientSession, sym: str) -> Optional[dict]:
+def _stress_test_io_worker(sym: str) -> Optional[dict]:
     """压测阶段1: 历史 IO 拉取"""
-    df = await safe_get_history_async(session, sym, "5y", "1d", fast_mode=True)
+    df = safe_get_history(sym, "5y", "1d", fast_mode=True)
     if len(df) < 500: return None
     return {'sym': sym, 'df': df}
 
@@ -879,7 +1244,7 @@ def _stress_test_cpu_worker(payload: dict) -> dict:
                     local_metrics[env_name]['trades'] += 1
                     local_metrics[env_name]['ret_sum'] += ret
                     if ret > 0: local_metrics[env_name]['wins'] += 1
-        except Exception as e: logger.debug(f"Exception suppressed: {e}")
+        except Exception: pass
     return local_metrics
 
 # ================= 数据预备引擎 (升级版: IO/CPU 解锁) =================
@@ -889,22 +1254,18 @@ def _prepare_universe_data(ctx: MarketContext) -> Tuple[List[dict], dict]:
     logger.info(f"🚀 启动架构升级版: IO与CPU分离的两阶段并行引擎 (解除GIL枷锁)...")
     
     # --- 阶段 1: 极高并发异步 IO 拉取 ---
-    async def fetch_all(syms):
-        async with aiohttp.ClientSession() as session:
-            tasks = [_io_fetch_worker_async(session, sym) for sym in syms]
-            return await asyncio.gather(*tasks, return_exceptions=True)
-
     io_results = []
-    try:
-        results = asyncio.run(fetch_all(symbols))
-        for idx, res in enumerate(results):
-            sym = symbols[idx]
-            if isinstance(res, Exception):
-                logger.warning(f"⚠️ [数据异常] 标的 {sym} 获取失败，已忽略: {res}")
-            elif res:
-                io_results.append(res)
-    except Exception as e:
-        logger.error(f"AsyncIO execute error: {e}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as io_executor:
+        future_to_sym = {io_executor.submit(_io_fetch_worker, sym): sym for sym in symbols}
+        for future in concurrent.futures.as_completed(future_to_sym, timeout=120.0):
+            sym = future_to_sym[future]
+            try:
+                res = future.result(timeout=30.0) 
+                if res: io_results.append(res)
+            except concurrent.futures.TimeoutError:
+                logger.warning(f"⚠️ [防抖熔断] 标的 {sym} API 响应死锁 (处理超时)，已被沙盒强行隔离剔除！")
+            except Exception as e:
+                logger.warning(f"⚠️ [数据异常] 标的 {sym} 获取失败，已忽略: {e}")
 
     if not io_results: return [], {}
 
@@ -1099,7 +1460,7 @@ class ExecutionEngine:
                         if bo.status == 'FILLED':
                             tca = {"client_oid": r['client_oid'], "symbol": r['symbol'], "side": r['side'], "qty": bo.filled_qty, "arrival_price": r['arrival_price'], "execution_price": bo.avg_fill_price, "timestamp": datetime_to_str(), "slippage_bps": abs(bo.avg_fill_price - r['arrival_price'])/(r['arrival_price']+1e-10)*10000.0 * (-1 if r['side']=='SELL' else 1)}
                             with open(Config.TCA_LOG_PATH, 'a') as f: f.write(json.dumps(tca) + '\n')
-                    except Exception as e: logger.debug(f"Exception suppressed: {e}")
+                    except Exception: pass
             time.sleep(0.2)
 
 # ================= 6. 主程序入口与路由 (全量恢复) =================
@@ -1215,8 +1576,8 @@ def run_backtest_engine() -> None:
                             if isinstance(raw_ml, list): ml_feats = {Config.ALL_FACTORS[i]: val for i, val in enumerate(raw_ml + [0.0] * (len(Config.ALL_FACTORS) - len(raw_ml)))}
                             else: ml_feats = raw_ml
                             trades.append({'date': log['date'], 'vix': macro.get('vix', log.get('vix', 18.0)), 'cred': macro.get('credit_spread_mom', 0.0), 'term': macro.get('vix_term_structure', 1.0), 'pcr': macro.get('market_pcr', 1.0), 'symbol': p['symbol'], 'signals': p.get('signals', []), 'factors': p.get('factors', []), 'ml_features': ml_feats, 'ai_prob': p.get('ai_prob', 0.0), 'tp': p.get('tp', float('inf')), 'sl': p.get('sl', 0)})
-                    except Exception as e: logger.debug(f"Exception suppressed: {e}")
-        except Exception as e: logger.debug(f"Exception suppressed: {e}")
+                    except Exception: pass
+        except Exception: pass
             
     if not trades: return
     syms = list(set([t['symbol'] for t in trades]))
@@ -1340,7 +1701,7 @@ def run_backtest_engine() -> None:
                             t_idx = np.where(ind_df.index.get_loc(valid_dates[-1]))[0][-1] if isinstance(ind_df.index.get_loc(valid_dates[-1]), np.ndarray) else (ind_df.index.get_loc(valid_dates[-1]).stop - 1 if isinstance(ind_df.index.get_loc(valid_dates[-1]), slice) else ind_df.index.get_loc(valid_dates[-1]))
                             seq = _get_transformer_seq(ind_df, end_idx=t_idx + 1)
                             if not np.all(seq == 0): transformer_X.append(seq); transformer_Y.append(ret) 
-                    except Exception as e: logger.debug(f"Exception suppressed: {e}")
+                    except Exception: pass
                 
                 factor_list = t.get('factors', [])
                 if not factor_list:
@@ -1425,7 +1786,7 @@ def run_backtest_engine() -> None:
             for i, factor in enumerate(Config.ALL_FACTORS):
                 if combined_imp[i] > 0: feature_importances_dict[factor] = float(combined_imp[i])
         except ImportError: pass
-        except Exception as e: logger.debug(f"Exception suppressed: {e}")
+        except Exception: pass
             
     res = {}
     for p, r in stats_period.items():
@@ -1484,7 +1845,7 @@ def run_backtest_engine() -> None:
             X_arr, Y_arr, buf_path = np.array(transformer_X, dtype=np.float32), np.array(transformer_Y, dtype=np.float32), os.path.join(Config.DATA_DIR, "training_buffer.npz")
             if os.path.exists(buf_path):
                 try: existing = np.load(buf_path); X_arr, Y_arr = np.concatenate([existing['X'], X_arr]), np.concatenate([existing['Y'], Y_arr])
-                except Exception as e: logger.debug(f"Exception suppressed: {e}")
+                except Exception: pass
             temp_buf_path = buf_path + ".tmp"
             np.savez(temp_buf_path, X=X_arr, Y=Y_arr); os.replace(temp_buf_path, buf_path)
             report_md.append(f"\n## 🌌 深度学习右脑 (Transformer) 数据积淀战报\n- **状态**: ✅ 已将 {len(transformer_X)} 笔新样本压入 `.npz` 缓冲区\n- **架构声明**: 训练进程已被物理剥离，请稍后执行 `python train_transformer.py` 唤醒独立算力节点进行闭环代谢。")
@@ -1528,27 +1889,21 @@ def run_synthetic_stress_test() -> None:
                 if xai_data:
                     avg_imp = 1.0 / len(Config.ALL_FACTORS)
                     for tag, imp in xai_data.items(): xai_weights[tag] = 0.0 if imp < avg_imp * 0.25 else max(0.5, min(3.0, float(imp) / avg_imp))
-    except Exception as e: logger.debug(f"Exception suppressed: {e}")
+    except Exception: pass
     
     market_ctx = MarketContext(regime="bull", regime_desc="", w_mul=1.0, xai_weights=xai_weights, vix_current=18.0, vix_desc="", vix_scalar=1.0, max_risk=0.015, macro_gravity=False, is_credit_risk_high=False, vix_inv=False, qqq_df=pd.DataFrame(), macro_data={'spy': pd.DataFrame(), 'tlt': pd.DataFrame(), 'dxy': pd.DataFrame()}, total_market_exposure=1.0, health_score=1.0, pain_warning="", dynamic_min_score=8.0)
     
     metrics = {'Original': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}, 'Phase_Chaos': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}, 'Noise_Explosion': {'trades': 0, 'wins': 0, 'ret_sum': 0.0}}
     
     # --- 压测阶段 1: 异步 IO 拉取 ---
-    async def fetch_all(syms):
-        async with aiohttp.ClientSession() as session:
-            tasks = [_stress_test_io_worker_async(session, sym) for sym in syms]
-            return await asyncio.gather(*tasks, return_exceptions=True)
-
     io_results = []
-    symbols_to_test = get_filtered_watchlist(max_stocks=30)[:20]
-    try:
-        results = asyncio.run(fetch_all(symbols_to_test))
-        for res in results:
-            if isinstance(res, Exception): logger.debug(f"Exception suppressed: {res}")
-            elif res: io_results.append(res)
-    except Exception as e:
-        logger.debug(f"Exception suppressed: {e}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as io_executor:
+        future_to_sym = {io_executor.submit(_stress_test_io_worker, sym): sym for sym in get_filtered_watchlist(max_stocks=30)[:20]}
+        for future in concurrent.futures.as_completed(future_to_sym, timeout=120.0):
+            try:
+                res = future.result(timeout=30.0)
+                if res: io_results.append(res)
+            except Exception: pass
 
     if not io_results:
         logger.warning("压测样本历史数据获取失败。")
