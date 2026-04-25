@@ -82,7 +82,7 @@ jobs:
           fi
 
       - name: 🧠 触发深度神经代谢 (MLOps Training)
-        if: env.RUN_MODE == 'backtest'
+        if: ${{ env.RUN_MODE == 'backtest' }}
         id: training
         continue-on-error: true  
         env:
