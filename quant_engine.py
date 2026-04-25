@@ -121,7 +121,7 @@ class Config:
     CORE_WATCHLIST: list = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO", "AMD", "QCOM", "JPM", "V", "MA", "UNH", "JNJ", "XOM", "PG", "HD", "COST", "ABBV", "CRM", "NFLX", "ADBE", "NOW", "UBER", "INTU", "IBM", "ISRG", "SYK", "SPY", "QQQ", "IWM", "DIA"]
     CROWDING_EXCLUDE_SECTORS: list = [INDEX_ETF] 
 
-    CORE_FACTORS = ["米奈尔维尼", "强相对强度", "MACD金叉", "TTM Squeeze ON", "一目多头", "强势回踩", "机构控盘(CMF)", "突破缺口", "VWAP突破", "AVWAP突破", "SMC失衡区", "流动性扫盘", "聪明钱抢筹", "巨量滞涨", "放量长阳", "口袋支点", "VCP收缩", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘", "跨时空共振(周线)", "破底翻(Spring)", "地量窒息真突破", "缩量企稳回踩"]
+    CORE_FACTORS = ["米奈尔维尼", "强相对强度", "均线多头共振", "MACD金叉", "TTM Squeeze ON", "一目多头", "强势回踩", "机构控盘(CMF)", "突破缺口", "VWAP突破", "AVWAP突破", "SMC失衡区", "流动性扫盘", "聪明钱抢筹", "巨量滞涨", "放量长阳", "口袋支点", "VCP收缩", "特性改变(ChoCh)", "订单块(OB)", "AMD操盘", "跨时空共振(周线)", "破底翻(Spring)", "地量窒息真突破", "缩量企稳回踩"]
     ADVANCED_MATH_FACTORS = ["量子概率云(KDE)", "稳健赫斯特(Hurst)", "FFT多窗共振(动能)", "CVD筹码净流入", "独立Alpha(脱钩)", "NR7极窄突破", "VPT量价共振", "大盘Beta(宏观调整)", "利率敏感度(TLT相关性)", "汇率传导(DXY相关性)", "Amihud非流动性(冲击成本)", "波动率风险溢价(VRP)"]
     INTERACTION_FACTORS = ["带量金叉(交互)", "量价吸筹(交互)", "近3日突破(滞后)", "近3日巨量(滞后)", "大周期保护小周期(MACD共振)", "60分钟级精准校准(RSI反弹)", "52周高点距离(动能延续)"]
     ALT_DATA_FACTORS = ["聪明钱月度净流入(月线)", "期权PutCall情绪(PCR)", "隐含波动率偏度(IV Skew)", "做空兴趣突变(轧空)", "内部人集群净买入(Insider)", "分析师修正动量(Analyst)", "舆情NLP情感极值(News_NLP)", "散户热度加速度(WSB_Accel)"]
@@ -134,7 +134,7 @@ class Config:
         # [针对 4C24G ARM 优化] 动态进程池：留出 1 个核心给系统IO和主调度器，避免 OOM 和死锁
         import multiprocessing
         MAX_WORKERS = min(3, multiprocessing.cpu_count() - 1) if multiprocessing.cpu_count() > 1 else 1
-        MIN_SCORE_THRESHOLD = 12.0
+        MIN_SCORE_THRESHOLD = 9.0
         BASE_MAX_RISK = 0.015       
         CROWDING_PENALTY = 0.75     
         CROWDING_MIN_STOCKS = 2     
@@ -1146,6 +1146,9 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
         m_str = (stock.curr['SMA_50'] - stock.curr['SMA_200']) / (stock.curr['SMA_200'] + 1e-10)
         add_trigger("米奈尔维尼", f"🏆 [主升趋势] 米奈尔维尼模板形成 (强度:{m_str*100:.1f}% 权:{{fw:.2f}}x)", 8 + int(m_str*20), "TREND")
         
+    if pd.notna(stock.curr['SMA_200']) and stock.curr['EMA_20'] > stock.curr['SMA_50'] > stock.curr['SMA_200']:
+        add_trigger("均线多头共振", f"🔥 [多头排列] 均线三线开花强趋势确立 (权:{{fw:.2f}}x)", 6, "TREND")
+        
     if cf.rs_20 > 0: 
         dynamic_rs_thresh = 1.0 + (stock.curr['ATR'] / (stock.curr['Close'] + 1e-10)) * 2.0
         if cf.rs_20 > dynamic_rs_thresh: add_trigger("强相对强度", f"⚡ [相对强度] 动能超越波动率动态阈值 (阈值:{dynamic_rs_thresh:.2f} 权:{{fw:.2f}}x)", 7 if stock.is_vol else 4, "TREND", "MOMENTUM_BURST")
@@ -1163,7 +1166,7 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
     if allow_breakout and pd.notna(stock.curr['AVWAP']) and stock.curr['Close'] > stock.curr['AVWAP'] and stock.prev['Close'] <= stock.curr['AVWAP']: add_trigger("AVWAP突破", "⚓ [筹码夺回] 强势站上AVWAP锚定成本核心区 (权:{fw:.2f}x)", 12, "TREND", "MOMENTUM_BURST")
 
     kc_w, bb_w = stock.curr['KC_Upper'] - stock.curr['KC_Lower'], stock.curr['BB_Upper'] - stock.curr['BB_Lower']
-    if bb_w < kc_w and stock.curr['Close'] > stock.curr['KC_Upper'] and stock.curr['Volume'] > stock.curr['Vol_MA20'] * 1.5: 
+    if bb_w < kc_w and stock.curr['Close'] > stock.curr['KC_Upper'] and stock.curr['Volume'] > stock.curr['Vol_MA20'] * 1.3: 
         s_ratio = (kc_w - bb_w) / (stock.curr['ATR'] + 1e-10)
         add_trigger("TTM Squeeze ON", f"📦 [波动压缩] 多头强爆发下的 TTM Squeeze 向上突破确认 (比率:{s_ratio:.2f} 权:{{fw:.2f}}x)", 8 + int(s_ratio*10), "VOLATILITY")
 
@@ -2210,7 +2213,7 @@ def run_historical_replay(days: int = 252) -> None:
                     score, is_bearish_div, sig = _apply_market_filters(curr, prev, sym, score, sig, [], [], [])
                     
                     if score >= Config.Params.MIN_SCORE_THRESHOLD:
-                        daily_trades.append({'symbol': sym, 'score': score, 'signals': sig, 'factors': factors, 'tp': float(curr['Close']*1.1), 'sl': float(curr['Close']*0.9)})
+                        daily_trades.append({'symbol': sym, 'score': score, 'signals': sig, 'factors': factors, 'tp': float(curr['Close'] + 3.0 * curr['ATR']), 'sl': float(curr['Close'] - 2.0 * curr['ATR'])})
             except Exception: pass
             
         if daily_trades:
