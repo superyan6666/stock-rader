@@ -13,3 +13,14 @@ quantbot_config.json
 .env.local
 
 backtest_log_*.jsonl
+
+# 业务数据与日志
+data/
+logs/
+*.csv
+*.db
+*.sqlite3
+# 多媒体产物（若有）
+output_images/
+output_videos/
+
