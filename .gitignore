@@ -23,3 +23,51 @@ logs/
 output_images/
 output_videos/
 
+# ==========================================
+# 1. QuantBot 3.0 核心数据与缓存 (Core Data)
+# ==========================================
+.quantbot_data/
+*.tmp
+backtest_log_*.jsonl
+
+# 补齐 Config 中定义在根目录的动态文件：
+tickers_cache.json
+alert_history.json
+scoring_model.pkl
+wsb_history.json
+quantbot_config.json
+
+# ==========================================
+# 2. 密钥与虚拟环境 (Security & Envs)
+# ==========================================
+venv/
+env/
+.env
+.env.local
+
+# ==========================================
+# 3. Python 系统级缓存 (Python Caches)
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# ==========================================
+# 4. 业务日志与通用产物 (Logs & Artifacts)
+# ==========================================
+logs/
+*.csv
+*.db
+*.sqlite3
+*.log
+output_images/
+output_videos/
+
+# ==========================================
+# 5. 操作系统与 IDE 缓存 (OS & IDE)
+# ==========================================
+.DS_Store
+.vscode/
+.idea/
+*.swp
