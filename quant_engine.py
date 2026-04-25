@@ -91,10 +91,10 @@ class Config:
     ORDER_DB_PATH: str = os.path.join(DATA_DIR, "order_state.db") 
     TCA_LOG_PATH: str = os.path.join(DATA_DIR, "tca_history.jsonl")
     
-    CACHE_FILE: str = "tickers_cache.json"
-    ALERT_CACHE_FILE: str = "alert_history.json"
-    MODEL_FILE: str = "scoring_model.pkl"
-    WSB_CACHE_FILE: str = "wsb_history.json"  
+    CACHE_FILE: str = os.path.join(DATA_DIR, "tickers_cache.json")
+    ALERT_CACHE_FILE: str = os.path.join(DATA_DIR, "alert_history.json")
+    MODEL_FILE: str = os.path.join(DATA_DIR, "scoring_model.pkl")
+    WSB_CACHE_FILE: str = os.path.join(DATA_DIR, "wsb_history.json")  
     CUSTOM_CONFIG_FILE: str = "quantbot_config.json" 
     MODEL_VERSION: str = "3.0" 
 
@@ -1205,6 +1205,12 @@ def _cpu_calc_worker(payload: dict) -> Optional[dict]:
         cf = _extract_complex_features(stock, ctx)
         alt = AltData(*payload['sentiment'][:4], *payload['alt_data'][:3], 0.0)
         seq = _get_transformer_seq(df_ind)
+        # ✅ 致命修复: 严格遵守 Directive 1 戒律，绝不在 CPU Worker 回传完整的 DataFrame
+        # 在完成特征提取后，必须卸载 StockData 中携带的所有重型 DataFrame，只保留标量给主进程使用
+        stock.df = pd.DataFrame()
+        stock.df_w = pd.DataFrame()
+        stock.df_m = pd.DataFrame()
+        stock.df_60m = pd.DataFrame()
         
         return {
             'sym': sym, 'stock': stock, 'alt': alt, 'cf': cf, 'seq': seq, 
@@ -1865,8 +1871,11 @@ def _decompose_and_perturb(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     df_phase, df_noise = df.copy(), df.copy()
     c = df['Close']
     trend, high_freq_noise, seasonal = c.ewm(span=60, adjust=False).mean(), c - c.ewm(span=5, adjust=False).mean(), c.ewm(span=5, adjust=False).mean() - c.ewm(span=60, adjust=False).mean()
-
-    angles = np.random.uniform(0, 2 * np.pi, len(np.fft.rfft(seasonal.values)))
+    # ✅ 致命修复: 遵守 Directive 5 戒律，绝不使用全局 np.random，改用带数据特征 Seed 的局部 rng
+    # 防止多进程 fork 后所有标的生成一模一样的相位错乱特征，污染压测池
+    seed_val = int(np.sum(np.abs(c.values[-10:])) * 1e6) % (2**31)
+    rng = np.random.default_rng(seed=seed_val)
+    angles = rng.uniform(0, 2 * np.pi, len(np.fft.rfft(seasonal.values)))
     angles[0] = 0.0 
     if len(seasonal.values) % 2 == 0: angles[-1] = 0.0 
     

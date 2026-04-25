@@ -6,11 +6,14 @@
 *.tmp
 backtest_log_*.jsonl
 
-# 补齐 Config 中定义在根目录的动态文件：
-tickers_cache.json
-alert_history.json
-scoring_model.pkl
-wsb_history.json
+# 深度学习模型与二进制大文件全局防漏 (Global Safety Net)
+*.pth
+*.npz
+*.pkl
+*.feather
+*.parquet
+
+# 用户本地配置覆盖
 quantbot_config.json
 
 # ==========================================
