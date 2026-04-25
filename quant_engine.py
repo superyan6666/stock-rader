@@ -139,8 +139,8 @@ class Config:
         CROWDING_PENALTY = 0.75     
         CROWDING_MIN_STOCKS = 2     
         PORTFOLIO_VALUE = 100000.0  
-        SLIPPAGE = 0.003            
-        COMMISSION = 0.0005         
+        SLIPPAGE = 0.0005            
+        COMMISSION = 0.0001         
         MIN_T_STAT = 1.0            
         PCR_BEAR = 1.5           
         PCR_BULL = 0.5           
@@ -1961,7 +1961,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             mae_mfe_records[f'T+{d}'].append({'ret': float(ret), 'mfe': float((period_h[idx] - entry_costs[idx]) / entry_costs[idx]), 'mae': float((period_l[idx] - entry_costs[idx]) / entry_costs[idx])})
             stats_period[f'T+{d}'].append(float(ret))
             
-            if d == 3:
+            if d == 5:
                 sym, r_dt = t['symbol'], t['date']
                 if TRANSFORMER_AVAILABLE:
                     try:
@@ -2234,7 +2234,7 @@ def run_historical_replay(days: int = 252) -> None:
                     score, is_bearish_div, sig = _apply_market_filters(curr, prev, sym, score, sig, [], [], [])
                     
                     if score >= Config.Params.MIN_SCORE_THRESHOLD:
-                        daily_trades.append({'symbol': sym, 'score': score, 'signals': sig, 'factors': factors, 'tp': float(curr['Close'] + 2.0 * curr['ATR']), 'sl': float(curr['Close'] - 1.0 * curr['ATR'])})
+                        daily_trades.append({'symbol': sym, 'score': score, 'signals': sig, 'factors': factors, 'tp': float(curr['Close'] + 3.0 * curr['ATR']), 'sl': float(curr['Close'] - 1.5 * curr['ATR'])})
             except Exception: pass
             
         if daily_trades:
