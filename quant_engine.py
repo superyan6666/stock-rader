@@ -57,6 +57,10 @@ _GLOBAL_HEADERS = {
     'Accept': 'application/json'
 }
 
+import aiohttp
+import asyncio
+from aiohttp import ClientTimeout, TCPConnector
+
 # 注入带有强效防抖与重试机制的全局 Session
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
