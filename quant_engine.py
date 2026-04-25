@@ -1111,13 +1111,13 @@ def _extract_ml_features(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: A
         for i in range(1, 17): feat_dict[f"Alpha_T{i:02d}"] = 0.0
     return {f: float(np.nan_to_num(feat_dict.get(f, 0.0), nan=0.0, posinf=20.0, neginf=-20.0)) for f in Config.ALL_FACTORS}
 
-def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: AltData) -> Tuple[int, List[str], List[str], bool]:
     triggered_list, factors_list = [], []
     theme_scores = {'TREND': 0.0, 'VOLATILITY': 0.0, 'REVERSAL': 0.0, 'QUANTUM': 0.0, 'SHORT': 0.0}
+    sub_theme_scores = defaultdict(list)
     black_swan_risk = False
     
     def get_fw(tag_name: str) -> float: return ctx.xai_weights.get(tag_name, 1.0)
-    def add_trigger(tag, text, pts, theme):
+    def add_trigger(tag, text, pts, theme, sub_theme=None):
         fw = get_fw(tag)
         if fw > 0:
             adj_pts = pts * getattr(ctx, 'w_mul', 1.0) * fw
@@ -1127,7 +1127,10 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
                 elif theme == "REVERSAL": adj_pts *= 1.4
             elif regime in ["bull", "rebound"]:
                 if theme in ["TREND", "VOLATILITY", "QUANTUM"]: adj_pts *= 1.2
-            theme_scores[theme] += adj_pts
+            
+            if sub_theme: sub_theme_scores[f"{theme}_{sub_theme}"].append(adj_pts)
+            else: theme_scores[theme] += adj_pts
+            
             triggered_list.append(text.format(fw=fw)); factors_list.append(tag)
 
     gap_pct = (stock.curr['Open'] - stock.prev['Close']) / (stock.prev['Close'] + 1e-10)
@@ -1141,16 +1144,16 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
         
     if cf.rs_20 > 0: 
         dynamic_rs_thresh = 1.0 + (stock.curr['ATR'] / (stock.curr['Close'] + 1e-10)) * 2.0
-        if cf.rs_20 > dynamic_rs_thresh: add_trigger("强相对强度", f"⚡ [相对强度] 动能超越波动率动态阈值 (阈值:{dynamic_rs_thresh:.2f} 权:{{fw:.2f}}x)", 7 if stock.is_vol else 4, "TREND")
+        if cf.rs_20 > dynamic_rs_thresh: add_trigger("强相对强度", f"⚡ [相对强度] 动能超越波动率动态阈值 (阈值:{dynamic_rs_thresh:.2f} 权:{{fw:.2f}}x)", 7 if stock.is_vol else 4, "TREND", "MOMENTUM_BURST")
     
     macd_crossed = check_macd_cross(stock.curr, stock.prev)
     if macd_crossed:
         is_above_water = stock.curr['MACD'] > Config.Params.MACD_WATERLINE
-        add_trigger("MACD金叉", f"🔥 [经典动能] MACD{'水上金叉' if is_above_water else '水下金叉'}起爆 (权:{{fw:.2f}}x)", 12 if is_above_water else 8, "TREND")
+        add_trigger("MACD金叉", f"🔥 [经典动能] MACD{'水上金叉' if is_above_water else '水下金叉'}起爆 (权:{{fw:.2f}}x)", 12 if is_above_water else 8, "TREND", "MOMENTUM_BURST")
 
     if stock.curr['Above_Cloud'] == 1 and stock.curr['Tenkan'] > stock.curr['Kijun']: add_trigger("一目多头", "🌥️ [趋势确认] 一目均衡表云上多头共振 (权:{fw:.2f}x)", 6, "TREND")
-    if stock.curr['Close'] > stock.curr['VWAP_20'] and stock.prev['Close'] <= stock.curr['VWAP_20']: add_trigger("VWAP突破", "🌊 [量价突破] 放量逾越近20日VWAP机构均价线 (权:{fw:.2f}x)", 8, "TREND")
-    if pd.notna(stock.curr['AVWAP']) and stock.curr['Close'] > stock.curr['AVWAP'] and stock.prev['Close'] <= stock.curr['AVWAP']: add_trigger("AVWAP突破", "⚓ [筹码夺回] 强势站上AVWAP锚定成本核心区 (权:{fw:.2f}x)", 12, "TREND")
+    if stock.curr['Close'] > stock.curr['VWAP_20'] and stock.prev['Close'] <= stock.curr['VWAP_20']: add_trigger("VWAP突破", "🌊 [量价突破] 放量逾越近20日VWAP机构均价线 (权:{fw:.2f}x)", 8, "TREND", "MOMENTUM_BURST")
+    if pd.notna(stock.curr['AVWAP']) and stock.curr['Close'] > stock.curr['AVWAP'] and stock.prev['Close'] <= stock.curr['AVWAP']: add_trigger("AVWAP突破", "⚓ [筹码夺回] 强势站上AVWAP锚定成本核心区 (权:{fw:.2f}x)", 12, "TREND", "MOMENTUM_BURST")
 
     kc_w, bb_w = stock.curr['KC_Upper'] - stock.curr['KC_Lower'], stock.curr['BB_Upper'] - stock.curr['BB_Lower']
     if bb_w < kc_w: 
@@ -1164,9 +1167,9 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
     if stock.curr['Range_20'] > 0 and stock.curr['Range_20'] < stock.curr['Range_60'] * vcp_th and stock.curr['Close'] > stock.curr['SMA_50']:
         add_trigger("VCP收缩", f"🌪️ [VCP形态] 极度价格波动压缩后的放量突破 (阈值:{vcp_th} 权:{{fw:.2f}}x)", 15, "VOLATILITY")
 
-    if pd.notna(stock.curr['Swing_Low_20']) and stock.curr['Low'] < stock.curr['Swing_Low_20'] and stock.curr['Close'] > stock.curr['Swing_Low_20']: add_trigger("流动性扫盘", "🧹 [止损猎杀] 刺穿前低扫掉散户止损后迅速诱空反转 (权:{fw:.2f}x)", 15, "REVERSAL")
-    if pd.notna(stock.curr['Swing_Low_20']) and stock.curr['Low'] > stock.curr['Swing_Low_20'] and stock.curr['Close'] > stock.swing_high_10: add_trigger("特性改变(ChoCh)", "🔀 [结构破坏] 突破近期反弹高点，完成 ChoCh 趋势逆转确认 (权:{fw:.2f}x)", 15, "REVERSAL")
-    if pd.notna(stock.curr['OB_High']) and stock.curr['Low'] <= stock.curr['OB_High'] and stock.curr['Close'] >= stock.curr['OB_Low'] and stock.curr['Close'] > stock.curr['Open']: add_trigger("订单块(OB)", "🧱 [机构订单块] 触达历史起爆底仓区并收出企稳阳线 (权:{fw:.2f}x)", 15, "REVERSAL")
+    if pd.notna(stock.curr['Swing_Low_20']) and stock.curr['Low'] < stock.curr['Swing_Low_20'] and stock.curr['Close'] > stock.curr['Swing_Low_20']: add_trigger("流动性扫盘", "🧹 [止损猎杀] 刺穿前低扫掉散户止损后迅速诱空反转 (权:{fw:.2f}x)", 15, "REVERSAL", "BOTTOM_REVERSAL")
+    if pd.notna(stock.curr['Swing_Low_20']) and stock.curr['Low'] > stock.curr['Swing_Low_20'] and stock.curr['Close'] > stock.swing_high_10: add_trigger("特性改变(ChoCh)", "🔀 [结构破坏] 突破近期反弹高点，完成 ChoCh 趋势逆转确认 (权:{fw:.2f}x)", 15, "REVERSAL", "BOTTOM_REVERSAL")
+    if pd.notna(stock.curr['OB_High']) and stock.curr['Low'] <= stock.curr['OB_High'] and stock.curr['Close'] >= stock.curr['OB_Low'] and stock.curr['Close'] > stock.curr['Open']: add_trigger("订单块(OB)", "🧱 [机构订单块] 触达历史起爆底仓区并收出企稳阳线 (权:{fw:.2f}x)", 15, "REVERSAL", "BOTTOM_REVERSAL")
 
     if cf.kde_breakout_score > Config.Params.KDE_BREAKOUT: add_trigger("量子概率云(KDE)", f"☁️ [真空逃逸] KDE 自适应带宽揭示上行阻力极度稀薄 (得分:{cf.kde_breakout_score:.2f} 权:{{fw:.2f}}x)", 15 * cf.kde_breakout_score, "QUANTUM")
     if cf.hurst_reliable and cf.hurst_med > Config.Params.HURST_RELIABLE: add_trigger("稳健赫斯特(Hurst)", f"⏳ [稳健记忆] R/S Bootstrap 确认强抗噪持续性 (Hurst={cf.hurst_med:.2f} 权:{{fw:.2f}}x)", 15 * (cf.hurst_med - 0.5) * 2.0, "QUANTUM")
@@ -1177,16 +1180,16 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
 
     if macd_crossed and "带量金叉(交互)" in factors_list: theme_scores['TREND'] -= min(get_fw("MACD金叉")*8, get_fw("带量金叉(交互)")*12) * 0.5 
     if cf.pure_alpha > 0.8: add_trigger("独立Alpha(脱钩)", "🪐 [独立Alpha] 强势剥离大盘Beta，爆发特质动能 (权:{fw:.2f}x)", 22, "TREND")
-    if stock.curr['SuperTrend_Up'] == 1 and stock.curr['Close'] < stock.curr['EMA_20'] * 1.02: add_trigger("强势回踩", "🟢 [低吸点位] 超级趋势主升轨精准回踩 (权:{fw:.2f}x)", 10, "REVERSAL")
-    if gap_pct * 100 > max(1.5, atr_pct * 0.3) and gap_pct < 0.06 * vix_scalar: add_trigger("突破缺口", "💥 [动能爆发] 放量跳空，留下底部突破缺口 (权:{fw:.2f}x)", 8, "VOLATILITY")
-    if cf.fvg_lower > 0 and stock.curr['Low'] <= cf.fvg_upper and stock.curr['Close'] > cf.fvg_lower: add_trigger("SMC失衡区", "🧲 [SMC交易法] 精准回踩并测试前期机构失衡区(FVG) (权:{fw:.2f}x)", 15, "REVERSAL")
+    if stock.curr['SuperTrend_Up'] == 1 and stock.curr['Close'] < stock.curr['EMA_20'] + stock.curr['ATR'] * 0.5: add_trigger("强势回踩", "🟢 [低吸点位] 超级趋势主升轨精准回踩 (权:{fw:.2f}x)", 10, "REVERSAL", "BOTTOM_REVERSAL")
+    if gap_pct > (stock.curr['ATR'] / (stock.prev['Close'] + 1e-10)) * 0.5 and gap_pct < (stock.curr['ATR'] / (stock.prev['Close'] + 1e-10)) * 2.0 * vix_scalar: add_trigger("突破缺口", "💥 [动能爆发] 放量跳空，留下底部突破缺口 (权:{fw:.2f}x)", 8, "VOLATILITY")
+    if cf.fvg_lower > 0 and stock.curr['Low'] <= cf.fvg_upper and stock.curr['Close'] > cf.fvg_lower: add_trigger("SMC失衡区", "🧲 [SMC交易法] 精准回踩并测试前期机构失衡区(FVG) (权:{fw:.2f}x)", 15, "REVERSAL", "BOTTOM_REVERSAL")
 
     if stock.curr['Volume'] > stock.curr['Vol_MA20'] * 2.0 and abs(stock.curr['Close'] - stock.curr['Open']) < stock.curr['ATR'] * 0.5:
         if pd.notna(stock.curr['Swing_Low_20']) and stock.curr['Close'] < stock.curr['Swing_Low_20'] * 1.05: add_trigger("巨量滞涨", "🛑 [冰山吸筹] 底部巨量滞涨，极大概率为机构冰山挂单吸货 (权:{fw:.2f}x)", 12, "QUANTUM")
         elif stock.curr['Close'] > stock.swing_high_10 * 0.95: triggered_list.append("⚠️ [高位派发] 高位巨量滞涨，警惕机构冰山挂单出货 (已被系统降权)")
         
-    if day_chg > max(3.0, atr_pct * 0.6) and stock.curr['Volume'] > stock.curr['Vol_MA20'] * 1.5: add_trigger("放量长阳", "⚡ [动能脉冲] 强劲的日内放量大实体阳线 (权:{fw:.2f}x)", 12, "QUANTUM")
-    if stock.curr['Close'] > stock.prev['Close'] and stock.curr['Volume'] > stock.curr['Max_Down_Vol_10'] > 0 and stock.curr['Close'] >= stock.curr['EMA_50'] and stock.prev['Close'] <= stock.curr['EMA_50'] * 1.02: add_trigger("口袋支点", "💎 [口袋支点] 放量阳线成交量完全吞噬近期最大阴量 (权:{fw:.2f}x)", 12, "REVERSAL")
+    if day_chg > max(3.0, atr_pct * 0.6) and stock.curr['Volume'] > stock.curr['Vol_MA20'] * 1.5: add_trigger("放量长阳", "⚡ [动能脉冲] 强劲的日内放量大实体阳线 (权:{fw:.2f}x)", 12, "QUANTUM", "PRICE_ACTION_BURST")
+    if stock.curr['Close'] > stock.prev['Close'] and stock.curr['Volume'] > stock.curr['Max_Down_Vol_10'] > 0 and stock.curr['Close'] >= stock.curr['EMA_50'] and stock.prev['Close'] <= stock.curr['EMA_50'] * 1.02: add_trigger("口袋支点", "💎 [口袋支点] 放量阳线成交量完全吞噬近期最大阴量 (权:{fw:.2f}x)", 12, "REVERSAL", "BOTTOM_REVERSAL")
 
     lower_wick = stock.curr['Open'] - stock.curr['Low'] if stock.curr['Close'] > stock.curr['Open'] else stock.curr['Close'] - stock.curr['Low']
     upper_wick = stock.curr['High'] - stock.curr['Close'] if stock.curr['Close'] > stock.curr['Open'] else stock.curr['High'] - stock.curr['Open']
@@ -1194,16 +1197,24 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
     if cf.weekly_bullish and (stock.curr['Close'] > stock.curr['Highest_22'] * 0.95): add_trigger("跨时空共振(周线)", "🌌 [多周期共振] 周线级别主升浪与日线级别放量的强力双重共振 (权:{fw:.2f}x)", 20, "QUANTUM")
 
     if stock.curr['CVD_Trend'] == 1.0 and stock.prev['CVD_Trend'] <= 0.0:
-        if stock.curr['CVD_Divergence'] == 0: add_trigger("CVD筹码净流入", "🧬 [微观筹码] CVD 双均线平滑多头确立且无量价背离，真实买盘涌入 (权:{fw:.2f}x)", 12, "QUANTUM")
+        if stock.curr['CVD_Divergence'] == 0: add_trigger("CVD筹码净流入", "🧬 [微观筹码] CVD 双均线平滑多头确立且无量价背离，真实买盘涌入 (权:{fw:.2f}x)", 12, "QUANTUM", "PRICE_ACTION_BURST")
         else: triggered_list.append("⚠️ [微观筹码] 价格近高但 CVD 出现顶背离，尾盘动能涉嫌虚假欺骗 (已被AI降权)")
 
-    if stock.curr['VPT_ZScore'] > 0.5 and stock.curr['VPT_Accel'] > 0 and stock.prev['VPT_ZScore'] <= 0.5: add_trigger("VPT量价共振", "📈 [量价归一] VPT Z-Score突破且动能加速，真实买盘绝对共振 (权:{fw:.2f}x)", 10, "TREND")
-    if macd_crossed: add_trigger("带量金叉(交互)", "🔥 [交互共振] MACD金叉与成交量激增产生乘数效应 (权:{fw:.2f}x)", 12, "TREND")
-    if stock.curr['CMF'] > 0.15 and stock.curr['Smart_Money_Flow'] > 0.4: add_trigger("量价吸筹(交互)", "🏦 [交互共振] 蔡金资金流与微观聪明钱同向深度吸筹 (权:{fw:.2f}x)", 10, "QUANTUM")
+    if stock.curr['VPT_ZScore'] > 0.5 and stock.curr['VPT_Accel'] > 0 and stock.prev['VPT_ZScore'] <= 0.5: add_trigger("VPT量价共振", "📈 [量价归一] VPT Z-Score突破且动能加速，真实买盘绝对共振 (权:{fw:.2f}x)", 10, "TREND", "MOMENTUM_BURST")
+    if macd_crossed: add_trigger("带量金叉(交互)", "🔥 [交互共振] MACD金叉与成交量激增产生乘数效应 (权:{fw:.2f}x)", 12, "TREND", "MOMENTUM_BURST")
+    
+    cmf_val = stock.curr['CMF'] if pd.notna(stock.curr['CMF']) else 0.0
+    smf_val = stock.curr['Smart_Money_Flow'] if pd.notna(stock.curr['Smart_Money_Flow']) else 0.0
+    if cmf_val > 0.05 and smf_val > 0.1:
+        cmf_intensity = min(1.0, max(0.0, (cmf_val - 0.05) / 0.2)) 
+        smf_intensity = min(1.0, max(0.0, (smf_val - 0.1) / 0.4)) 
+        interaction_pts = 12 * (cmf_intensity * 0.6 + smf_intensity * 0.4)
+        if interaction_pts > 3.0: add_trigger("量价吸筹(交互)", f"🏦 [交互共振] 蔡金资金流与聪明钱同向深度吸筹 (强度: {interaction_pts/12:.1%} 权:{{fw:.2f}}x)", interaction_pts, "QUANTUM", "PRICE_ACTION_BURST")
+        
     if cf.fft_ensemble_score >= Config.Params.FFT_RESONANCE: add_trigger("FFT多窗共振(动能)", "🌊 [频域共振] 多窗口 FFT 阵列一致确认，主导周期处于强劲上升象限 (权:{fw:.2f}x)", 15, "QUANTUM")
     if cf.weekly_macd_res == 1.0 and macd_crossed: add_trigger("大周期保护小周期(MACD共振)", "🛡️ [多维时空] 周线MACD动能发散，日线精准金叉，大周期绝对战役保护 (权:{fw:.2f}x)", 15, "TREND")
     if cf.monthly_inst_flow == 1.0: add_trigger("聪明钱月度净流入(月线)", "🏛️ [战略定调] 月线级别连续3个月大单资金净流入，暗池机构底仓坚如磐石 (权:{fw:.2f}x)", 10, "QUANTUM")
-    if cf.rsi_60m_bounce == 1.0: add_trigger("60分钟级精准校准(RSI反弹)", "⏱️ [战术执行] 60分钟线 RSI 触底反弹，日内高频微操切入绝佳滑点位置 (权:{fw:.2f}x)", 8, "REVERSAL")
+    if cf.rsi_60m_bounce == 1.0: add_trigger("60分钟级精准校准(RSI反弹)", "⏱️ [战术执行] 60分钟线 RSI 触底反弹，日内高频微操切入绝佳滑点位置 (权:{fw:.2f}x)", 8, "REVERSAL", "BOTTOM_REVERSAL")
 
     macro_gravity = getattr(ctx, 'macro_gravity', False)
     if cf.beta_60d > 1.2 and not macro_gravity: add_trigger("大盘Beta(宏观调整)", "📈 [宏观Beta动能] 宏观低压期，高Beta(>1.2)特质赋予极强上行弹性 (权:{fw:.2f}x)", 7, "TREND")
@@ -1221,7 +1232,9 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
     if amihud_val > Config.Params.AMIHUD_ILLIQ and macro_gravity: add_trigger("Amihud非流动性(冲击成本)", "⚠️ [流动性枯竭] 宏观高压下 Amihud 冲击成本显著放大，极易发生踩踏被降权 (权:{fw:.2f}x)", -10, "VOLATILITY")
     if cf.vrp > Config.Params.VRP_EXTREME: add_trigger("波动率风险溢价(VRP)", f"🌋 [风险溢价] VRP归一化极度飙升(溢价率>{cf.vrp*100:.1f}%)，期权市场定价极端恐慌，捕捉极值底 (权:{{fw:.2f}}x)", 12, "QUANTUM")
 
-    if alt.nlp_score > Config.Params.NLP_BULL: add_trigger("舆情NLP情感极值(News_NLP)", f"📰 [舆情引擎] VADER-Lite 分析判定近期新闻呈现极度狂热 (复合得分:{alt.nlp_score:.2f} 权:{{fw:.2f}}x)", 6, "VOLATILITY")
+    if alt.nlp_score > 0.3:
+        nlp_pts = 10 * min(1.0, alt.nlp_score / 0.8)
+        add_trigger("舆情NLP情感极值(News_NLP)", f"📰 [舆情引擎] VADER-Lite 分析判定近期新闻呈现极度狂热 (强度:{nlp_pts/10:.1%} 权:{{fw:.2f}}x)", nlp_pts, "VOLATILITY")
     elif alt.nlp_score < Config.Params.NLP_BEAR: add_trigger("舆情NLP情感极值(News_NLP)", f"⚠️ [舆情崩塌] 探测到新闻包含密集利空/诉讼词汇 (复合得分:{alt.nlp_score:.2f} 权:{{fw:.2f}}x)", -10, "VOLATILITY")
     if alt.wsb_accel > Config.Params.WSB_ACCEL: add_trigger("散户热度加速度(WSB_Accel)", f"🔥 [散户加速] Reddit/WSB 提及数二阶导数飙升 (加速度:{alt.wsb_accel:.0f}/日²)，游资加速抬轿 (权:{{fw:.2f}}x)", 8, "VOLATILITY")
 
@@ -1235,16 +1248,26 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
     if ctx.is_credit_risk_high:
         add_trigger("宏观重力场(Credit_Risk)", "🚨 [系统性风险] 信用债市场出现剧烈抛售，根据量化上帝视角，此处必须降权避险 (权:{fw:.2f}x)", 15, "SHORT")
         
-    # [架构优化] Soft-Clipping 抑制动量多重共线性
+    # 子池 Max-Pooling 聚合，解决多重共线性
+    for st_key, scores in sub_theme_scores.items():
+        theme = st_key.split('_')[0]
+        if scores:
+            scores.sort(reverse=True)
+            pooled_score = scores[0] + sum(s * 0.3 for s in scores[1:]) # 取最大值，其余衰减为 30%
+            theme_scores[theme] += pooled_score
+
+    # [架构优化] Soft-Clipping 抑制单极分化
     if theme_scores['TREND'] > 40:
         theme_scores['TREND'] = 40 + np.log1p(theme_scores['TREND'] - 40) * 10
         
     positive_themes = ['TREND', 'VOLATILITY', 'REVERSAL', 'QUANTUM']
     saturated_theme_sum = sum([50.0 * (1 - np.exp(-theme_scores[t] / 25.0)) for t in positive_themes if theme_scores[t] > 0])
-    short_penalty = 50.0 * (1 - np.exp(-theme_scores['SHORT'] / 25.0)) if theme_scores['SHORT'] > 0 else 0.0
     
-    final_score_saturated = 100.0 * (1 - np.exp(-saturated_theme_sum / 50.0)) - short_penalty
+    final_score_saturated = 100.0 * (1 - np.exp(-saturated_theme_sum / 50.0))
     if alt.pcr > Config.Params.PCR_BEAR or alt.iv_skew > Config.Params.IV_SKEW_BEAR or ctx.is_credit_risk_high: black_swan_risk = True
+    
+    # [黑天鹅一票否决权] 彻底摧毁带病股票的分数
+    if black_swan_risk: final_score_saturated *= 0.1
         
     return int(final_score_saturated), triggered_list, factors_list, black_swan_risk
 
