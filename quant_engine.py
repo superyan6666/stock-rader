@@ -1969,7 +1969,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                     ai_filtered_total += 1
                     if ret > 0: ai_filtered_wins += 1
                     
-                if t.get('ml_features', {}): trades_with_ret.append({'date': t['date'], 'symbol': t.get('symbol', 'UNKNOWN'), 'vix': t['vix'], 'cred': t['cred'], 'term': t['term'], 'pcr': t['pcr'], 'ml_features': t.get('ml_features', {}), 'factors': factor_list, 'ret': float(ret)})
+                trades_with_ret.append({'date': t['date'], 'symbol': t.get('symbol', 'UNKNOWN'), 'vix': t['vix'], 'cred': t['cred'], 'term': t['term'], 'pcr': t['pcr'], 'ml_features': t.get('ml_features', {}), 'factors': factor_list, 'ret': float(ret)})
     
     feature_importances_dict, meta_weights_dict, factor_ic_report, trade_df = {}, {}, {}, pd.DataFrame(trades_with_ret)
     
