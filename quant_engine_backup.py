@@ -134,7 +134,7 @@ class Config:
         # [针对 4C24G ARM 优化] 动态进程池：留出 1 个核心给系统IO和主调度器，避免 OOM 和死锁
         import multiprocessing
         MAX_WORKERS = min(3, multiprocessing.cpu_count() - 1) if multiprocessing.cpu_count() > 1 else 1
-        MIN_SCORE_THRESHOLD = 12.0
+        MIN_SCORE_THRESHOLD = 8
         BASE_MAX_RISK = 0.015       
         CROWDING_PENALTY = 0.75     
         CROWDING_MIN_STOCKS = 2     
@@ -1162,7 +1162,7 @@ def _extract_ml_features(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: A
     if allow_breakout and pd.notna(stock.curr['AVWAP']) and stock.curr['Close'] > stock.curr['AVWAP'] and stock.prev['Close'] <= stock.curr['AVWAP']: add_trigger("AVWAP突破", "⚓ [筹码夺回] 强势站上AVWAP锚定成本核心区 (权:{fw:.2f}x)", 12, "TREND", "MOMENTUM_BURST")
 
     kc_w, bb_w = stock.curr['KC_Upper'] - stock.curr['KC_Lower'], stock.curr['BB_Upper'] - stock.curr['BB_Lower']
-    if bb_w < kc_w and stock.curr['Close'] > stock.curr['KC_Upper'] and stock.curr['Volume'] > stock.curr['Vol_MA20'] * 1.5: 
+    if bb_w < kc_w and stock.curr['Close'] > stock.curr['KC_Upper'] and stock.curr['Volume'] > stock.curr['Vol_MA20'] * 1.2: 
         s_ratio = (kc_w - bb_w) / (stock.curr['ATR'] + 1e-10)
         add_trigger("TTM Squeeze ON", f"📦 [波动压缩] 多头强爆发下的 TTM Squeeze 向上突破确认 (比率:{s_ratio:.2f} 权:{{fw:.2f}}x)", 8 + int(s_ratio*10), "VOLATILITY")
 
@@ -1171,8 +1171,7 @@ def _extract_ml_features(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: A
     vix_scalar = getattr(ctx, 'vix_scalar', 1.0)
     vcp_th = (Config.Params.VCP_BEAR if getattr(ctx, 'regime', 'range') in ["bear", "hidden_bear"] else Config.Params.VCP_BULL) * vix_scalar
     if stock.curr['Range_20'] > 0 and stock.curr['Range_20'] < stock.curr['Range_60'] * vcp_th and stock.curr['Close'] > stock.curr['SMA_50']:
-        vcp_score = min(25, 10 + int(stock.curr['Range_60'] / (stock.curr['Range_20'] + 1e-5)) * 2)
-        add_trigger("VCP收缩", f"🌪️ [VCP形态] 极度价格波动压缩后的放量突破 (动态权:{{fw:.2f}}x)", vcp_score, "VOLATILITY")
+        add_trigger("VCP收缩", f"🌪️ [VCP形态] 极度价格波动压缩后的放量突破 (阈值:{vcp_th} 权:{{fw:.2f}}x)", 15, "VOLATILITY")
 
     is_pullback = stock.curr['Close'] < stock.curr['EMA_20']
     
@@ -1299,7 +1298,7 @@ def _extract_ml_features(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: A
     return int(final_score_saturated), triggered_list, factors_list, black_swan_risk
 
 def _apply_market_filters(curr, prev, sym, base_score, sig, a, b, c):
-    if curr['RSI'] > 80.0: return max(0, base_score - 50), False, sig + ["⚠️ 极端超买"]
+    if curr['RSI'] > 85.0: return max(0, base_score - 30), False, sig + ["⚠️ 极端超买"]
     return base_score, False, sig
 
 def _build_market_context() -> MarketContext:
