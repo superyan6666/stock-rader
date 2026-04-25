@@ -83,17 +83,19 @@ class Config:
     }
     
     LOG_PREFIX: str = "backtest_log_"
-    STATS_FILE: str = "strategy_stats.json"
-    REPORT_FILE: str = "backtest_report.md"
+    # ✅ 修复：将所有核心文件路径强绑定至 DATA_DIR 目录，对齐 GitHub Artifacts 与 Dashboard
+    DATA_DIR: str = ".quantbot_data"
+    STATS_FILE: str = os.path.join(DATA_DIR, "strategy_stats.json")
+    REPORT_FILE: str = os.path.join(DATA_DIR, "backtest_report.md")
+    EXT_CACHE_FILE: str = os.path.join(DATA_DIR, "daily_ext_cache.json")
+    ORDER_DB_PATH: str = os.path.join(DATA_DIR, "order_state.db") 
+    TCA_LOG_PATH: str = os.path.join(DATA_DIR, "tca_history.jsonl")
+    
     CACHE_FILE: str = "tickers_cache.json"
     ALERT_CACHE_FILE: str = "alert_history.json"
     MODEL_FILE: str = "scoring_model.pkl"
     WSB_CACHE_FILE: str = "wsb_history.json"  
     CUSTOM_CONFIG_FILE: str = "quantbot_config.json" 
-    DATA_DIR: str = ".quantbot_data"
-    EXT_CACHE_FILE: str = os.path.join(DATA_DIR, "daily_ext_cache.json")
-    ORDER_DB_PATH: str = os.path.join(DATA_DIR, "order_state.db") 
-    TCA_LOG_PATH: str = os.path.join(DATA_DIR, "tca_history.jsonl")
     MODEL_VERSION: str = "3.0" 
 
     CORE_WATCHLIST: list = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO", "AMD", "QCOM", "JPM", "V", "MA", "UNH", "JNJ", "XOM", "PG", "HD", "COST", "ABBV", "CRM", "NFLX", "ADBE", "NOW", "UBER", "INTU", "IBM", "ISRG", "SYK", "SPY", "QQQ", "IWM", "DIA"]
@@ -176,6 +178,8 @@ def validate_config():
         with open(Config.STATS_FILE, 'w') as f: f.write("{}")
     if not os.path.exists(Config.ALERT_CACHE_FILE):
         with open(Config.ALERT_CACHE_FILE, 'w') as f: json.dump({"matrix": {}, "shadow_pool": {}}, f)
+    # ✅ 修复：提前初始化 tca 账本空文件，保证上传 Artifacts 时不报 404
+    if not os.path.exists(Config.TCA_LOG_PATH): open(Config.TCA_LOG_PATH, 'a').close()
     logger.info("✅ 环境与架构目录校验通过")
 
 # ================= 2. 数据抽象模型 =================
@@ -459,6 +463,7 @@ def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retr
             
             # 若 Alpaca 拉取失败（如没有配置密钥、遇到宏观指数 ^VIX），自动安全回退 (Fallback) 降级至 yfinance
             if new_df.empty:
+                logger.debug(f"🔄 [降级路由] Alpaca 未返回 {symbol} 数据，安全切换至 yfinance 通道。")
                 new_df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False, timeout=8)
                 if not new_df.empty:
                     new_df.index = pd.to_datetime(new_df.index, utc=True)
