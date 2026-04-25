@@ -18,6 +18,24 @@ logger = logging.getLogger("QuantTransformer")
 
 # ================= 1. 核心数学组件 =================
 
+class Time2Vec(nn.Module):
+    """Time2Vec: 让模型具备捕捉市场周期性(Periodicity)与线性趋势的能力"""
+    def __init__(self, input_dim: int, out_dim: int):
+        super().__init__()
+        self.out_dim = out_dim
+        # 线性分量：捕捉长期趋势
+        self.wb = nn.Parameter(torch.randn(input_dim, 1))
+        self.bb = nn.Parameter(torch.randn(1))
+        # 周期分量：通过正弦函数捕捉季节性与循环
+        self.wa = nn.Parameter(torch.randn(input_dim, out_dim - 1))
+        self.ba = nn.Parameter(torch.randn(out_dim - 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (Batch, Seq, Features)
+        bias = torch.matmul(x, self.wb) + self.bb
+        wgts = torch.sin(torch.matmul(x, self.wa) + self.ba)
+        return torch.cat([bias, wgts], dim=-1) # 融合线性与周期分量
+
 class PositionalEncoding(nn.Module):
     """位置编码器：让 Transformer 具备时间方向感。"""
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 120):
@@ -62,7 +80,12 @@ class QuantAlphaTransformer(nn.Module):
         }
         self.d_model = d_model
         self.input_norm = nn.LayerNorm(num_features)
-        self.feature_projection = nn.Linear(num_features, d_model)
+        
+        # 🚀 [架构进化] 引入 Time2Vec 替代原始线性投影
+        t2v_dim = 16 # 分配 16 维用于捕捉周期性特征
+        self.t2v = Time2Vec(num_features, t2v_dim)
+        self.feature_projection = nn.Linear(num_features + t2v_dim, d_model)
+        
         self.pos_encoder = PositionalEncoding(d_model, dropout, max_len=120)
         
         encoder_layers = nn.TransformerEncoderLayer(
@@ -90,7 +113,12 @@ class QuantAlphaTransformer(nn.Module):
         assert src.size(2) == self.hp['num_features'], f"特征维度异常，期待 {self.hp['num_features']}，实际: {src.size(2)}"
         
         src = self.input_norm(src)
-        x = self.feature_projection(src) * math.sqrt(self.d_model)
+        
+        # 融合原始特征与 Time2Vec 周期嵌入
+        t2v_embed = self.t2v(src)
+        combined = torch.cat([src, t2v_embed], dim=-1)
+        
+        x = self.feature_projection(combined) * math.sqrt(self.d_model)
         x = self.pos_encoder(x)
         memory = self.transformer_encoder(x)
         
@@ -193,15 +221,25 @@ def train_alpha_model(features: np.ndarray, returns: np.ndarray,
     device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_amp = device.type == 'cuda'
     
-    split_idx = int(len(features) * 0.8)
-    if split_idx == 0 or split_idx == len(features):
-        raise ValueError("样本量太少，无法执行时序切分！")
+    # 🚀 [抗过拟合进化] Purged & Embargoed 时序切分
+    # 逻辑：验证集必须与训练集保持至少 60 天的物理隔离，防止滑动窗口导致的信息泄露
+    lookback = 60
+    total_len = len(features)
+    train_end = int(total_len * 0.75) # 提高训练集比重，但由于 Embargo，实际训练样本会减少
+    val_start = train_end + lookback  # 强制隔离带 (Embargo)
+    
+    if val_start >= total_len - 10:
+        logger.warning("⚠️ 样本量不足以建立封锁区，将回退至常规时序切分。")
+        train_end = int(total_len * 0.8)
+        val_start = train_end
         
-    train_ds = QuantContrastiveDataset(features[:split_idx], returns[:split_idx])
-    val_ds = QuantContrastiveDataset(features[split_idx:], returns[split_idx:])
+    train_ds = QuantContrastiveDataset(features[:train_end], returns[:train_end])
+    val_ds = QuantContrastiveDataset(features[val_start:], returns[val_start:])
     
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    
+    logger.info(f"📊 训练流状态: 训练集[{train_end}] | 封锁隔离带[{lookback}] | 验证集[{total_len - val_start}]")
     
     model = QuantAlphaTransformer().to(device)
     criterion = AlphaContrastiveLoss(temperature=0.1).to(device)
