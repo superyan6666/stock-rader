@@ -95,6 +95,7 @@ class Config:
     ALERT_CACHE_FILE: str = os.path.join(DATA_DIR, "alert_history.json")
     MODEL_FILE: str = os.path.join(DATA_DIR, "scoring_model.pkl")
     WSB_CACHE_FILE: str = os.path.join(DATA_DIR, "wsb_history.json")  
+    TRANSFORMER_PTH: str = os.path.join(DATA_DIR, "transformer_production.pth")
     CUSTOM_CONFIG_FILE: str = "quantbot_config.json" 
     MODEL_VERSION: str = "3.0" 
 
@@ -1312,15 +1313,66 @@ def _prepare_universe_data(ctx: MarketContext) -> Tuple[List[dict], dict]:
     return prepared_data, {d['sym']: d['close_history'] for d in prepared_data}
 
 def _apply_ai_inference(reports: List[dict], ctx: MarketContext) -> List[dict]:
-    for r in reports: r['ai_prob'] = random.uniform(0.4, 0.8)
+    """AI 推理引擎: 将 Transformer 右脑逻辑从占位符升级为实时模型推演"""
+    if not TRANSFORMER_AVAILABLE or not os.path.exists(Config.TRANSFORMER_PTH):
+        # 降级方案：如果没有模型，则使用基于技术面权重的概率偏移
+        for r in reports: r['ai_prob'] = 0.45 + (r['score'] / 100.0) * 0.2
+        return reports
+    
+    try:
+        # 热加载生产权重
+        device = torch.device('cpu') # ARM CPU 上使用 CPU 推理，避免 GPU 调度开销
+        model = QuantAlphaTransformer.load_checkpoint(Config.TRANSFORMER_PTH, device=device)
+        
+        for r in reports:
+            seq = r.get('seq')
+            if seq is not None and isinstance(seq, np.ndarray) and seq.shape == (60, 49):
+                # 注入时序特征序列，提取 16 维高维 Alpha 嵌入
+                alpha_vec = model.extract_alpha(seq)
+                # 策略逻辑：计算 Alpha 向量的强度作为胜率参考 (映射至 0.4-0.9 之间)
+                # 在对比学习中，向量模长反映了特征的确定性
+                confidence = float(np.tanh(np.linalg.norm(alpha_vec) / 4.0))
+                r['ai_prob'] = 0.5 + confidence * 0.4
+            else:
+                r['ai_prob'] = 0.5
+    except Exception as e:
+        logger.error(f"⚠️ [AI 推理崩溃] 无法激活右脑引擎: {e}")
+        for r in reports: r['ai_prob'] = 0.5
     return reports
 
-def _calculate_position_size(stock, ctx, ai_prob, div, risk):
-    return stock.curr['Close'] * 1.1, stock.curr['Close'] * 0.95, ai_prob - 0.2, ""
+def _calculate_position_size(stock: StockData, ctx: MarketContext, ai_prob: float, div: float, risk: float):
+    """风控决策引擎: 从固定比例升级为基于 ATR 的波动率动态停损"""
+    c = stock.curr['Close']
+    atr = stock.curr.get('ATR', c * 0.02) # 缺省使用 2% 波动
+    
+    # 动态止盈止损：根据波幅设定 3.5x 空间止盈，2.0x 空间止损
+    tp_price = c + (atr * 3.5)
+    sl_price = c - (atr * 2.0)
+    
+    # 根据趋势强度修正胜率预估
+    adj_prob = ai_prob
+    if c > stock.curr['SMA_200']: adj_prob += 0.03 # 顺大势加分
+    
+    return float(tp_price), float(sl_price), float(adj_prob), ""
 
 def _apply_kelly_cluster_optimization(reports: List[dict], pd_dict, exp, ctx):
-    for i, r in enumerate(reports): r['opt_weight'] = 0.05; r['pos_advice'] = "✅ 凯利最优"
-    return reports[:5]
+    """资金管理引擎: 从固定仓位升级为动态凯利公式 (Kelly Criterion) 映射"""
+    if not reports: return []
+    
+    for r in reports:
+        p = r.get('ai_prob', 0.5)
+        # 简化版凯利公式：Weight = (p * b - q) / b，此处 b (盈亏比) 假设为 1.5
+        # 结果乘以 0.2 的缩放系数以保持稳健性 (Fractional Kelly)
+        b = 1.5
+        k_val = (p * (b + 1) - 1) / b
+        k_weight = max(0.02, min(0.12, k_val * 0.2)) # 限制单标的仓位在 2% - 12% 之间
+        
+        r['opt_weight'] = k_weight
+        r['pos_advice'] = f"✅ 凯利权重: {k_weight*100:.1f}%"
+        
+    # 按 AI 胜率排序，保留前 5 名最强标的
+    final_pool = sorted(reports, key=lambda x: x['ai_prob'], reverse=True)[:5]
+    return final_pool
 
 def _generate_and_send_matrix_report(final_reports: List[dict], final_shadow_pool: List[dict], ctx: MarketContext) -> None:
     txts = []
