@@ -1812,7 +1812,7 @@ def run_gateway():
 # ================= 7. 回测引擎与抗噪验证 =================
 def run_backtest_engine(replay_mode: bool = False) -> None:
     if replay_mode:
-        log_files = ['backtest_log_replay.jsonl']
+        log_files = [os.path.join(Config.DATA_DIR, 'backtest_log_replay.jsonl')]
     else:
         log_files = [f for f in os.listdir('.') if f.startswith('backtest_log') and f.endswith('.jsonl') and not f.endswith('replay.jsonl')]
     if not log_files: logger.warning("未找到历史日志，回测取消。"); return
