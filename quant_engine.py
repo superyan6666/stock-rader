@@ -357,8 +357,71 @@ def safe_div(num, den, cap=20.0):
 def check_macd_cross(curr: pd.Series, prev: pd.Series) -> bool:
     return prev['MACD'] < prev['Signal_Line'] and curr['MACD'] > curr['Signal_Line']
 
+def _fetch_from_alpaca(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    """使用 Alpaca Data v2 API 拉取行情"""
+    api_key = os.environ.get('ALPACA_API_KEY', '')
+    api_secret = os.environ.get('ALPACA_API_SECRET', '')
+    
+    if not api_key or not api_secret:
+        return pd.DataFrame()
+        
+    # Alpaca 时限映射 (粗略换算，Alpaca 使用 RFC3339 格式的 start/end)
+    now = datetime.now(timezone.utc)
+    if period.endswith('d'): days = int(period[:-1])
+    elif period.endswith('mo'): days = int(period[:-2]) * 30
+    elif period.endswith('y'): days = int(period[:-1]) * 365
+    else: days = 365
+    
+    start_time = (now - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_time = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+    
+    # timeframe 映射: 1d -> 1Day, 60m -> 1Hour, 1wk -> 1Week
+    if interval == '1d': timeframe = '1Day'
+    elif interval == '60m' or interval == '1h': timeframe = '1Hour'
+    elif interval == '1wk': timeframe = '1Week'
+    elif interval == '1mo': timeframe = '1Month'
+    else: timeframe = '1Day'
+
+    url = f"https://data.alpaca.markets/v2/stocks/bars"
+    params = {
+        "symbols": symbol,
+        "timeframe": timeframe,
+        "start": start_time,
+        "end": end_time,
+        "limit": 10000,
+        "adjustment": "all" # 处理拆股除息
+    }
+    headers = {
+        "APCA-API-KEY-ID": api_key,
+        "APCA-API-SECRET-KEY": api_secret,
+        "Accept": "application/json"
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json().get('bars', {}).get(symbol, [])
+            if not data: return pd.DataFrame()
+            
+            df = pd.DataFrame(data)
+            # 格式化映射: t->Date, o->Open, h->High, l->Low, c->Close, v->Volume
+            df.rename(columns={'t': 'Date', 'o': 'Open', 'h': 'High', 'l': 'Low', 'c': 'Close', 'v': 'Volume'}, inplace=True)
+            df['Date'] = pd.to_datetime(df['Date'])
+            df.set_index('Date', inplace=True)
+            # 仅保留核心列
+            return df[['Open', 'High', 'Low', 'Close', 'Volume']]
+        elif resp.status_code == 422:
+            # 某些指数/非股票数据，Alpaca不提供，静默返回空以触发 Fallback
+            pass
+        else:
+            logger.debug(f"Alpaca API 异常: {resp.status_code} - {resp.text}")
+    except Exception as e:
+        logger.debug(f"Alpaca 请求失败: {e}")
+        
+    return pd.DataFrame()
+
+
 def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 3, fast_mode: bool = False) -> pd.DataFrame:
-    # ✅ 移除冗余的 global _WORKER_LOCAL_LIMITER 声明以通过 Flake8 检查
     # 修复1：对缓存键做路径安全转义，防止部分文件系统拒绝含有 '^' 或 '/' 的写入
     safe_sym = symbol.replace('^', '_caret_').replace('/', '_slash_')
     cache_key = f"{safe_sym}_{interval}_{period}"
@@ -391,9 +454,16 @@ def safe_get_history(symbol: str, period: str = "1y", interval: str = "1d", retr
     for attempt in range(retries):
         wait = limiter.acquire()  # 跨域安全限速
         try:
-            new_df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False, timeout=8)
+            # ✅ 优先级 1 改进：尝试使用高性能 Alpaca Data API
+            new_df = _fetch_from_alpaca(symbol, period, interval)
+            
+            # 若 Alpaca 拉取失败（如没有配置密钥、遇到宏观指数 ^VIX），自动安全回退 (Fallback) 降级至 yfinance
+            if new_df.empty:
+                new_df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False, timeout=8)
+                if not new_df.empty:
+                    new_df.index = pd.to_datetime(new_df.index, utc=True)
+            
             if not new_df.empty:
-                new_df.index = pd.to_datetime(new_df.index, utc=True)
                 df = new_df[~new_df.index.duplicated(keep='last')]
                 _SHARED_CACHE.set(cache_key, df) # 写入共享内存
                 return df
