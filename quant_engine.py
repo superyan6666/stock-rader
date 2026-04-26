@@ -1191,7 +1191,7 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
 
     if alt.insider_net_buy > Config.Params.INSIDER_BUY: add_trigger("内部人集群净买入(Insider)", "👔 [内幕天眼] SEC Form 4 披露高管集群式大额净买入 (权:{fw:.2f}x)", 20, "QUANTUM")
     if alt.analyst_mom > Config.Params.ANALYST_UP: add_trigger("分析师修正动量(Analyst)", f"📊 [投行护航] 分析师评级修正动量突破 Z-Score={alt.analyst_mom:.1f} (权:{{fw:.2f}}x)", 8, "QUANTUM")
-    elif alt.analyst_mom < Config.Params.ANALYST_DN: add_trigger("分析师修正动量(Analyst)", f"⚠️ [投行抛售] 分析师评级下调动量爆表 Z-Score={alt.analyst_mom:.1f}，已被系统降权 (权:{{fw:.2f}}x)", -10, "TREND")
+    elif alt.analyst_mom < Config.Params.ANALYST_DN: add_trigger("分析师修正动量(Analyst)", f"⚠️ [投行抛售] 分析师评级下调动量爆表 Z-Score={alt.analyst_mom:.1f}，已被系统降权 (权:{{fw:.2f}}x)", -5, "TREND")
 
     if macd_crossed and "带量金叉(交互)" in factors_list: theme_scores['TREND'] -= min(get_fw("MACD金叉")*8, get_fw("带量金叉(交互)")*12) * 0.5 
     if cf.pure_alpha > 0.8: add_trigger("独立Alpha(脱钩)", "🪐 [独立Alpha] 强势剥离大盘Beta，爆发特质动能 (权:{fw:.2f}x)", 22, "TREND")
@@ -1249,7 +1249,7 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
 
     macro_gravity = getattr(ctx, 'macro_gravity', False)
     if cf.beta_60d > 1.2 and not macro_gravity: add_trigger("大盘Beta(宏观调整)", "📈 [宏观Beta动能] 宏观低压期，高Beta(>1.2)特质赋予极强上行弹性 (权:{fw:.2f}x)", 7, "TREND")
-    elif cf.beta_60d > 1.2 and macro_gravity: add_trigger("大盘Beta(宏观调整)", "⚠️ [宏观Beta反噬] 宏观引力波高压期，高Beta特质面临深度回撤风险，降权防御 (权:{fw:.2f}x)", -10, "TREND")
+    elif cf.beta_60d > 1.2 and macro_gravity: add_trigger("大盘Beta(宏观调整)", "⚠️ [宏观Beta反噬] 宏观引力波高压期，高Beta特质面临深度回撤风险，降权防御 (权:{fw:.2f}x)", -5, "TREND")
 
     if cf.tlt_corr > 0.4 and getattr(ctx, 'tlt_trend', 1.0) > 0: add_trigger("利率敏感度(TLT相关性)", "🏦 [宏观映射] 与长期国债(TLT)高度正相关且美债处于多头趋势，受益于无风险利率见顶预期 (权:{fw:.2f}x)", 8, "TREND")
     elif cf.tlt_corr < -0.4 and getattr(ctx, 'tlt_trend', 1.0) < 0: add_trigger("利率敏感度(TLT相关性)", "🛡️ [宏观防御] 与长期国债(TLT)高度负相关且美债走弱，具备抗息避险属性 (权:{fw:.2f}x)", 6, "TREND")
@@ -1260,7 +1260,7 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
     if dist_52w > Config.Params.DIST_52W and cf.weekly_bullish: add_trigger("52周高点距离(动能延续)", "🏔️ [动能延续] 逼近 52 周新高且周线多头，上方无抛压阻力真空区 (权:{fw:.2f}x)", 10, "TREND")
         
     amihud_val = stock.curr['Amihud'] if pd.notna(stock.curr['Amihud']) else 0.0
-    if amihud_val > Config.Params.AMIHUD_ILLIQ and macro_gravity: add_trigger("Amihud非流动性(冲击成本)", "⚠️ [流动性枯竭] 宏观高压下 Amihud 冲击成本显著放大，极易发生踩踏被降权 (权:{fw:.2f}x)", -10, "VOLATILITY")
+    if amihud_val > Config.Params.AMIHUD_ILLIQ and macro_gravity: add_trigger("Amihud非流动性(冲击成本)", "⚠️ [流动性枯竭] 宏观高压下 Amihud 冲击成本显著放大，极易发生踩踏被降权 (权:{fw:.2f}x)", -5, "VOLATILITY")
     if cf.vrp > Config.Params.VRP_EXTREME: add_trigger("波动率风险溢价(VRP)", f"🌋 [风险溢价] VRP归一化极度飙升(溢价率>{cf.vrp*100:.1f}%)，期权市场定价极端恐慌，捕捉极值底 (权:{{fw:.2f}}x)", 12, "QUANTUM")
 
     if alt.nlp_score > 0.3:
@@ -1303,7 +1303,8 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
     return int(final_score_saturated), triggered_list, factors_list, black_swan_risk
 
 def _apply_market_filters(curr, prev, sym, base_score, sig, a, b, c):
-    if curr['RSI'] > 80.0: return max(0, base_score - 50), False, sig + ["⚠️ 极端超买"]
+    # [策略改进] RSI 超买惩罚从 -50 软化至 -20，避免过度扼杀强势主升浪
+    if curr['RSI'] > 85.0: return max(0, base_score - 20), False, sig + ["⚠️ 极端超买"]
     return base_score, False, sig
 
 def _build_market_context() -> MarketContext:
@@ -2126,7 +2127,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             today = all_dates[current_idx]
             today_str = today.strftime('%Y-%m-%d') if hasattr(today, 'strftime') else str(today)
             
-            # --- A. 盘中：检查现有持仓的止盈止损 ---
+            # --- A. 盘中：检查现有持仓的止盈止损 + 🆕 追踪止损 (Trailing Stop) ---
             remaining_positions = []
             for p in positions:
                 sym_col = p['s_col']
@@ -2136,6 +2137,14 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                 l_price = l_arr[current_idx, sym_col]
                 c_price = c_arr[current_idx, sym_col]
                 o_price = o_arr[current_idx, sym_col]
+                
+                # 🆕 追踪止损：记录持仓以来最高价，动态上移止损线锁定利润
+                if not np.isnan(h_price):
+                    p['high_since_entry'] = max(p.get('high_since_entry', p['entry_price']), h_price)
+                
+                atr_trail = p.get('atr_val', p['entry_price'] * 0.025)  # ATR 绝对值
+                trail_sl = p['high_since_entry'] - 2.0 * atr_trail
+                p['sl'] = max(p['sl'], trail_sl)  # 只升不降
                 
                 hit = False
                 exit_price = np.nan
@@ -2183,8 +2192,11 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                         entry_open = o_arr[next_day_idx, s_col]
                         if np.isnan(entry_open) or entry_open <= 0: continue
                             
-                        # 资金管理：单边最高10%总仓位
-                        alloc_amount = min(equity * 0.10, capital)
+                        # 🆕 信号质量分层仓位：高分信号获得更多资金
+                        sig_score = sig.get('score', 8)
+                        # 指数加权：8分=6%, 15分=8%, 30分=12%, 60分+=15%
+                        weight = min(0.15, 0.04 + 0.02 * np.log1p(sig_score / 5.0))
+                        alloc_amount = min(equity * weight, capital)
                         if alloc_amount < 1000: continue
                             
                         prev_close = c_arr[current_idx, s_col]
@@ -2196,12 +2208,14 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                         capital -= alloc_amount
                         
                         atr_pct = sig.get('_atr_pct', 0.025)
+                        atr_val = atr_pct * entry_cost  # ATR 绝对值，用于追踪止损
                         tp = entry_cost * (1 + 3.0 * atr_pct)
                         sl = entry_cost * (1 - 1.2 * atr_pct)
                         
                         positions.append({
                             'sym': sig['symbol'], 's_col': s_col, 'shares': shares,
-                            'entry_price': entry_cost, 'tp': tp, 'sl': sl, 'days_held': 0
+                            'entry_price': entry_cost, 'tp': tp, 'sl': sl, 'days_held': 0,
+                            'high_since_entry': entry_cost, 'atr_val': atr_val
                         })
 
         if equity_data:
