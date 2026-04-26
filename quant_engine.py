@@ -2401,7 +2401,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
         report_md.append(f"\n## 🔬 高级微观因子归因仪表盘 (Alpha Attribution)\n| 高级因子 | 纯因子溢价 (BPS) | 与传统动能耦合度 (Corr) | 触发频率 | 归因诊断 |\n|:---|:---:|:---:|:---:|:---:|")
         for f, data in attr_report.items(): report_md.append(f"| {f} | {data['premium_bps']:+.1f} bps | {data['corr_with_baseline']:.2f} | {data['trigger_rate']*100:.1f}% | {'⚠️ 负溢价' if data['premium_bps'] < 0 else ('⚖️ 高度耦合' if data['corr_with_baseline'] > 0.6 else ('💎 纯净 Alpha' if data['premium_bps'] > 50 and data['corr_with_baseline'] < 0.4 else '✅ 有效增益'))} |")
 
-    if TRANSFORMER_AVAILABLE and len(transformer_X) >= 64:
+    if TRANSFORMER_AVAILABLE and len(transformer_X) >= 16:
         logger.info(f"🧠 [架构解耦] 已捕获 {len(transformer_X)} 笔三元组时序切片，正压入训练数据共享缓冲区...")
         try:
             X_arr, Y_arr, buf_path = np.array(transformer_X, dtype=np.float32), np.array(transformer_Y, dtype=np.float32), os.path.join(Config.DATA_DIR, "training_buffer.npz")

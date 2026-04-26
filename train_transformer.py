@@ -28,8 +28,8 @@ BUFFER_PATH = os.path.join(DATA_DIR, "training_buffer.npz")
 MODEL_PATH = os.path.join(DATA_DIR, "transformer_production.pth")
 ARCHIVE_DIR = os.path.join(DATA_DIR, "archive")
 
-MIN_SAMPLES_REQUIRED = 128  # 至少积累足够的切片才启动耗时的反向传播
-BATCH_SIZE = 64
+MIN_SAMPLES_REQUIRED = 16  # 至少积累足够的切片才启动耗时的反向传播
+BATCH_SIZE = 16
 
 def get_device() -> torch.device:
     if torch.cuda.is_available():
