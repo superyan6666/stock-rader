@@ -2243,6 +2243,9 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
 • 资金破产概率(DD>50%): {mc_ruin_prob * 100:.2f}%
 • 合成路径中位数收益: {mc_median_ret * 100:.2f}%"""
             
+            # --- [AGENT_FITNESS_SCORE] 输出 ---
+            fitness_score = (sharpe * 15.0) + (total_ret * 50.0) - abs(max_dd * 80.0) + (calmar * 5.0)
+            
             print(f"\n[AGENT_FITNESS_SCORE]: {fitness_score:.4f}\n{mc_report}\n")
             with open(os.path.join(Config.DATA_DIR, "fitness_score.txt"), "w", encoding='utf-8') as f:
                 f.write(f"[AGENT_FITNESS_SCORE]: {fitness_score:.4f}\n{mc_report}")
