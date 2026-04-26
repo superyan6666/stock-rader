@@ -1969,7 +1969,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             stats_period[f'T+{d}'].append(float(ret))
             
             if d == 5:
-            sym, r_dt = t['symbol'], t['date']
+                sym, r_dt = t['symbol'], t['date']
                 if TRANSFORMER_AVAILABLE:
                     try:
                         if sym not in cached_inds: cached_inds[sym] = calculate_indicators(df_all.xs(sym, level=1, axis=1) if isinstance(df_all.columns, pd.MultiIndex) else pd.DataFrame({'Close': df_c[sym], 'Open': df_o[sym], 'High': df_h[sym], 'Low': df_l[sym], 'Volume': 1000000}))
