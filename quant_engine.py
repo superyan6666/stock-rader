@@ -2664,6 +2664,9 @@ def run_optuna_search():
         
     with open(os.path.join(Config.DATA_DIR, "optuna_best_params.json"), "w", encoding='utf-8') as f:
         json.dump(study.best_params, f, indent=4)
+        
+    alert_msg = f"## 🏆 Optuna Result!\n\n**Best Score: {study.best_value:.4f}**\n\n**Best Params:**\n```json\n{json.dumps(study.best_params, indent=4)}\n```"
+    send_alert("Optuna Result", alert_msg)
 
 if __name__ == "__main__":
     validate_config()

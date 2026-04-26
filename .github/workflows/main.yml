@@ -73,7 +73,7 @@ jobs:
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             MODE="${{ github.event.inputs.run_mode }}"
           elif [[ "${{ github.event_name }}" == "push" ]]; then
-            MODE="replay"
+            MODE="optuna"
           elif [[ "${{ github.event_name }}" == "schedule" ]]; then
             MODE="matrix"
           fi
