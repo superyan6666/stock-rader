@@ -2176,15 +2176,17 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                 if today_signals:
                     today_signals = sorted(today_signals, key=lambda x: x.get('score', 0), reverse=True)
                     
-                    # === 🛡️ 冬眠防御系统 (Hibernation Defense) ===
-                    # 当净值距历史峰值回撤超过 5% 时，进入防御模式
-                    # 正常牛市的 2-3% 震荡不会触发，只有真正的修正才会激活
+                    # === 🛡️ 冬眠防御系统 (Hibernation Defense) - 双层熔断 ===
+                    # Tier 1: 回撤 >5% → 减半入场（谨慎模式）
+                    # Tier 2: 回撤 >8% → 完全停止入场（全面熔断）
                     max_daily_entries = 5
                     pos_weight = 0.10
                     if len(equity_data) >= 5:
                         peak_equity = max(e['equity'] for e in equity_data)
                         current_dd = (equity - peak_equity) / peak_equity
-                        if current_dd < -0.05:  # 回撤超过 5% 才进入冬眠
+                        if current_dd < -0.08:  # Tier 2: 全面熔断
+                            max_daily_entries = 0
+                        elif current_dd < -0.05:  # Tier 1: 谨慎模式
                             max_daily_entries = 2
                             pos_weight = 0.05
                     
