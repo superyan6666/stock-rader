@@ -1539,11 +1539,11 @@ def _calculate_position_size(stock: StockData, ctx: MarketContext, ai_prob: floa
     c = stock.curr['Close']
     atr = stock.curr.get('ATR', c * 0.02) if pd.notna(stock.curr.get('ATR')) else c * 0.02
     
-    # 动态止盈：设定 3.5x 极限空间止盈
-    tp_price = c + (atr * 3.5)
+    # 动态止盈：与回测网格搜索最优解(TP=3.0)完全对齐
+    tp_price = c + (atr * 3.0)
     
-    # [利润回撤防线] 结合硬底线止损与吊灯移动止损
-    hard_sl = c - (atr * 2.0)
+    # [利润回撤防线] 结合硬底线止损(与最优解 SL=1.2 对齐)与吊灯移动止损
+    hard_sl = c - (atr * 1.2)
     chandelier_sl = stock.curr.get('Chandelier_Exit', hard_sl)
     if pd.isna(chandelier_sl) or chandelier_sl == 0.0: chandelier_sl = hard_sl
     
@@ -2237,26 +2237,15 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             mc_ruin_prob = float(np.mean(mc_max_dds <= -0.50)) # 破产概率 (回撤 >= 50%的比例)
             mc_median_ret = float(np.median(mc_total_rets))
             
-            print(f"\n🎲 蒙特卡洛压力测试 (10,000 次模拟):")
-            print(f"   - 95% 置信度极限回撤 (VaR): {mc_var_95 * 100:.2f}%")
-            print(f"   - 资金破产概率 (DD > 50%): {mc_ruin_prob * 100:.2f}%")
-            print(f"   - 蒙特卡洛合成中位数收益: {mc_median_ret * 100:.2f}%\n")
+            mc_report = f"""
+🎲 蒙特卡洛抗压测试 (10,000次重采样):
+• 95%置信度极限回撤: {mc_var_95 * 100:.2f}%
+• 资金破产概率(DD>50%): {mc_ruin_prob * 100:.2f}%
+• 合成路径中位数收益: {mc_median_ret * 100:.2f}%"""
             
-            portfolio_metrics = {
-                'total_ret': float(total_ret), 
-                'max_dd': float(max_dd), 
-                'sharpe': float(sharpe), 
-                'calmar': float(calmar),
-                'mc_var_95': mc_var_95,
-                'mc_ruin_prob': mc_ruin_prob,
-                'mc_median_ret': mc_median_ret
-            }
-            
-            # --- [AGENT_FITNESS_SCORE] 输出 ---
-            fitness_score = (sharpe * 15.0) + (total_ret * 50.0) - abs(max_dd * 80.0) + (calmar * 5.0)
-            print(f"\n[AGENT_FITNESS_SCORE]: {fitness_score:.4f}\n")
-            with open(os.path.join(Config.DATA_DIR, "fitness_score.txt"), "w") as f:
-                f.write(f"[AGENT_FITNESS_SCORE]: {fitness_score:.4f}")
+            print(f"\n[AGENT_FITNESS_SCORE]: {fitness_score:.4f}\n{mc_report}\n")
+            with open(os.path.join(Config.DATA_DIR, "fitness_score.txt"), "w", encoding='utf-8') as f:
+                f.write(f"[AGENT_FITNESS_SCORE]: {fitness_score:.4f}\n{mc_report}")
 
     with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: json.dump({"overall": res, "factors": f_res, "xai_importances": feature_importances_dict, "meta_weights": meta_weights_dict, "attribution": attr_report, "factor_ic": factor_ic_report, "portfolio": portfolio_metrics}, f, indent=4)
     
