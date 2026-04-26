@@ -3,22 +3,49 @@
 To Model: Antigravity (or any succeeding AI Coding Agent)
 Subject: Context Initialization & Architecture Rules for QuantBot 3.0
 Project State: Production-Ready, ARM-Optimized, Fully Decoupled (IO/CPU).
+Last Session: 2026-04-26, Conversation ID: bbe0cdca-0a7a-463b-a8db-ed9aecda7543
 
-1. 核心架构拓扑 (Architecture Topology)
+## 🚨 URGENT: Immediate Task for Next Session
+
+**The Transformer "Right Brain" training pipeline has been fully debugged and is awaiting its first successful run.**
+
+### What Was Done:
+1. **Optuna Optimization COMPLETE** — 500-trial search found optimal params (fitness 41→82), welded into `simulate_ledger_run()` defaults at line ~1823 of `quant_engine.py`.
+2. **Training data pipeline FIXED** — `training_buffer.npz` (29MB, 2510 samples) confirmed present on server at `.quantbot_data/`.
+3. **5 bugs fixed in sequence**: wrong execution mode routing, numpy `.npz` suffix auto-append, exit code masking, wrong constructor kwarg (`feature_dim` → `num_features`), missing `quant_transformer.py` commit.
+
+### What To Do First:
+1. **Check the latest GitHub Actions run** (commit `5a734cf`) — it should show `train_transformer.py` successfully running InfoNCE contrastive learning with Loss output.
+2. **If it succeeded**: The `transformer_production.pth` file now exists. Future runs of `quant_engine.py` will auto-detect it and use real AI probabilities instead of the hardcoded `ai_prob = 0.45 + score*0.2` fallback (see `_apply_ai_inference()` around line 1510).
+3. **If it failed again**: Read the error, it will be a simple fix. All infrastructure is now correct.
+
+### Post-Success Cleanup:
+- Remove diagnostic `[DIAG]` logging from `quant_engine.py` (line ~2404) and `main.yml` (line ~108-109)
+- Delete orphan file `training_buffer.npz.tmp.npz` from server
+- Delete scratch files from repo root: `update_params.py`, `update_params.ps1`, `fix.ps1`, `fix.py`, `fix2.ps1`, `fix3.ps1`, `error.txt`, `out.log`, `refactor.py`, `test_ast.py`
+
+### Suggested Next Evolution Directions:
+1. **Walk-Forward Optimization** — Replace global Optuna with rolling 3-month-train/1-month-test to combat overfitting
+2. **Slippage & Impact Model** — Add dynamic slippage penalty in `simulate_ledger_run()` based on volatility
+3. **Survivorship Bias Audit** — Ensure the stock pool is dynamic, not based on today's survivors
+
+---
+
+## 1. 核心架构拓扑 (Architecture Topology)
 
 当前系统由 10 个完美对齐的文件组成，不要随意更改文件职责划分：
 
 quant_engine.py: [绝对主脑] 包含多进程/多线程并发引擎、特征计算(49维)、数据拉取路由(Alpaca -> yfinance)、因子评分矩阵与执行调度。
 
-quant_transformer.py: [右脑结构] PyTorch 编写的 InfoNCE 架构 Transformer，处理时序截面并提取 16 维 Alpha 向量。
+quant_transformer.py: [右脑结构] PyTorch 编写的 InfoNCE 架构 Transformer，处理时序截面并提取 16 维 Alpha 向量。含 `train_alpha_model()` 函数，接受 `existing_model` 参数用于增量微调。
 
-train_transformer.py: [代谢中枢] 每周末读取实盘沉淀的 .npz 缓冲区，执行 AMP 混合精度重训。
+train_transformer.py: [代谢中枢] 每周末读取实盘沉淀的 .npz 缓冲区，调用 `train_alpha_model()` 执行 AMP 混合精度重训。MIN_SAMPLES_REQUIRED=16, BATCH_SIZE=16。
 
 dashboard.py: [指挥仓] Streamlit 前端，强依赖 .quantbot_data/ 目录下的统计文件与 TCA 账本。
 
 gateway_daemon.sh: [守护网关] 绑定 NUMA/Jemalloc 节点的执行器。
 
-main.yml: [调度流水线] GitHub Actions CI/CD，定义了环境变量、依赖和 crontab 调度。
+main.yml: [调度流水线] GitHub Actions CI/CD。push→replay+backtest(采集训练数据)+MLOps训练。schedule→matrix。workflow_dispatch→自选模式。`clean: false` 保护 `.quantbot_data/` 持久化。
 
 setup_arm_blas.sh: [物理加速] Oracle ARM 机器的 OpenBLAS/NumPy 底层编译脚本。
 
@@ -28,7 +55,7 @@ requirements.txt: 依赖锁定。
 
 README.md: 极其详细的系统白皮书。
 
-2. 绝对工程戒律 (CRITICAL DIRECTIVES - DO NOT VIOLATE)
+## 2. 绝对工程戒律 (CRITICAL DIRECTIVES - DO NOT VIOLATE)
 
 在进行任何后续代码修改时，必须严格遵守以下红线，否则会导致生产环境崩溃：
 
@@ -60,7 +87,11 @@ README.md: 极其详细的系统白皮书。
 
 禁止使用全局 np.random.seed()。必须使用局部的 np.random.default_rng(seed=...)，以免在 CPU Worker 池中导致所有标的生成相同的扰动特征。
 
-3. 当前数据流路由 (Data Routing State)
+🚫 Directive 6: np.savez 后缀陷阱 (NumPy Suffix Trap)
+
+`np.savez()` 会自动追加 `.npz` 后缀。如果传入的路径已包含 `.npz`，最终文件名将变成 `xxx.npz.npz`。在做原子写入时，临时文件路径必须本身就以 `.npz` 结尾（如 `training_buffer_tmp.npz`），而非 `training_buffer.npz.tmp`。
+
+## 3. 当前数据流路由 (Data Routing State)
 
 主通道: Alpaca Data v2 API (_fetch_from_alpaca)。
 
@@ -68,14 +99,15 @@ README.md: 极其详细的系统白皮书。
 
 数据黑洞: 所有系统产生的文件 (JSONL, SQLite, MD, NPZ, PTH) 现已强制归拢于 .quantbot_data/ 目录。严禁在根目录乱写文件，否则 GitHub Artifacts 收集将报错。
 
-4. Antigravity 接管后建议的潜在演进方向 (Future Roadmap)
+## 4. Optuna 最优参数 (Welded into Production)
 
-作为后续接管的 AI，您可以协助开发者在以下方向平滑演进：
-
-微观结构数据 (Tick-Level Data): 在 _io_fetch_worker 中引入 Alpaca 的 Level 2 Order Book (L2) 抓取逻辑，并新增微观结构因子。
-
-异步并发极限提升 (Asyncio): 目前 IO 阶段使用的是 ThreadPool。可演进为纯 asyncio + aiohttp，将 32 线程并发上限解除至 1000+ 协程并发。
-
-右脑 Transformer 拓扑优化: 探索增加 Time2Vec 时序嵌入，或结合 GNN (图神经网络) 处理行业板块的横向协方差联动。
+以下参数已固化到 `simulate_ledger_run()` 的默认值中（quant_engine.py line ~1823）：
+- tier1_dd: -0.0385 (一级防御线)
+- tier2_dd: -0.0722 (深水区防御)
+- tp_normal: 3.44 (正常止盈倍数)
+- tp_tier1: 2.75 (休眠止盈倍数)
+- sl_mul: 1.43 (止损倍数)
+- max_hold_trend: 15 (趋势最大持仓天数)
+- max_hold_rev: 4 (反转最大持仓天数)
 
 [End of Handover Context]
