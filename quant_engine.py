@@ -1945,7 +1945,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
         # --- 🚀 Audit Fix #2: TP/SL 锚定实际入场成本，而非信号日收盘价 ---
         atr_pct_arr = np.array([t.get('_atr_pct', 0.025) for t in valid_trades])
         dynamic_tp = entry_costs * (1 + 3.0 * atr_pct_arr)
-        dynamic_sl = entry_costs * (1 - 1.2 * atr_pct_arr)
+        dynamic_sl = entry_costs * (1 - 1.0 * atr_pct_arr)
         
         actual_exit_prices = exit_closes.copy()
         hit_sl = period_l <= dynamic_sl
@@ -2246,7 +2246,7 @@ def run_historical_replay(days: int = 252) -> None:
                     
                     if score >= Config.Params.MIN_SCORE_THRESHOLD:
                         atr_pct = float(curr['ATR'] / (curr['Close'] + 1e-10))
-                        daily_trades.append({'symbol': sym, 'score': score, 'signals': sig, 'factors': factors, 'tp': float(curr['Close'] + 3.0 * curr['ATR']), 'sl': float(curr['Close'] - 1.2 * curr['ATR']), 'atr_pct': atr_pct})
+                        daily_trades.append({'symbol': sym, 'score': score, 'signals': sig, 'factors': factors, 'tp': float(curr['Close'] + 3.0 * curr['ATR']), 'sl': float(curr['Close'] - 1.0 * curr['ATR']), 'atr_pct': atr_pct})
             except Exception: pass
             
         if daily_trades:
