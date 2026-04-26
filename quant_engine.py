@@ -2356,11 +2356,22 @@ def run_historical_replay(days: int = 252) -> None:
     all_dates = sorted(list(ind_dict[list(ind_dict.keys())[0]].index))
     if len(all_dates) < days: days = len(all_dates) - 1
     
-    logger.info("⏰ 开启时间旅行切片...")
+    logger.info("⏰ 开启时间旅行切片与全量因子解禁 (Factor Realization)...")
+    
+    # 注入大盘基准用于纯 Alpha 和 Beta 计算
+    if "SPY" in df_c.columns and "QQQ" in df_c.columns:
+        ctx.macro_data = {'spy': pd.DataFrame({'Close': df_c["SPY"]}), 'qqq': pd.DataFrame({'Close': df_c["QQQ"]})}
+    else:
+        ctx.macro_data = {}
+        
     for i in range(-days, -1):
         dt = all_dates[i]
         date_str = dt.strftime('%Y-%m-%d')
         daily_trades = []
+        
+        # 动态更新基准切片以防前瞻
+        if "spy" in ctx.macro_data: ctx.spy_close = ctx.macro_data['spy']['Close'].loc[:dt]
+        if "qqq" in ctx.macro_data: ctx.qqq_close = ctx.macro_data['qqq']['Close'].loc[:dt]
         
         for sym, sym_ind in ind_dict.items():
             try:
@@ -2371,9 +2382,15 @@ def run_historical_replay(days: int = 252) -> None:
                     is_vol = bool((curr['Volume'] / (curr['Vol_MA20']+1e-9) > 1.5) and (curr['Close'] > curr['Open']))
                     swing_high_10 = float(sym_ind['High'].iloc[dt_idx-10:dt_idx].max())
                     
-                    stock = StockData(sym, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), curr, prev, is_vol, swing_high_10)
-                    cf = ComplexFeatures(False, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, False, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0) 
-                    alt = AltData(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                    # --- 🌟 因子真实化 (Factor Realization) 解禁 ---
+                    # 截取历史切片传递给右脑特征引擎，彻底激活 AI 对量价背离、波动率收缩和筹码分布的感知
+                    slice_start = max(0, dt_idx - 120)
+                    df_slice = sym_ind.iloc[slice_start:dt_idx+1]
+                    # 为了回测性能，放弃消耗巨大的 df_w 和 df_m 重采样，专注于日线的 KDE、FFT、VWAP
+                    stock = StockData(sym, df_slice, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), curr, prev, is_vol, swing_high_10)
+                    
+                    cf = _extract_complex_features(stock, ctx)
+                    alt = AltData(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) # AltData 因需外部暗池接口，保留中性
                     
                     score, sig, factors, black_swan = _evaluate_omni_matrix(stock, ctx, cf, alt)
                     score, is_bearish_div, sig = _apply_market_filters(curr, prev, sym, score, sig, [], [], [])
