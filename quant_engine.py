@@ -2261,6 +2261,38 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
 • 资金破产概率(DD>50%): {fat_ruin_prob * 100:.2f}%
 • 合成路径中位数收益: {fat_median_ret * 100:.2f}%"""
             
+            # === 📊 Walk-Forward 季度稳定性诊断 ===
+            wf_report = ""
+            try:
+                eq_df['date'] = pd.to_datetime(eq_df['date'])
+                eq_df['quarter'] = eq_df['date'].dt.to_period('Q')
+                quarters = eq_df['quarter'].unique()
+                
+                if len(quarters) >= 2:
+                    q_results = []
+                    for q in quarters:
+                        q_data = eq_df[eq_df['quarter'] == q]
+                        if len(q_data) < 5: continue
+                        q_ret = (q_data['equity'].iloc[-1] / q_data['equity'].iloc[0]) - 1.0
+                        q_peak = q_data['equity'].cummax()
+                        q_dd = ((q_data['equity'] - q_peak) / q_peak).min()
+                        q_daily = q_data['daily_ret']
+                        q_sharpe = float(np.sqrt(252) * q_daily.mean() / (q_daily.std() + 1e-9))
+                        q_results.append({'q': str(q), 'ret': q_ret, 'dd': q_dd, 'sharpe': q_sharpe})
+                    
+                    if q_results:
+                        q_wins = sum(1 for q in q_results if q['ret'] > 0)
+                        wf_lines = [f"\n\n[Walk-Forward 季度稳定性]"]
+                        for q in q_results:
+                            flag = " ⚠️" if q['sharpe'] < 0 else ""
+                            wf_lines.append(f"• {q['q']}: 收益 {q['ret']*100:+.1f}% | 回撤 {q['dd']*100:.1f}% | Sharpe {q['sharpe']:.2f}{flag}")
+                        wf_lines.append(f"• 季度胜率: {q_wins}/{len(q_results)}")
+                        wf_report = "\n".join(wf_lines)
+            except Exception:
+                pass
+            
+            mc_report += wf_report
+            
             # --- [AGENT_FITNESS_SCORE] 输出 ---
             fitness_score = (sharpe * 15.0) + (total_ret * 50.0) - abs(max_dd * 80.0) + (calmar * 5.0)
             
