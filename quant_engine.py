@@ -1833,7 +1833,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                             raw_ml = p.get('ml_features', {})
                             if isinstance(raw_ml, list): ml_feats = {Config.ALL_FACTORS[i]: val for i, val in enumerate(raw_ml + [0.0] * (len(Config.ALL_FACTORS) - len(raw_ml)))}
                             else: ml_feats = raw_ml
-                            trades.append({'date': log['date'], 'vix': macro.get('vix', log.get('vix', 18.0)), 'cred': macro.get('credit_spread_mom', 0.0), 'term': macro.get('vix_term_structure', 1.0), 'pcr': macro.get('market_pcr', 1.0), 'symbol': p['symbol'], 'signals': p.get('signals', []), 'factors': p.get('factors', []), 'ml_features': ml_feats, 'ai_prob': p.get('ai_prob', 0.0), 'tp': p.get('tp', float('inf')), 'sl': p.get('sl', 0)})
+                            trades.append({'date': log['date'], 'vix': macro.get('vix', log.get('vix', 18.0)), 'cred': macro.get('credit_spread_mom', 0.0), 'term': macro.get('vix_term_structure', 1.0), 'pcr': macro.get('market_pcr', 1.0), 'symbol': p['symbol'], 'signals': p.get('signals', []), 'factors': p.get('factors', []), 'ml_features': ml_feats, 'ai_prob': p.get('ai_prob', 0.0), 'tp': p.get('tp', float('inf')), 'sl': p.get('sl', float('-inf')), '_atr_pct': p.get('atr_pct', 0.025)})
                     except Exception: pass
         except Exception: pass
             
@@ -1942,17 +1942,23 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                     period_h[i] = np.nanmax(h_arr[sl_slice, sym_cols[i]])
                     period_l[i] = np.nanmin(l_arr[sl_slice, sym_cols[i]])
         
-        # --- 🚀 Gen-3: 注入底层动态止盈止损 (TP/SL) 截断引擎 ---
-        actual_exit_prices = exit_closes.copy()
-        hit_sl = period_l <= sl_arr
-        hit_tp = period_h >= tp_arr
+        # --- 🚀 Audit Fix #2: TP/SL 锚定实际入场成本，而非信号日收盘价 ---
+        atr_pct_arr = np.array([t.get('_atr_pct', 0.025) for t in valid_trades])
+        dynamic_tp = entry_costs * (1 + 2.5 * atr_pct_arr)
+        dynamic_sl = entry_costs * (1 - 1.5 * atr_pct_arr)
         
-        # 防止缺口套利：如果买入价已经低于 SL，则按最低价结算
-        actual_exit_prices = np.where(hit_sl, np.minimum(sl_arr, entry_opens), actual_exit_prices)
-        actual_exit_prices = np.where(~hit_sl & hit_tp, np.maximum(tp_arr, entry_opens), actual_exit_prices)
+        actual_exit_prices = exit_closes.copy()
+        hit_sl = period_l <= dynamic_sl
+        hit_tp = period_h >= dynamic_tp
+        
+        # 保守原则：同时触发时按止损处理
+        actual_exit_prices = np.where(hit_sl, dynamic_sl, actual_exit_prices)
+        actual_exit_prices = np.where(~hit_sl & hit_tp, dynamic_tp, actual_exit_prices)
         
         exit_revenues = actual_exit_prices * (1 - Config.Params.SLIPPAGE - Config.Params.COMMISSION)
-        returns = (exit_revenues - entry_costs) / (entry_costs + 1e-10) * np.where(gap_up > 0.03, 0.5, 1.0)
+        # --- Audit Fix #5: gap_up 惩罚只缩减仓位（盈利和亏损等比缩放是合理的半仓逻辑） ---
+        gap_position_scale = np.where(gap_up > 0.03, 0.5, 1.0)
+        returns = (exit_revenues - entry_costs) / (entry_costs + 1e-10) * gap_position_scale
         
         # 4. 指标回填与右脑缓存投喂 (极速降维循环)
         for idx, ret in enumerate(returns):
@@ -2105,8 +2111,10 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             for date_str, group in pf_df.groupby('date'):
                 n_trades = len(group)
                 alloc = min(max_pos, 1.0 / n_trades) if n_trades > 0 else 0
+                # --- Audit Fix #3: 总仓位硬性封顶 100%，消除隐性杠杆 ---
+                total_exposure = min(alloc * n_trades, 1.0)
                 avg_ret = group['ret'].mean()
-                daily_ret = alloc * n_trades * avg_ret
+                daily_ret = total_exposure * avg_ret
                 capital *= (1 + daily_ret)
                 equity_data.append({'date': date_str, 'equity': capital, 'daily_ret': daily_ret})
             
@@ -2120,8 +2128,8 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                 calmar = total_ret / abs(max_dd) if max_dd < 0 else 99.0
                 portfolio_metrics = {'total_ret': float(total_ret), 'max_dd': float(max_dd), 'sharpe': float(sharpe), 'calmar': float(calmar)}
                 
-                # --- [AGENT_FITNESS_SCORE] 输出 ---
-                fitness_score = (sharpe * 10.0) + (total_ret * 100.0) - abs(max_dd * 50.0)
+                # --- Audit Fix #7: 重平衡适应度公式，增加回撤惩罚，降低 total_ret 权重 ---
+                fitness_score = (sharpe * 15.0) + (total_ret * 50.0) - abs(max_dd * 80.0) + (calmar * 5.0)
                 print(f"\n[AGENT_FITNESS_SCORE]: {fitness_score:.4f}\n")
                 with open(os.path.join(Config.DATA_DIR, "fitness_score.txt"), "w") as f:
                     f.write(f"[AGENT_FITNESS_SCORE]: {fitness_score:.4f}")
@@ -2179,6 +2187,9 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
 def run_historical_replay(days: int = 252) -> None:
     logger.info(f"⏳ 启动历史重播引擎，回溯天数: {days}")
     ctx = _build_market_context()
+    # --- Audit Fix #6: 强制中性市场制度，避免前瞻偏差 ---
+    ctx.regime = 'range'
+    ctx.w_mul = 1.0
     symbols = get_filtered_watchlist(max_stocks=40)
     
     dfs = []
@@ -2234,7 +2245,8 @@ def run_historical_replay(days: int = 252) -> None:
                     score, is_bearish_div, sig = _apply_market_filters(curr, prev, sym, score, sig, [], [], [])
                     
                     if score >= Config.Params.MIN_SCORE_THRESHOLD:
-                        daily_trades.append({'symbol': sym, 'score': score, 'signals': sig, 'factors': factors, 'tp': float(curr['Close'] + 2.5 * curr['ATR']), 'sl': float(curr['Close'] - 1.5 * curr['ATR'])})
+                        atr_pct = float(curr['ATR'] / (curr['Close'] + 1e-10))
+                        daily_trades.append({'symbol': sym, 'score': score, 'signals': sig, 'factors': factors, 'tp': float(curr['Close'] + 2.5 * curr['ATR']), 'sl': float(curr['Close'] - 1.5 * curr['ATR']), 'atr_pct': atr_pct})
             except Exception: pass
             
         if daily_trades:
