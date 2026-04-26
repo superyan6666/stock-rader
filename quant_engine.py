@@ -2095,7 +2095,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             chunk = syms[i:i + 40]
             for attempt in range(3):
                 try:
-                    chunk_df = yf.download(chunk, period="1y", progress=False, threads=False, timeout=15)
+                    chunk_df = yf.download(chunk, period="2y", progress=False, threads=False, timeout=15)
                     if not chunk_df.empty: 
                         if len(chunk) == 1 and not isinstance(chunk_df.columns, pd.MultiIndex): chunk_df.columns = pd.MultiIndex.from_product([chunk_df.columns, chunk])
                         dfs.append(chunk_df); break
@@ -2219,14 +2219,18 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                 sym, r_dt = t['symbol'], t['date']
                 if TRANSFORMER_AVAILABLE:
                     try:
-                        if sym not in cached_inds: cached_inds[sym] = calculate_indicators(df_all.xs(sym, level=1, axis=1) if isinstance(df_all.columns, pd.MultiIndex) else pd.DataFrame({'Close': df_c[sym], 'Open': df_o[sym], 'High': df_h[sym], 'Low': df_l[sym], 'Volume': 1000000}))
+                        if sym not in cached_inds:
+                            temp_df = df_all.xs(sym, level=1, axis=1).copy() if isinstance(df_all.columns, pd.MultiIndex) else pd.DataFrame({'Close': df_c[sym], 'Open': df_o[sym], 'High': df_h[sym], 'Low': df_l[sym], 'Volume': 1000000})
+                            temp_df.index = pd.to_datetime(temp_df.index).strftime('%Y-%m-%d')
+                            cached_inds[sym] = calculate_indicators(temp_df)
                         ind_df = cached_inds[sym]
                         valid_dates = ind_df.index[ind_df.index <= r_dt]
                         if len(valid_dates) > 0:
                             t_idx = np.where(ind_df.index.get_loc(valid_dates[-1]))[0][-1] if isinstance(ind_df.index.get_loc(valid_dates[-1]), np.ndarray) else (ind_df.index.get_loc(valid_dates[-1]).stop - 1 if isinstance(ind_df.index.get_loc(valid_dates[-1]), slice) else ind_df.index.get_loc(valid_dates[-1]))
                             seq = _get_transformer_seq(ind_df, end_idx=t_idx + 1)
                             if not np.all(seq == 0): transformer_X.append(seq); transformer_Y.append(ret) 
-                    except Exception: pass
+                    except Exception as e:
+                        logger.error(f"Transformer sequence extraction failed for {sym} at {r_dt}: {e}")
                 
                 factor_list = t.get('factors', [])
                 if not factor_list:
