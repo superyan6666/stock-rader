@@ -2401,6 +2401,9 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
         report_md.append(f"\n## 🔬 高级微观因子归因仪表盘 (Alpha Attribution)\n| 高级因子 | 纯因子溢价 (BPS) | 与传统动能耦合度 (Corr) | 触发频率 | 归因诊断 |\n|:---|:---:|:---:|:---:|:---:|")
         for f, data in attr_report.items(): report_md.append(f"| {f} | {data['premium_bps']:+.1f} bps | {data['corr_with_baseline']:.2f} | {data['trigger_rate']*100:.1f}% | {'⚠️ 负溢价' if data['premium_bps'] < 0 else ('⚖️ 高度耦合' if data['corr_with_baseline'] > 0.6 else ('💎 纯净 Alpha' if data['premium_bps'] > 50 and data['corr_with_baseline'] < 0.4 else '✅ 有效增益'))} |")
 
+    # 🔍 硬诊断：无论结果如何都打印状态
+    logger.info(f"🔍 [DIAG] TRANSFORMER_AVAILABLE={TRANSFORMER_AVAILABLE}, transformer_X count={len(transformer_X)}, transformer_Y count={len(transformer_Y)}")
+    
     if TRANSFORMER_AVAILABLE and len(transformer_X) >= 16:
         logger.info(f"🧠 [架构解耦] 已捕获 {len(transformer_X)} 笔三元组时序切片，正压入训练数据共享缓冲区...")
         try:
@@ -2413,6 +2416,10 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             report_md.append(f"\n## 🌌 深度学习右脑 (Transformer) 数据积淀战报\n- **状态**: ✅ 已将 {len(transformer_X)} 笔新样本压入 `.npz` 缓冲区\n- **架构声明**: 训练进程已被物理剥离，请稍后执行 `python train_transformer.py` 唤醒独立算力节点进行闭环代谢。")
             logger.info(f"✅ 样本集成功落盘 (当前总样本池: {len(X_arr)} 笔)。")
         except Exception as e: logger.error(f"⚠️ 缓冲区落盘失败: {e}")
+    elif not TRANSFORMER_AVAILABLE:
+        logger.warning("⚠️ [DIAG] Transformer 模块未加载（torch/quant_transformer 不可用），跳过 .npz 数据采集。")
+    else:
+        logger.warning(f"⚠️ [DIAG] transformer_X 样本数 ({len(transformer_X)}) 不足 16 笔，跳过 .npz 落盘。")
 
     with open(Config.REPORT_FILE, 'w', encoding='utf-8') as f: f.write('\n'.join(report_md))
     

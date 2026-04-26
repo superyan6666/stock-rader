@@ -104,8 +104,9 @@ jobs:
           echo "启动 Transformer 右脑增量训练..."
           set +e
           LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2 numactl --cpunodebind=0 --membind=0 python train_transformer.py
-          if [ -f "error.txt" ]; then echo "🔍 ENCOUNTERED ERRORS:"; cat error.txt; fi
           TRAIN_EXIT=$?
+          echo "🔍 [DIAG] train_transformer.py exited with code: $TRAIN_EXIT"
+          ls -la .quantbot_data/ || echo "⚠️ .quantbot_data/ does not exist!"
           set -e
           case $TRAIN_EXIT in
             0) echo "::notice title=MLOps 换代成功::隐空间权重已进化，准备接管下周实盘流。" ;;
