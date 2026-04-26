@@ -2369,9 +2369,19 @@ def run_historical_replay(days: int = 252) -> None:
         date_str = dt.strftime('%Y-%m-%d')
         daily_trades = []
         
-        # 动态更新基准切片以防前瞻
-        if "spy" in ctx.macro_data: ctx.spy_close = ctx.macro_data['spy']['Close'].loc[:dt]
-        if "qqq" in ctx.macro_data: ctx.qqq_close = ctx.macro_data['qqq']['Close'].loc[:dt]
+        # 动态更新基准切片以防前瞻 (直接替换宏观字典防止触发 is_lite 误判)
+        current_macro = {}
+        if "spy" in ctx.macro_data: current_macro['spy'] = ctx.macro_data['spy'].loc[:dt]
+        if "qqq" in ctx.macro_data: current_macro['qqq'] = ctx.macro_data['qqq'].loc[:dt]
+        ctx.macro_data_slice = current_macro
+        
+        # 修正：不使用 ctx.spy_close 避免 AttributeError，直接利用 ctx.macro_data 逻辑
+        # Wait, inside _extract_complex_features, if not is_lite, it expects ctx.macro_data.get('spy')...
+        # Let's temporarily override ctx.macro_data and ctx.qqq_df with the slice!
+        original_macro = ctx.macro_data
+        original_qqq = ctx.qqq_df
+        ctx.macro_data = current_macro
+        ctx.qqq_df = current_macro.get('qqq', pd.DataFrame())
         
         for sym, sym_ind in ind_dict.items():
             try:
@@ -2398,8 +2408,15 @@ def run_historical_replay(days: int = 252) -> None:
                     if score >= Config.Params.MIN_SCORE_THRESHOLD:
                         atr_pct = float(curr['ATR'] / (curr['Close'] + 1e-10))
                         daily_trades.append({'symbol': sym, 'score': score, 'signals': sig, 'factors': factors, 'tp': float(curr['Close'] + 3.0 * curr['ATR']), 'sl': float(curr['Close'] - 1.2 * curr['ATR']), 'atr_pct': atr_pct})
-            except Exception: pass
+            except Exception as e: 
+                # Print exception for debugging if something else fails
+                # print(f"Error on {sym} {dt}: {e}")
+                pass
             
+        # 恢复 ctx，防止内存占用或引用混乱
+        ctx.macro_data = original_macro
+        ctx.qqq_df = original_qqq
+        
         if daily_trades:
             top_picks = sorted(daily_trades, key=lambda x: x['score'], reverse=True)[:5]
             with open(log_path, 'a', encoding='utf-8') as f:
