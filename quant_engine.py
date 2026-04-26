@@ -2209,7 +2209,9 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                         capital -= alloc_amount
                         
                         atr_pct = sig.get('_atr_pct', 0.025)
-                        tp = entry_cost * (1 + 3.0 * atr_pct)
+                        # 冬眠模式下收紧止盈（2.0×ATR），加速利润回收减少暴露时间
+                        tp_mul = 2.0 if pos_weight < 0.10 else 3.0
+                        tp = entry_cost * (1 + tp_mul * atr_pct)
                         sl = entry_cost * (1 - 1.2 * atr_pct)
                         
                         positions.append({
