@@ -2217,7 +2217,6 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             calmar = total_ret / abs(max_dd) if max_dd < 0 else 99.0
             
             # === 🎲 蒙特卡洛压力测试 (Monte Carlo Stress Test) ===
-            import numpy as np
             daily_returns = eq_df['daily_ret'].values
             n_days = len(daily_returns)
             
