@@ -2100,39 +2100,128 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             trig, not_trig = attr_df[attr_df[f] == 1], attr_df[attr_df[f] == 0]
             attr_report[f] = {'premium_bps': float((trig['ret'].median() - not_trig['ret'].median()) * 10000) if len(trig) > 0 and len(not_trig) > 0 else 0.0, 'corr_with_baseline': float(attr_df[f].corr(attr_df["MACD金叉"]) if len(attr_df) > 1 and not pd.isna(attr_df[f].corr(attr_df["MACD金叉"])) else 0.0), 'trigger_rate': float(len(trig) / len(attr_df)) if len(attr_df) > 0 else 0.0}
 
-    # === 🚀 组合净值曲线生成 (Portfolio-Level Backtest) ===
+    # === 🚀 真实的逐日盯市事件驱动引擎 (Event-Driven Ledger) ===
     portfolio_metrics = {}
-    if len(trades_with_ret) >= 10:
-        pf_df = pd.DataFrame(trades_with_ret).sort_values('date')
-        if 'symbol' in pf_df.columns:
-            capital = 100000.0  # 初始模拟资金 10w
-            max_pos = 0.1       # 单只最高 10% 仓位
-            equity_data = []
-            for date_str, group in pf_df.groupby('date'):
-                n_trades = len(group)
-                alloc = min(max_pos, 1.0 / n_trades) if n_trades > 0 else 0
-                # --- Audit Fix #3: 总仓位硬性封顶 100%，消除隐性杠杆 ---
-                total_exposure = min(alloc * n_trades, 1.0)
-                avg_ret = group['ret'].mean()
-                daily_ret = total_exposure * avg_ret
-                capital *= (1 + daily_ret)
-                equity_data.append({'date': date_str, 'equity': capital, 'daily_ret': daily_ret})
+    if len(valid_trades) >= 10:
+        from collections import defaultdict
+        signals_by_date = defaultdict(list)
+        for t in valid_trades:
+            # t['date'] is a string 'YYYY-MM-DD'
+            signals_by_date[t['date']].append(t)
             
-            if equity_data:
-                eq_df = pd.DataFrame(equity_data)
-                total_ret = (capital / 100000.0) - 1.0
-                peak = eq_df['equity'].cummax()
-                drawdown = (eq_df['equity'] - peak) / peak
-                max_dd = drawdown.min()
-                sharpe = np.sqrt(252) * eq_df['daily_ret'].mean() / (eq_df['daily_ret'].std() + 1e-9)
-                calmar = total_ret / abs(max_dd) if max_dd < 0 else 99.0
-                portfolio_metrics = {'total_ret': float(total_ret), 'max_dd': float(max_dd), 'sharpe': float(sharpe), 'calmar': float(calmar)}
+        all_dates = sorted(list(df_c.index))
+        try:
+            start_date_str = min(t['date'] for t in valid_trades)
+            start_date_pd = pd.to_datetime(start_date_str)
+            start_idx = all_dates.index(start_date_pd) if start_date_pd in all_dates else 0
+        except Exception:
+            start_idx = 0
+            
+        capital = 100000.0  # 初始可用现金 10w
+        equity = 100000.0
+        positions = [] 
+        equity_data = []
+        
+        for current_idx in range(start_idx, len(all_dates)):
+            today = all_dates[current_idx]
+            today_str = today.strftime('%Y-%m-%d') if hasattr(today, 'strftime') else str(today)
+            
+            # --- A. 盘中：检查现有持仓的止盈止损 ---
+            remaining_positions = []
+            for p in positions:
+                sym_col = p['s_col']
+                p['days_held'] += 1
                 
-                # --- Audit Fix #7: 重平衡适应度公式，增加回撤惩罚，降低 total_ret 权重 ---
-                fitness_score = (sharpe * 15.0) + (total_ret * 50.0) - abs(max_dd * 80.0) + (calmar * 5.0)
-                print(f"\n[AGENT_FITNESS_SCORE]: {fitness_score:.4f}\n")
-                with open(os.path.join(Config.DATA_DIR, "fitness_score.txt"), "w") as f:
-                    f.write(f"[AGENT_FITNESS_SCORE]: {fitness_score:.4f}")
+                h_price = h_arr[current_idx, sym_col]
+                l_price = l_arr[current_idx, sym_col]
+                c_price = c_arr[current_idx, sym_col]
+                o_price = o_arr[current_idx, sym_col]
+                
+                hit = False
+                exit_price = np.nan
+                
+                if not np.isnan(o_price) and o_price <= p['sl']:
+                    exit_price, hit = o_price, True
+                elif not np.isnan(o_price) and o_price >= p['tp']:
+                    exit_price, hit = o_price, True
+                elif not np.isnan(l_price) and l_price <= p['sl']:
+                    exit_price, hit = p['sl'], True
+                elif not np.isnan(h_price) and h_price >= p['tp']:
+                    exit_price, hit = p['tp'], True
+                elif p['days_held'] >= 5: # MAX_HOLDING_DAYS
+                    exit_price, hit = c_price, True
+                    
+                if hit and not np.isnan(exit_price):
+                    actual_exit = exit_price * (1 - Config.Params.SLIPPAGE - Config.Params.COMMISSION)
+                    capital += p['shares'] * actual_exit
+                else:
+                    remaining_positions.append(p)
+            
+            positions = remaining_positions
+            
+            # --- B. 盘尾：盯市 (Mark-to-Market) ---
+            current_mv = 0.0
+            for p in positions:
+                cp = c_arr[current_idx, p['s_col']]
+                if not np.isnan(cp): current_mv += p['shares'] * cp
+            
+            equity = capital + current_mv
+            equity_data.append({'date': today_str, 'equity': equity, 'cash': capital})
+            
+            # --- C. 盘后：处理新信号 (预扣资金用于明天开盘买入) ---
+            if current_idx + 1 < len(all_dates):
+                next_day_idx = current_idx + 1
+                today_signals = signals_by_date.get(today_str, [])
+                
+                if today_signals:
+                    today_signals = sorted(today_signals, key=lambda x: x.get('score', 0), reverse=True)
+                    
+                    for sig in today_signals:
+                        if capital <= 1000: break # 资金耗尽
+                            
+                        s_col = sig['_s_col']
+                        entry_open = o_arr[next_day_idx, s_col]
+                        if np.isnan(entry_open) or entry_open <= 0: continue
+                            
+                        # 资金管理：单边最高10%总仓位
+                        alloc_amount = min(equity * 0.10, capital)
+                        if alloc_amount < 1000: continue
+                            
+                        prev_close = c_arr[current_idx, s_col]
+                        gap_up = (entry_open - prev_close) / (prev_close + 1e-10)
+                        slip = Config.Params.SLIPPAGE * 3 if gap_up > 0.03 else Config.Params.SLIPPAGE
+                        entry_cost = entry_open * (1 + slip + Config.Params.COMMISSION)
+                        
+                        shares = alloc_amount / entry_cost
+                        capital -= alloc_amount
+                        
+                        atr_pct = sig.get('_atr_pct', 0.025)
+                        tp = entry_cost * (1 + 3.0 * atr_pct)
+                        sl = entry_cost * (1 - 1.2 * atr_pct)
+                        
+                        positions.append({
+                            'sym': sig['symbol'], 's_col': s_col, 'shares': shares,
+                            'entry_price': entry_cost, 'tp': tp, 'sl': sl, 'days_held': 0
+                        })
+
+        if equity_data:
+            eq_df = pd.DataFrame(equity_data)
+            eq_df['daily_ret'] = eq_df['equity'].pct_change().fillna(0.0)
+            
+            total_ret = (eq_df['equity'].iloc[-1] / 100000.0) - 1.0
+            peak = eq_df['equity'].cummax()
+            drawdown = (eq_df['equity'] - peak) / peak
+            max_dd = drawdown.min()
+            
+            sharpe = np.sqrt(252) * eq_df['daily_ret'].mean() / (eq_df['daily_ret'].std() + 1e-9)
+            calmar = total_ret / abs(max_dd) if max_dd < 0 else 99.0
+            portfolio_metrics = {'total_ret': float(total_ret), 'max_dd': float(max_dd), 'sharpe': float(sharpe), 'calmar': float(calmar)}
+            
+            # --- [AGENT_FITNESS_SCORE] 输出 ---
+            fitness_score = (sharpe * 15.0) + (total_ret * 50.0) - abs(max_dd * 80.0) + (calmar * 5.0)
+            print(f"\n[AGENT_FITNESS_SCORE]: {fitness_score:.4f}\n")
+            with open(os.path.join(Config.DATA_DIR, "fitness_score.txt"), "w") as f:
+                f.write(f"[AGENT_FITNESS_SCORE]: {fitness_score:.4f}")
 
     with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: json.dump({"overall": res, "factors": f_res, "xai_importances": feature_importances_dict, "meta_weights": meta_weights_dict, "attribution": attr_report, "factor_ic": factor_ic_report, "portfolio": portfolio_metrics}, f, indent=4)
     
