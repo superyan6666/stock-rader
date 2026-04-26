@@ -2127,7 +2127,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             today = all_dates[current_idx]
             today_str = today.strftime('%Y-%m-%d') if hasattr(today, 'strftime') else str(today)
             
-            # --- A. 盘中：检查现有持仓的止盈止损 + 🆕 追踪止损 (Trailing Stop) ---
+            # --- A. 盘中：检查现有持仓的止盈止损 ---
             remaining_positions = []
             for p in positions:
                 sym_col = p['s_col']
@@ -2137,17 +2137,6 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                 l_price = l_arr[current_idx, sym_col]
                 c_price = c_arr[current_idx, sym_col]
                 o_price = o_arr[current_idx, sym_col]
-                
-                # 🆕 追踪止损：记录持仓以来最高价，动态上移止损线锁定利润
-                if not np.isnan(h_price):
-                    p['high_since_entry'] = max(p.get('high_since_entry', p['entry_price']), h_price)
-                
-                atr_trail = p.get('atr_val', p['entry_price'] * 0.025)
-                # ✅ 修正: 只有浮盈超过 1×ATR 后才启动追踪，避免日内正常波动触发误杀
-                unrealized_gain = p['high_since_entry'] - p['entry_price']
-                if unrealized_gain > atr_trail:
-                    trail_sl = p['high_since_entry'] - 2.5 * atr_trail  # 加宽至 2.5×ATR
-                    p['sl'] = max(p['sl'], trail_sl)
                 
                 hit = False
                 exit_price = np.nan
@@ -2195,11 +2184,8 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                         entry_open = o_arr[next_day_idx, s_col]
                         if np.isnan(entry_open) or entry_open <= 0: continue
                             
-                        # 🆕 信号质量分层仓位：高分信号获得更多资金
-                        sig_score = sig.get('score', 8)
-                        # 线性加权：8分=8%, 15分=10%, 30分=15% (cap)
-                        weight = min(0.15, 0.08 + max(0, sig_score - 8) * 0.003)
-                        alloc_amount = min(equity * weight, capital)
+                        # 资金管理：单边最高10%总仓位
+                        alloc_amount = min(equity * 0.10, capital)
                         if alloc_amount < 1000: continue
                             
                         prev_close = c_arr[current_idx, s_col]
@@ -2211,14 +2197,12 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                         capital -= alloc_amount
                         
                         atr_pct = sig.get('_atr_pct', 0.025)
-                        atr_val = atr_pct * entry_cost  # ATR 绝对值，用于追踪止损
                         tp = entry_cost * (1 + 3.0 * atr_pct)
                         sl = entry_cost * (1 - 1.2 * atr_pct)
                         
                         positions.append({
                             'sym': sig['symbol'], 's_col': s_col, 'shares': shares,
-                            'entry_price': entry_cost, 'tp': tp, 'sl': sl, 'days_held': 0,
-                            'high_since_entry': entry_cost, 'atr_val': atr_val
+                            'entry_price': entry_cost, 'tp': tp, 'sl': sl, 'days_held': 0
                         })
 
         if equity_data:
