@@ -217,7 +217,8 @@ class QuantContrastiveDataset(Dataset):
 
 def train_alpha_model(features: np.ndarray, returns: np.ndarray, 
                       epochs: int = 50, batch_size: int = 64, lr: float = 3e-4, 
-                      patience: int = 5, device: torch.device = None) -> QuantAlphaTransformer:
+                      patience: int = 5, device: torch.device = None,
+                      existing_model: QuantAlphaTransformer = None) -> QuantAlphaTransformer:
     device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_amp = device.type == 'cuda'
     
@@ -241,7 +242,7 @@ def train_alpha_model(features: np.ndarray, returns: np.ndarray,
     
     logger.info(f"📊 训练流状态: 训练集[{train_end}] | 封锁隔离带[{lookback}] | 验证集[{total_len - val_start}]")
     
-    model = QuantAlphaTransformer().to(device)
+    model = existing_model if existing_model is not None else QuantAlphaTransformer().to(device)
     criterion = AlphaContrastiveLoss(temperature=0.1).to(device)
     optimizer = model.get_optimizer(lr=lr)
     
