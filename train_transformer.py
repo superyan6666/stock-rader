@@ -81,44 +81,20 @@ def run_metabolic_training():
     
     # 4. 执行混合精度 (AMP) 训练管道
     try:
-        # 兼容性调用：传入提取出来的核心重训函数
-        # 若 quant_transformer 中自带完整的 train_alpha_model，则直接挂接
         logger.info("🔥 燃烧算力，启动梯度反向传播与 InfoNCE 对比学习空间重构...")
         
-        # 转换张量
-        tensor_X = torch.tensor(X_train, dtype=torch.float32)
-        tensor_Y = torch.tensor(Y_train, dtype=torch.float32)
-        dataset = TensorDataset(tensor_X, tensor_Y)
-        dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+        # 移交至先进的 AlphaContrastiveLoss 与 Embargo 时序隔离训练流
+        model = train_alpha_model(
+            features=X_train,
+            returns=Y_train,
+            epochs=5,
+            batch_size=BATCH_SIZE,
+            lr=3e-4,
+            patience=3,
+            device=device,
+            existing_model=model
+        )
         
-        optimizer = model.get_optimizer(lr=3e-4, weight_decay=1e-4)
-        scaler = torch.amp.GradScaler(enabled=device.type == 'cuda')
-        criterion = nn.MSELoss() # 基础回归惩罚，结合模型内的 Alpha Head
-        
-        epochs = 5  # 增量代谢只需少批量 Epoch
-        for epoch in range(epochs):
-            total_loss = 0.0
-            for batch_X, batch_Y in dataloader:
-                batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
-                
-                optimizer.zero_grad()
-                with torch.amp.autocast(device_type=device.type, enabled=device.type == 'cuda'):
-                    preds = model(batch_X)
-                    loss = criterion(preds.squeeze(), batch_Y)
-                
-                scaler.scale(loss).backward()
-                # 梯度裁剪防爆炸
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                scaler.step(optimizer)
-                scaler.update()
-                
-                total_loss += loss.item()
-                
-            avg_loss = total_loss / len(dataloader)
-            logger.info(f"   ► Epoch [{epoch+1}/{epochs}] - Loss: {avg_loss:.6f}")
-
         # 5. 固化神经网络记忆 (原子覆写)
         model.save_checkpoint(MODEL_PATH)
         logger.info(f"🏆 右脑重塑完成！新一代权重已刻入系统 ({MODEL_PATH})。")
