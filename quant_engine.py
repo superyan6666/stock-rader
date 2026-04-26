@@ -2180,7 +2180,11 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                             actual_exit = cp * (1 - Config.Params.SLIPPAGE - Config.Params.COMMISSION)
                             capital += p['shares'] * actual_exit
                     positions = []
-                    equity = capital  # 全现金状态
+                    equity = capital
+                    # ✅ 重置峰值基准，防止系统永久锁死在熔断状态
+                    equity_data[-1]['equity'] = equity
+                    # 插入一个"重置标记"，使后续 peak_equity 从新起点计算
+                    equity_data = [{'date': e['date'], 'equity': min(e['equity'], equity), 'cash': e['cash']} for e in equity_data]
             
             # --- C. 盘后：处理新信号 (预扣资金用于明天开盘买入) ---
             if current_idx + 1 < len(all_dates):
