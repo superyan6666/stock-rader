@@ -1820,13 +1820,13 @@ def simulate_ledger_run(valid_trades, all_dates, h_arr, l_arr, c_arr, o_arr, par
     # === 🚀 真实的逐日盯市事件驱动引擎 (Event-Driven Ledger) ===
     portfolio_metrics = {}
     params = params or {}
-    tier2_dd = params.get('tier2_dd', -0.08)
-    tier1_dd = params.get('tier1_dd', -0.05)
-    tp_normal = params.get('tp_normal', 3.0)
-    tp_tier1 = params.get('tp_tier1', 2.0)
-    sl_mul = params.get('sl_mul', 1.2)
-    max_hold_trend = params.get('max_hold_trend', 7)
-    max_hold_rev = params.get('max_hold_rev', 3)
+    tier2_dd = params.get('tier2_dd', -0.0722)
+    tier1_dd = params.get('tier1_dd', -0.0385)
+    tp_normal = params.get('tp_normal', 3.44)
+    tp_tier1 = params.get('tp_tier1', 2.75)
+    sl_mul = params.get('sl_mul', 1.43)
+    max_hold_trend = params.get('max_hold_trend', 15)
+    max_hold_rev = params.get('max_hold_rev', 4)
     pos_weight_normal = params.get('pos_weight_normal', 0.10)
     pos_weight_tier1 = params.get('pos_weight_tier1', 0.05)
     max_entries_normal = params.get('max_entries_normal', 5)
