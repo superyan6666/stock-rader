@@ -2117,10 +2117,11 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
         except Exception:
             start_idx = 0
             
-        capital = 100000.0  # 初始可用现金 10w
+        capital = 100000.0
         equity = 100000.0
         positions = [] 
         equity_data = []
+        dd_peak = 100000.0  # 独立峰值追踪器（清仓后可重置，不影响历史数据）
         
         for current_idx in range(start_idx, len(all_dates)):
             today = all_dates[current_idx]
@@ -2148,7 +2149,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                     exit_price, hit = p['sl'], True
                 elif not np.isnan(h_price) and h_price >= p['tp']:
                     exit_price, hit = p['tp'], True
-                elif p['days_held'] >= p.get('max_hold', 5): # 自适应持仓周期
+                elif p['days_held'] >= p.get('max_hold', 5):
                     exit_price, hit = c_price, True
                     
                 if hit and not np.isnan(exit_price):
@@ -2168,23 +2169,19 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             equity = capital + current_mv
             equity_data.append({'date': today_str, 'equity': equity, 'cash': capital})
             
+            # 更新独立峰值追踪器
+            dd_peak = max(dd_peak, equity)
+            
             # === 🚨 Tier 2 紧急刹车：组合级强制清仓 ===
-            # 当组合回撤超过 -8% 时，立即按收盘价清仓所有持仓
-            # 这不是单笔追踪止损（有 H/L 歧义），而是组合级决策（用收盘价，无歧义）
-            if len(equity_data) >= 5 and positions:
-                peak_eq = max(e['equity'] for e in equity_data)
-                if (equity - peak_eq) / peak_eq < -0.08:
-                    for p in positions:
-                        cp = c_arr[current_idx, p['s_col']]
-                        if not np.isnan(cp):
-                            actual_exit = cp * (1 - Config.Params.SLIPPAGE - Config.Params.COMMISSION)
-                            capital += p['shares'] * actual_exit
-                    positions = []
-                    equity = capital
-                    # ✅ 重置峰值基准，防止系统永久锁死在熔断状态
-                    equity_data[-1]['equity'] = equity
-                    # 插入一个"重置标记"，使后续 peak_equity 从新起点计算
-                    equity_data = [{'date': e['date'], 'equity': min(e['equity'], equity), 'cash': e['cash']} for e in equity_data]
+            if positions and (equity - dd_peak) / dd_peak < -0.08:
+                for p in positions:
+                    cp = c_arr[current_idx, p['s_col']]
+                    if not np.isnan(cp):
+                        actual_exit = cp * (1 - Config.Params.SLIPPAGE - Config.Params.COMMISSION)
+                        capital += p['shares'] * actual_exit
+                positions = []
+                equity = capital
+                dd_peak = equity  # ✅ 重置峰值追踪器（不修改历史数据）
             
             # --- C. 盘后：处理新信号 (预扣资金用于明天开盘买入) ---
             if current_idx + 1 < len(all_dates):
@@ -2196,17 +2193,13 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                     
                     # === 🛡️ 冬眠防御系统 (Hibernation Defense) - 双层熔断 ===
                     # Tier 1: 回撤 >5% → 减半入场（谨慎模式）
-                    # Tier 2: 回撤 >8% → 完全停止入场（全面熔断）
+                    # Tier 2: 回撤 >8% → 强制清仓（已在上方执行）
                     max_daily_entries = 5
                     pos_weight = 0.10
-                    if len(equity_data) >= 5:
-                        peak_equity = max(e['equity'] for e in equity_data)
-                        current_dd = (equity - peak_equity) / peak_equity
-                        if current_dd < -0.08:  # Tier 2: 全面熔断
-                            max_daily_entries = 0
-                        elif current_dd < -0.05:  # Tier 1: 谨慎模式
-                            max_daily_entries = 2
-                            pos_weight = 0.05
+                    current_dd = (equity - dd_peak) / dd_peak if dd_peak > 0 else 0
+                    if current_dd < -0.05:  # Tier 1: 谨慎模式
+                        max_daily_entries = 2
+                        pos_weight = 0.05
                     
                     entries_today = 0
                     for sig in today_signals:
