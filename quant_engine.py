@@ -2219,29 +2219,47 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             # === 🎲 蒙特卡洛压力测试 (Monte Carlo Stress Test) ===
             daily_returns = eq_df['daily_ret'].values
             n_days = len(daily_returns)
-            
-            # 1. 净值重采样 (Equity Bootstrapping) - 10,000 条合成路径
             n_simulations = 10000
-            # 随机有放回抽样生成收益率矩阵 (n_simulations, n_days)
+            
+            # --- Track 1: 正常历史重采样 (Normal Bootstrapping) ---
             mc_matrix = np.random.choice(daily_returns, size=(n_simulations, n_days), replace=True)
-            # 计算每条路径的累计净值 (假设初始为1.0)
             mc_paths = np.cumprod(1 + mc_matrix, axis=1)
-            # 计算每条路径的最终收益和最大回撤
-            mc_total_rets = mc_paths[:, -1] - 1.0
-            mc_peaks = np.maximum.accumulate(mc_paths, axis=1)
-            mc_drawdowns = (mc_paths - mc_peaks) / mc_peaks
+            mc_drawdowns = (mc_paths - np.maximum.accumulate(mc_paths, axis=1)) / np.maximum.accumulate(mc_paths, axis=1)
             mc_max_dds = np.min(mc_drawdowns, axis=1)
             
-            # 统计分布
-            mc_var_95 = float(np.percentile(mc_max_dds, 5)) # 最差5%的回撤 (95% VaR)
-            mc_ruin_prob = float(np.mean(mc_max_dds <= -0.50)) # 破产概率 (回撤 >= 50%的比例)
-            mc_median_ret = float(np.median(mc_total_rets))
+            mc_var_95 = float(np.percentile(mc_max_dds, 5))
+            mc_ruin_prob = float(np.mean(mc_max_dds <= -0.50))
+            mc_median_ret = float(np.median(mc_paths[:, -1] - 1.0))
+            
+            # --- Track 2: 肥尾黑天鹅注入 (Fat-Tail Shock Injection) ---
+            # 每日发生系统性崩盘的概率 (约10年一次)
+            crash_prob = 0.0004 
+            crash_mask = np.random.rand(n_simulations, n_days) < crash_prob
+            
+            # 制造断崖式跳空，无视任何止损，单日暴跌 -15% 到 -25%
+            fat_matrix = mc_matrix.copy()
+            fat_matrix[crash_mask] = np.random.uniform(-0.25, -0.15, size=np.sum(crash_mask))
+            
+            fat_paths = np.cumprod(1 + fat_matrix, axis=1)
+            fat_drawdowns = (fat_paths - np.maximum.accumulate(fat_paths, axis=1)) / np.maximum.accumulate(fat_paths, axis=1)
+            fat_max_dds = np.min(fat_drawdowns, axis=1)
+            
+            fat_var_95 = float(np.percentile(fat_max_dds, 5))
+            fat_ruin_prob = float(np.mean(fat_max_dds <= -0.50))
+            fat_median_ret = float(np.median(fat_paths[:, -1] - 1.0))
             
             mc_report = f"""
 🎲 蒙特卡洛抗压测试 (10,000次重采样):
+
+[和平时期 - 历史重采样]
 • 95%置信度极限回撤: {mc_var_95 * 100:.2f}%
 • 资金破产概率(DD>50%): {mc_ruin_prob * 100:.2f}%
-• 合成路径中位数收益: {mc_median_ret * 100:.2f}%"""
+• 合成路径中位数收益: {mc_median_ret * 100:.2f}%
+
+[黑天鹅降临 - 肥尾熔断攻击 (模拟2008/2020)]
+• 95%置信度极限回撤: {fat_var_95 * 100:.2f}%
+• 资金破产概率(DD>50%): {fat_ruin_prob * 100:.2f}%
+• 合成路径中位数收益: {fat_median_ret * 100:.2f}%"""
             
             # --- [AGENT_FITNESS_SCORE] 输出 ---
             fitness_score = (sharpe * 15.0) + (total_ret * 50.0) - abs(max_dd * 80.0) + (calmar * 5.0)
