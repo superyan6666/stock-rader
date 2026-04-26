@@ -2411,7 +2411,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             if os.path.exists(buf_path):
                 try: existing = np.load(buf_path); X_arr, Y_arr = np.concatenate([existing['X'], X_arr]), np.concatenate([existing['Y'], Y_arr])
                 except Exception: pass
-            temp_buf_path = buf_path + ".tmp"
+            temp_buf_path = os.path.join(Config.DATA_DIR, "training_buffer_tmp.npz")
             np.savez(temp_buf_path, X=X_arr, Y=Y_arr); os.replace(temp_buf_path, buf_path)
             report_md.append(f"\n## 🌌 深度学习右脑 (Transformer) 数据积淀战报\n- **状态**: ✅ 已将 {len(transformer_X)} 笔新样本压入 `.npz` 缓冲区\n- **架构声明**: 训练进程已被物理剥离，请稍后执行 `python train_transformer.py` 唤醒独立算力节点进行闭环代谢。")
             logger.info(f"✅ 样本集成功落盘 (当前总样本池: {len(X_arr)} 笔)。")
