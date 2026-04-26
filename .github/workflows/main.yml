@@ -71,11 +71,11 @@ jobs:
           ulimit -n 65536
           
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            MODE="optuna"
+            MODE="${{ github.event.inputs.run_mode }}"
           elif [[ "${{ github.event_name }}" == "push" ]]; then
-            MODE="optuna"
+            MODE="replay"
           elif [[ "${{ github.event_name }}" == "schedule" ]]; then
-            MODE="optuna"
+            MODE="matrix"
           fi
           
           echo "RUN_MODE=$MODE" >> $GITHUB_ENV
