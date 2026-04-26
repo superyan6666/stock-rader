@@ -71,10 +71,10 @@ def run_metabolic_training():
             logger.info("🔄 已挂载历史母体权重，准备进行增量微调 (Fine-tuning)...")
         except Exception as e:
             logger.warning(f"⚠️ 历史权重读取失败 ({e})，触发重置机制，初始化全新拓扑网络。")
-            model = QuantAlphaTransformer(feature_dim=49, d_model=128, nhead=4, num_layers=3).to(device)
+            model = QuantAlphaTransformer(num_features=49, d_model=64, nhead=8, num_layers=3).to(device)
     else:
         logger.info("🌱 未检测到历史母体，初始化第一代 Alpha 种子拓扑网络。")
-        model = QuantAlphaTransformer(feature_dim=49, d_model=128, nhead=4, num_layers=3).to(device)
+        model = QuantAlphaTransformer(num_features=49, d_model=64, nhead=8, num_layers=3).to(device)
 
     # 3. 剥离并进入专门的训练模式
     model.train()
