@@ -71,17 +71,11 @@ jobs:
           ulimit -n 65536
           
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            MODE="${{ github.event.inputs.run_mode }}"
+            MODE="optuna"
           elif [[ "${{ github.event_name }}" == "push" ]]; then
             MODE="optuna"
           elif [[ "${{ github.event_name }}" == "schedule" ]]; then
-            UTC_H=$(date -u +%-H)
-            UTC_D=$(date -u +%-u)
-            if [[ "$UTC_D" == "5" && "$UTC_H" == "23" ]]; then
-              MODE="backtest"
-            else
-              MODE="matrix"
-            fi
+            MODE="optuna"
           fi
           
           echo "RUN_MODE=$MODE" >> $GITHUB_ENV
