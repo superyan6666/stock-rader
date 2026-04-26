@@ -2142,9 +2142,12 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                 if not np.isnan(h_price):
                     p['high_since_entry'] = max(p.get('high_since_entry', p['entry_price']), h_price)
                 
-                atr_trail = p.get('atr_val', p['entry_price'] * 0.025)  # ATR 绝对值
-                trail_sl = p['high_since_entry'] - 2.0 * atr_trail
-                p['sl'] = max(p['sl'], trail_sl)  # 只升不降
+                atr_trail = p.get('atr_val', p['entry_price'] * 0.025)
+                # ✅ 修正: 只有浮盈超过 1×ATR 后才启动追踪，避免日内正常波动触发误杀
+                unrealized_gain = p['high_since_entry'] - p['entry_price']
+                if unrealized_gain > atr_trail:
+                    trail_sl = p['high_since_entry'] - 2.5 * atr_trail  # 加宽至 2.5×ATR
+                    p['sl'] = max(p['sl'], trail_sl)
                 
                 hit = False
                 exit_price = np.nan
@@ -2194,8 +2197,8 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                             
                         # 🆕 信号质量分层仓位：高分信号获得更多资金
                         sig_score = sig.get('score', 8)
-                        # 指数加权：8分=6%, 15分=8%, 30分=12%, 60分+=15%
-                        weight = min(0.15, 0.04 + 0.02 * np.log1p(sig_score / 5.0))
+                        # 线性加权：8分=8%, 15分=10%, 30分=15% (cap)
+                        weight = min(0.15, 0.08 + max(0, sig_score - 8) * 0.003)
                         alloc_amount = min(equity * weight, capital)
                         if alloc_amount < 1000: continue
                             
