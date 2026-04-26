@@ -2177,16 +2177,16 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                     today_signals = sorted(today_signals, key=lambda x: x.get('score', 0), reverse=True)
                     
                     # === 🛡️ 冬眠防御系统 (Hibernation Defense) ===
-                    # 当净值曲线低于 20 日均线时，策略进入"水下出血"状态
-                    # 自动节流：缩减入场数量和仓位比例，降低心跳频率
+                    # 当净值距历史峰值回撤超过 5% 时，进入防御模式
+                    # 正常牛市的 2-3% 震荡不会触发，只有真正的修正才会激活
                     max_daily_entries = 5
                     pos_weight = 0.10
-                    if len(equity_data) >= 20:
-                        recent_equities = [e['equity'] for e in equity_data[-20:]]
-                        eq_ma20 = sum(recent_equities) / len(recent_equities)
-                        if equity < eq_ma20:
-                            max_daily_entries = 2  # 从 5 缩减至 2
-                            pos_weight = 0.05      # 从 10% 缩减至 5%
+                    if len(equity_data) >= 5:
+                        peak_equity = max(e['equity'] for e in equity_data)
+                        current_dd = (equity - peak_equity) / peak_equity
+                        if current_dd < -0.05:  # 回撤超过 5% 才进入冬眠
+                            max_daily_entries = 2
+                            pos_weight = 0.05
                     
                     entries_today = 0
                     for sig in today_signals:
