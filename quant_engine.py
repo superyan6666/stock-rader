@@ -2176,15 +2176,28 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                 if today_signals:
                     today_signals = sorted(today_signals, key=lambda x: x.get('score', 0), reverse=True)
                     
+                    # === 🛡️ 冬眠防御系统 (Hibernation Defense) ===
+                    # 当净值曲线低于 20 日均线时，策略进入"水下出血"状态
+                    # 自动节流：缩减入场数量和仓位比例，降低心跳频率
+                    max_daily_entries = 5
+                    pos_weight = 0.10
+                    if len(equity_data) >= 20:
+                        recent_equities = [e['equity'] for e in equity_data[-20:]]
+                        eq_ma20 = sum(recent_equities) / len(recent_equities)
+                        if equity < eq_ma20:
+                            max_daily_entries = 2  # 从 5 缩减至 2
+                            pos_weight = 0.05      # 从 10% 缩减至 5%
+                    
+                    entries_today = 0
                     for sig in today_signals:
-                        if capital <= 1000: break # 资金耗尽
+                        if capital <= 1000 or entries_today >= max_daily_entries: break
                             
                         s_col = sig['_s_col']
                         entry_open = o_arr[next_day_idx, s_col]
                         if np.isnan(entry_open) or entry_open <= 0: continue
                             
-                        # 资金管理：单边最高10%总仓位
-                        alloc_amount = min(equity * 0.10, capital)
+                        # 资金管理：动态仓位（正常 10%，冬眠 5%）
+                        alloc_amount = min(equity * pos_weight, capital)
                         if alloc_amount < 1000: continue
                             
                         prev_close = c_arr[current_idx, s_col]
@@ -2203,6 +2216,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                             'sym': sig['symbol'], 's_col': s_col, 'shares': shares,
                             'entry_price': entry_cost, 'tp': tp, 'sl': sl, 'days_held': 0
                         })
+                        entries_today += 1
 
         if equity_data:
             eq_df = pd.DataFrame(equity_data)
