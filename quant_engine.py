@@ -1191,7 +1191,7 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
 
     if alt.insider_net_buy > Config.Params.INSIDER_BUY: add_trigger("内部人集群净买入(Insider)", "👔 [内幕天眼] SEC Form 4 披露高管集群式大额净买入 (权:{fw:.2f}x)", 20, "QUANTUM")
     if alt.analyst_mom > Config.Params.ANALYST_UP: add_trigger("分析师修正动量(Analyst)", f"📊 [投行护航] 分析师评级修正动量突破 Z-Score={alt.analyst_mom:.1f} (权:{{fw:.2f}}x)", 8, "QUANTUM")
-    elif alt.analyst_mom < Config.Params.ANALYST_DN: add_trigger("分析师修正动量(Analyst)", f"⚠️ [投行抛售] 分析师评级下调动量爆表 Z-Score={alt.analyst_mom:.1f}，已被系统降权 (权:{{fw:.2f}}x)", -5, "TREND")
+    elif alt.analyst_mom < Config.Params.ANALYST_DN: add_trigger("分析师修正动量(Analyst)", f"⚠️ [投行抛售] 分析师评级下调动量爆表 Z-Score={alt.analyst_mom:.1f}，已被系统降权 (权:{{fw:.2f}}x)", -10, "TREND")
 
     if macd_crossed and "带量金叉(交互)" in factors_list: theme_scores['TREND'] -= min(get_fw("MACD金叉")*8, get_fw("带量金叉(交互)")*12) * 0.5 
     if cf.pure_alpha > 0.8: add_trigger("独立Alpha(脱钩)", "🪐 [独立Alpha] 强势剥离大盘Beta，爆发特质动能 (权:{fw:.2f}x)", 22, "TREND")
@@ -1249,7 +1249,7 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
 
     macro_gravity = getattr(ctx, 'macro_gravity', False)
     if cf.beta_60d > 1.2 and not macro_gravity: add_trigger("大盘Beta(宏观调整)", "📈 [宏观Beta动能] 宏观低压期，高Beta(>1.2)特质赋予极强上行弹性 (权:{fw:.2f}x)", 7, "TREND")
-    elif cf.beta_60d > 1.2 and macro_gravity: add_trigger("大盘Beta(宏观调整)", "⚠️ [宏观Beta反噬] 宏观引力波高压期，高Beta特质面临深度回撤风险，降权防御 (权:{fw:.2f}x)", -5, "TREND")
+    elif cf.beta_60d > 1.2 and macro_gravity: add_trigger("大盘Beta(宏观调整)", "⚠️ [宏观Beta反噬] 宏观引力波高压期，高Beta特质面临深度回撤风险，降权防御 (权:{fw:.2f}x)", -10, "TREND")
 
     if cf.tlt_corr > 0.4 and getattr(ctx, 'tlt_trend', 1.0) > 0: add_trigger("利率敏感度(TLT相关性)", "🏦 [宏观映射] 与长期国债(TLT)高度正相关且美债处于多头趋势，受益于无风险利率见顶预期 (权:{fw:.2f}x)", 8, "TREND")
     elif cf.tlt_corr < -0.4 and getattr(ctx, 'tlt_trend', 1.0) < 0: add_trigger("利率敏感度(TLT相关性)", "🛡️ [宏观防御] 与长期国债(TLT)高度负相关且美债走弱，具备抗息避险属性 (权:{fw:.2f}x)", 6, "TREND")
@@ -1260,7 +1260,7 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
     if dist_52w > Config.Params.DIST_52W and cf.weekly_bullish: add_trigger("52周高点距离(动能延续)", "🏔️ [动能延续] 逼近 52 周新高且周线多头，上方无抛压阻力真空区 (权:{fw:.2f}x)", 10, "TREND")
         
     amihud_val = stock.curr['Amihud'] if pd.notna(stock.curr['Amihud']) else 0.0
-    if amihud_val > Config.Params.AMIHUD_ILLIQ and macro_gravity: add_trigger("Amihud非流动性(冲击成本)", "⚠️ [流动性枯竭] 宏观高压下 Amihud 冲击成本显著放大，极易发生踩踏被降权 (权:{fw:.2f}x)", -5, "VOLATILITY")
+    if amihud_val > Config.Params.AMIHUD_ILLIQ and macro_gravity: add_trigger("Amihud非流动性(冲击成本)", "⚠️ [流动性枯竭] 宏观高压下 Amihud 冲击成本显著放大，极易发生踩踏被降权 (权:{fw:.2f}x)", -10, "VOLATILITY")
     if cf.vrp > Config.Params.VRP_EXTREME: add_trigger("波动率风险溢价(VRP)", f"🌋 [风险溢价] VRP归一化极度飙升(溢价率>{cf.vrp*100:.1f}%)，期权市场定价极端恐慌，捕捉极值底 (权:{{fw:.2f}}x)", 12, "QUANTUM")
 
     if alt.nlp_score > 0.3:
@@ -1303,8 +1303,7 @@ def _evaluate_omni_matrix(stock: StockData, ctx: Any, cf: ComplexFeatures, alt: 
     return int(final_score_saturated), triggered_list, factors_list, black_swan_risk
 
 def _apply_market_filters(curr, prev, sym, base_score, sig, a, b, c):
-    # [策略改进] RSI 超买惩罚从 -50 软化至 -20，避免过度扼杀强势主升浪
-    if curr['RSI'] > 85.0: return max(0, base_score - 20), False, sig + ["⚠️ 极端超买"]
+    if curr['RSI'] > 80.0: return max(0, base_score - 50), False, sig + ["⚠️ 极端超买"]
     return base_score, False, sig
 
 def _build_market_context() -> MarketContext:
