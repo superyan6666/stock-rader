@@ -134,7 +134,7 @@ class Config:
         # [针对 4C24G ARM 优化] 动态进程池：留出 1 个核心给系统IO和主调度器，避免 OOM 和死锁
         import multiprocessing
         MAX_WORKERS = min(3, multiprocessing.cpu_count() - 1) if multiprocessing.cpu_count() > 1 else 1
-        MIN_SCORE_THRESHOLD = 8.0
+        MIN_SCORE_THRESHOLD = 7.0
         BASE_MAX_RISK = 0.015       
         CROWDING_PENALTY = 0.75     
         CROWDING_MIN_STOCKS = 2     
@@ -1944,7 +1944,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
         
         # --- 🚀 Audit Fix #2: TP/SL 锚定实际入场成本，而非信号日收盘价 ---
         atr_pct_arr = np.array([t.get('_atr_pct', 0.025) for t in valid_trades])
-        dynamic_tp = entry_costs * (1 + 3.5 * atr_pct_arr)
+        dynamic_tp = entry_costs * (1 + 3.0 * atr_pct_arr)
         dynamic_sl = entry_costs * (1 - 1.5 * atr_pct_arr)
         
         actual_exit_prices = exit_closes.copy()
@@ -2246,7 +2246,7 @@ def run_historical_replay(days: int = 252) -> None:
                     
                     if score >= Config.Params.MIN_SCORE_THRESHOLD:
                         atr_pct = float(curr['ATR'] / (curr['Close'] + 1e-10))
-                        daily_trades.append({'symbol': sym, 'score': score, 'signals': sig, 'factors': factors, 'tp': float(curr['Close'] + 3.5 * curr['ATR']), 'sl': float(curr['Close'] - 1.5 * curr['ATR']), 'atr_pct': atr_pct})
+                        daily_trades.append({'symbol': sym, 'score': score, 'signals': sig, 'factors': factors, 'tp': float(curr['Close'] + 3.0 * curr['ATR']), 'sl': float(curr['Close'] - 1.5 * curr['ATR']), 'atr_pct': atr_pct})
             except Exception: pass
             
         if daily_trades:
