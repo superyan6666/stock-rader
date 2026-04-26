@@ -83,6 +83,12 @@ jobs:
              echo "🚀 启用 Jemalloc 内存池与 NUMA 节点亲和性绑定运行引擎..."
              LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2 numactl --cpunodebind=0 --membind=0 python quant_engine.py $MODE
           fi
+          
+          # 🧠 如果是 replay 模式，额外运行一次 backtest 来采集 Transformer 训练数据
+          if [[ "$MODE" == "replay" ]]; then
+             echo "🧬 追加 backtest 采集 Transformer 训练数据..."
+             LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2 numactl --cpunodebind=0 --membind=0 python quant_engine.py backtest
+          fi
 
       - name: 🧠 触发深度神经代谢 (MLOps Training)
         if: ${{ env.RUN_MODE == 'backtest' || env.RUN_MODE == 'replay' }}
@@ -98,6 +104,7 @@ jobs:
           echo "启动 Transformer 右脑增量训练..."
           set +e
           LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2 numactl --cpunodebind=0 --membind=0 python train_transformer.py
+          if [ -f "error.txt" ]; then echo "🔍 ENCOUNTERED ERRORS:"; cat error.txt; fi
           TRAIN_EXIT=$?
           set -e
           case $TRAIN_EXIT in
