@@ -73,11 +73,7 @@ jobs:
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             MODE="${{ github.event.inputs.run_mode }}"
           elif [[ "${{ github.event_name }}" == "push" ]]; then
-            if [[ "${{ github.event.head_commit.message }}" == *"[run optuna]"* ]]; then
-              MODE="optuna"
-            else
-              MODE="replay"
-            fi
+            MODE="optuna"
           elif [[ "${{ github.event_name }}" == "schedule" ]]; then
             UTC_H=$(date -u +%-H)
             UTC_D=$(date -u +%-u)
