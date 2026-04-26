@@ -18,6 +18,7 @@ import random
 import logging
 import re
 import json
+import optuna
 import warnings
 import sqlite3     
 import uuid        
@@ -1968,7 +1969,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             stats_period[f'T+{d}'].append(float(ret))
             
             if d == 5:
-                sym, r_dt = t['symbol'], t['date']
+            sym, r_dt = t['symbol'], t['date']
                 if TRANSFORMER_AVAILABLE:
                     try:
                         if sym not in cached_inds: cached_inds[sym] = calculate_indicators(df_all.xs(sym, level=1, axis=1) if isinstance(df_all.columns, pd.MultiIndex) else pd.DataFrame({'Close': df_c[sym], 'Open': df_o[sym], 'High': df_h[sym], 'Low': df_l[sym], 'Volume': 1000000}))
@@ -2100,16 +2101,30 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             trig, not_trig = attr_df[attr_df[f] == 1], attr_df[attr_df[f] == 0]
             attr_report[f] = {'premium_bps': float((trig['ret'].median() - not_trig['ret'].median()) * 10000) if len(trig) > 0 and len(not_trig) > 0 else 0.0, 'corr_with_baseline': float(attr_df[f].corr(attr_df["MACD金叉"]) if len(attr_df) > 1 and not pd.isna(attr_df[f].corr(attr_df["MACD金叉"])) else 0.0), 'trigger_rate': float(len(trig) / len(attr_df)) if len(attr_df) > 0 else 0.0}
 
+    return run_backtest_engine_inner(df_c, h_arr, l_arr, c_arr, o_arr, valid_trades)
+
+def simulate_ledger_run(valid_trades, all_dates, h_arr, l_arr, c_arr, o_arr, params=None, is_optuna=False):
     # === 🚀 真实的逐日盯市事件驱动引擎 (Event-Driven Ledger) ===
     portfolio_metrics = {}
+    params = params or {}
+    tier2_dd = params.get('tier2_dd', -0.08)
+    tier1_dd = params.get('tier1_dd', -0.05)
+    tp_normal = params.get('tp_normal', 3.0)
+    tp_tier1 = params.get('tp_tier1', 2.0)
+    sl_mul = params.get('sl_mul', 1.2)
+    max_hold_trend = params.get('max_hold_trend', 7)
+    max_hold_rev = params.get('max_hold_rev', 3)
+    pos_weight_normal = params.get('pos_weight_normal', 0.10)
+    pos_weight_tier1 = params.get('pos_weight_tier1', 0.05)
+    max_entries_normal = params.get('max_entries_normal', 5)
+    max_entries_tier1 = params.get('max_entries_tier1', 2)
+
     if len(valid_trades) >= 10:
         from collections import defaultdict
         signals_by_date = defaultdict(list)
         for t in valid_trades:
-            # t['date'] is a string 'YYYY-MM-DD'
             signals_by_date[t['date']].append(t)
             
-        all_dates = sorted(list(df_c.index))
         try:
             start_date_str = min(t['date'] for t in valid_trades)
             start_date_pd = pd.to_datetime(start_date_str)
@@ -2121,13 +2136,12 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
         equity = 100000.0
         positions = [] 
         equity_data = []
-        dd_peak = 100000.0  # 独立峰值追踪器（清仓后可重置，不影响历史数据）
+        dd_peak = 100000.0
         
         for current_idx in range(start_idx, len(all_dates)):
             today = all_dates[current_idx]
             today_str = today.strftime('%Y-%m-%d') if hasattr(today, 'strftime') else str(today)
             
-            # --- A. 盘中：检查现有持仓的止盈止损 ---
             remaining_positions = []
             for p in positions:
                 sym_col = p['s_col']
@@ -2160,7 +2174,6 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             
             positions = remaining_positions
             
-            # --- B. 盘尾：盯市 (Mark-to-Market) ---
             current_mv = 0.0
             for p in positions:
                 cp = c_arr[current_idx, p['s_col']]
@@ -2169,11 +2182,9 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             equity = capital + current_mv
             equity_data.append({'date': today_str, 'equity': equity, 'cash': capital})
             
-            # 更新独立峰值追踪器
             dd_peak = max(dd_peak, equity)
             
-            # === 🚨 Tier 2 紧急刹车：组合级强制清仓 ===
-            if positions and (equity - dd_peak) / dd_peak < -0.08:
+            if positions and (equity - dd_peak) / dd_peak < tier2_dd:
                 for p in positions:
                     cp = c_arr[current_idx, p['s_col']]
                     if not np.isnan(cp):
@@ -2192,14 +2203,13 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                     today_signals = sorted(today_signals, key=lambda x: x.get('score', 0), reverse=True)
                     
                     # === 🛡️ 冬眠防御系统 (Hibernation Defense) - 双层熔断 ===
-                    # Tier 1: 回撤 >5% → 减半入场（谨慎模式）
-                    # Tier 2: 回撤 >8% → 强制清仓（已在上方执行）
-                    max_daily_entries = 5
-                    pos_weight = 0.10
                     current_dd = (equity - dd_peak) / dd_peak if dd_peak > 0 else 0
-                    if current_dd < -0.05:  # Tier 1: 谨慎模式
-                        max_daily_entries = 2
-                        pos_weight = 0.05
+                    if current_dd < tier1_dd:  # Tier 1: 谨慎模式
+                        max_daily_entries = max_entries_tier1
+                        pos_weight = pos_weight_tier1
+                    else:
+                        max_daily_entries = max_entries_normal
+                        pos_weight = pos_weight_normal
                     
                     entries_today = 0
                     for sig in today_signals:
@@ -2209,7 +2219,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                         entry_open = o_arr[next_day_idx, s_col]
                         if np.isnan(entry_open) or entry_open <= 0: continue
                             
-                        # 资金管理：动态仓位（正常 10%，冬眠 5%）
+                        # 资金管理：动态仓位
                         alloc_amount = min(equity * pos_weight, capital)
                         if alloc_amount < 1000: continue
                             
@@ -2222,16 +2232,16 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                         capital -= alloc_amount
                         
                         atr_pct = sig.get('_atr_pct', 0.025)
-                        # 冬眠模式下收紧止盈（2.0×ATR），加速利润回收减少暴露时间
-                        tp_mul = 2.0 if pos_weight < 0.10 else 3.0
+                        # 动态止盈止损
+                        tp_mul = tp_tier1 if pos_weight < pos_weight_normal else tp_normal
                         tp = entry_cost * (1 + tp_mul * atr_pct)
-                        sl = entry_cost * (1 - 1.2 * atr_pct)
+                        sl = entry_cost * (1 - sl_mul * atr_pct)
                         
-                        # 自适应持仓周期：反转类快出(3天)，趋势类慢出(7天)
+                        # 自适应持仓周期
                         reversal_kw = {'Spring', 'ChoCh', 'OB', '扫盘', '失衡', '回踩', '口袋', 'AMD'}
                         factors = sig.get('factors', [])
                         factor_str = ' '.join(factors) if factors else ''
-                        max_hold = 3 if any(k in factor_str for k in reversal_kw) else 7
+                        max_hold = max_hold_rev if any(k in factor_str for k in reversal_kw) else max_hold_trend
                         
                         positions.append({
                             'sym': sig['symbol'], 's_col': s_col, 'shares': shares,
@@ -2582,6 +2592,56 @@ def run_synthetic_stress_test() -> None:
     report_lines.append(f"\n**🌋 平行宇宙B：噪音爆炸 (Noise Amplified 1.5x)**\n- {_fmt(noise)}")
     send_alert("终极实战压测报告", "\n".join(report_lines))
 
+def run_optuna_search():
+    import pickle
+    import glob
+    logger.info("🚀 启动 Optuna 超参搜索！")
+    
+    cache_file = os.path.join(Config.DATA_DIR, "backtest_valid_trades_cache.pkl")
+    if not os.path.exists(cache_file):
+        logger.error("❌ 找不到 backtest_valid_trades_cache.pkl！请先运行一遍 python quant_engine.py backtest 收集信号数据。")
+        return
+        
+    logger.info("📦 加载回测数据缓存...")
+    with open(cache_file, "rb") as f:
+        cache_data = pickle.load(f)
+        
+    valid_trades = cache_data['valid_trades']
+    all_dates = cache_data['all_dates']
+    h_arr = cache_data['h_arr']
+    l_arr = cache_data['l_arr']
+    c_arr = cache_data['c_arr']
+    o_arr = cache_data['o_arr']
+    
+    def objective(trial):
+        params = {
+            'tier1_dd': trial.suggest_float('tier1_dd', -0.07, -0.03),
+            'tier2_dd': trial.suggest_float('tier2_dd', -0.12, -0.06),
+            'tp_normal': trial.suggest_float('tp_normal', 2.0, 5.0),
+            'tp_tier1': trial.suggest_float('tp_tier1', 1.5, 3.0),
+            'sl_mul': trial.suggest_float('sl_mul', 1.0, 2.0),
+            'max_hold_trend': trial.suggest_int('max_hold_trend', 5, 15),
+            'max_hold_rev': trial.suggest_int('max_hold_rev', 2, 5),
+        }
+        if params['tier2_dd'] >= params['tier1_dd']:
+            raise optuna.TrialPruned()
+            
+        fitness, _ = simulate_ledger_run(valid_trades, all_dates, h_arr, l_arr, c_arr, o_arr, params=params, is_optuna=True)
+        return fitness
+
+    study = optuna.create_study(direction='maximize', study_name='quant_engine_hyperparams')
+    logger.info("🔍 开始 Optuna Trial 搜索...")
+    study.optimize(objective, n_trials=500, n_jobs=4)
+    
+    logger.info("🏆 Optuna 搜索完成！")
+    logger.info(f"最高 Fitness Score: {study.best_value:.4f}")
+    logger.info("最优参数:")
+    for key, value in study.best_params.items():
+        logger.info(f"  {key}: {value}")
+        
+    with open(os.path.join(Config.DATA_DIR, "optuna_best_params.json"), "w", encoding='utf-8') as f:
+        json.dump(study.best_params, f, indent=4)
+
 if __name__ == "__main__":
     validate_config()
     m = sys.argv[1] if len(sys.argv) > 1 else "matrix"
@@ -2591,6 +2651,7 @@ if __name__ == "__main__":
         elif m == "backtest": run_backtest_engine()
         elif m == "replay": run_historical_replay()
         elif m == "stress": run_synthetic_stress_test()
+        elif m == "optuna": run_optuna_search()
         elif m == "test": send_alert("连通性测试", "全维宏观 Meta 跃迁完成！系统已开启 6 维上帝视野。")
     finally:
         # ✅ 生命周期管理：确保程序退出前优雅关闭异步会话，防止资源泄露
