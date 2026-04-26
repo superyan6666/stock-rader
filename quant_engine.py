@@ -1814,8 +1814,7 @@ def run_gateway():
     ExecutionEngine(broker).run()
 
 # ================= 7. 回测引擎与抗噪验证 =================
-            return fitness_score, portfolio_metrics
-    return -9999.0, portfolio_metrics
+
 
 def simulate_ledger_run(valid_trades, all_dates, h_arr, l_arr, c_arr, o_arr, params=None, is_optuna=False):
     # === 🚀 真实的逐日盯市事件驱动引擎 (Event-Driven Ledger) ===
