@@ -2215,7 +2215,43 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             
             sharpe = np.sqrt(252) * eq_df['daily_ret'].mean() / (eq_df['daily_ret'].std() + 1e-9)
             calmar = total_ret / abs(max_dd) if max_dd < 0 else 99.0
-            portfolio_metrics = {'total_ret': float(total_ret), 'max_dd': float(max_dd), 'sharpe': float(sharpe), 'calmar': float(calmar)}
+            
+            # === 🎲 蒙特卡洛压力测试 (Monte Carlo Stress Test) ===
+            import numpy as np
+            daily_returns = eq_df['daily_ret'].values
+            n_days = len(daily_returns)
+            
+            # 1. 净值重采样 (Equity Bootstrapping) - 10,000 条合成路径
+            n_simulations = 10000
+            # 随机有放回抽样生成收益率矩阵 (n_simulations, n_days)
+            mc_matrix = np.random.choice(daily_returns, size=(n_simulations, n_days), replace=True)
+            # 计算每条路径的累计净值 (假设初始为1.0)
+            mc_paths = np.cumprod(1 + mc_matrix, axis=1)
+            # 计算每条路径的最终收益和最大回撤
+            mc_total_rets = mc_paths[:, -1] - 1.0
+            mc_peaks = np.maximum.accumulate(mc_paths, axis=1)
+            mc_drawdowns = (mc_paths - mc_peaks) / mc_peaks
+            mc_max_dds = np.min(mc_drawdowns, axis=1)
+            
+            # 统计分布
+            mc_var_95 = float(np.percentile(mc_max_dds, 5)) # 最差5%的回撤 (95% VaR)
+            mc_ruin_prob = float(np.mean(mc_max_dds <= -0.50)) # 破产概率 (回撤 >= 50%的比例)
+            mc_median_ret = float(np.median(mc_total_rets))
+            
+            print(f"\n🎲 蒙特卡洛压力测试 (10,000 次模拟):")
+            print(f"   - 95% 置信度极限回撤 (VaR): {mc_var_95 * 100:.2f}%")
+            print(f"   - 资金破产概率 (DD > 50%): {mc_ruin_prob * 100:.2f}%")
+            print(f"   - 蒙特卡洛合成中位数收益: {mc_median_ret * 100:.2f}%\n")
+            
+            portfolio_metrics = {
+                'total_ret': float(total_ret), 
+                'max_dd': float(max_dd), 
+                'sharpe': float(sharpe), 
+                'calmar': float(calmar),
+                'mc_var_95': mc_var_95,
+                'mc_ruin_prob': mc_ruin_prob,
+                'mc_median_ret': mc_median_ret
+            }
             
             # --- [AGENT_FITNESS_SCORE] 输出 ---
             fitness_score = (sharpe * 15.0) + (total_ret * 50.0) - abs(max_dd * 80.0) + (calmar * 5.0)
