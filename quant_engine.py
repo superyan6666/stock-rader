@@ -2168,6 +2168,20 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             equity = capital + current_mv
             equity_data.append({'date': today_str, 'equity': equity, 'cash': capital})
             
+            # === 🚨 Tier 2 紧急刹车：组合级强制清仓 ===
+            # 当组合回撤超过 -8% 时，立即按收盘价清仓所有持仓
+            # 这不是单笔追踪止损（有 H/L 歧义），而是组合级决策（用收盘价，无歧义）
+            if len(equity_data) >= 5 and positions:
+                peak_eq = max(e['equity'] for e in equity_data)
+                if (equity - peak_eq) / peak_eq < -0.08:
+                    for p in positions:
+                        cp = c_arr[current_idx, p['s_col']]
+                        if not np.isnan(cp):
+                            actual_exit = cp * (1 - Config.Params.SLIPPAGE - Config.Params.COMMISSION)
+                            capital += p['shares'] * actual_exit
+                    positions = []
+                    equity = capital  # 全现金状态
+            
             # --- C. 盘后：处理新信号 (预扣资金用于明天开盘买入) ---
             if current_idx + 1 < len(all_dates):
                 next_day_idx = current_idx + 1
