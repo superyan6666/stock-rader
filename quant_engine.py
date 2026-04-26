@@ -1814,6 +1814,254 @@ def run_gateway():
     ExecutionEngine(broker).run()
 
 # ================= 7. 回测引擎与抗噪验证 =================
+            return fitness_score, portfolio_metrics
+    return -9999.0, portfolio_metrics
+
+def simulate_ledger_run(valid_trades, all_dates, h_arr, l_arr, c_arr, o_arr, params=None, is_optuna=False):
+    # === 🚀 真实的逐日盯市事件驱动引擎 (Event-Driven Ledger) ===
+    portfolio_metrics = {}
+    params = params or {}
+    tier2_dd = params.get('tier2_dd', -0.08)
+    tier1_dd = params.get('tier1_dd', -0.05)
+    tp_normal = params.get('tp_normal', 3.0)
+    tp_tier1 = params.get('tp_tier1', 2.0)
+    sl_mul = params.get('sl_mul', 1.2)
+    max_hold_trend = params.get('max_hold_trend', 7)
+    max_hold_rev = params.get('max_hold_rev', 3)
+    pos_weight_normal = params.get('pos_weight_normal', 0.10)
+    pos_weight_tier1 = params.get('pos_weight_tier1', 0.05)
+    max_entries_normal = params.get('max_entries_normal', 5)
+    max_entries_tier1 = params.get('max_entries_tier1', 2)
+
+    if len(valid_trades) >= 10:
+        from collections import defaultdict
+        signals_by_date = defaultdict(list)
+        for t in valid_trades:
+            signals_by_date[t['date']].append(t)
+            
+        try:
+            start_date_str = min(t['date'] for t in valid_trades)
+            start_date_pd = pd.to_datetime(start_date_str)
+            start_idx = all_dates.index(start_date_pd) if start_date_pd in all_dates else 0
+        except Exception:
+            start_idx = 0
+            
+        capital = 100000.0
+        equity = 100000.0
+        positions = [] 
+        equity_data = []
+        dd_peak = 100000.0
+        
+        for current_idx in range(start_idx, len(all_dates)):
+            today = all_dates[current_idx]
+            today_str = today.strftime('%Y-%m-%d') if hasattr(today, 'strftime') else str(today)
+            
+            remaining_positions = []
+            for p in positions:
+                sym_col = p['s_col']
+                p['days_held'] += 1
+                
+                h_price = h_arr[current_idx, sym_col]
+                l_price = l_arr[current_idx, sym_col]
+                c_price = c_arr[current_idx, sym_col]
+                o_price = o_arr[current_idx, sym_col]
+                
+                hit = False
+                exit_price = np.nan
+                
+                if not np.isnan(o_price) and o_price <= p['sl']:
+                    exit_price, hit = o_price, True
+                elif not np.isnan(o_price) and o_price >= p['tp']:
+                    exit_price, hit = o_price, True
+                elif not np.isnan(l_price) and l_price <= p['sl']:
+                    exit_price, hit = p['sl'], True
+                elif not np.isnan(h_price) and h_price >= p['tp']:
+                    exit_price, hit = p['tp'], True
+                elif p['days_held'] >= p.get('max_hold', 5):
+                    exit_price, hit = c_price, True
+                    
+                if hit and not np.isnan(exit_price):
+                    actual_exit = exit_price * (1 - Config.Params.SLIPPAGE - Config.Params.COMMISSION)
+                    capital += p['shares'] * actual_exit
+                else:
+                    remaining_positions.append(p)
+            
+            positions = remaining_positions
+            
+            current_mv = 0.0
+            for p in positions:
+                cp = c_arr[current_idx, p['s_col']]
+                if not np.isnan(cp): current_mv += p['shares'] * cp
+            
+            equity = capital + current_mv
+            equity_data.append({'date': today_str, 'equity': equity, 'cash': capital})
+            
+            dd_peak = max(dd_peak, equity)
+            
+            if positions and (equity - dd_peak) / dd_peak < tier2_dd:
+                for p in positions:
+                    cp = c_arr[current_idx, p['s_col']]
+                    if not np.isnan(cp):
+                        actual_exit = cp * (1 - Config.Params.SLIPPAGE - Config.Params.COMMISSION)
+                        capital += p['shares'] * actual_exit
+                positions = []
+                equity = capital
+                dd_peak = equity  # ✅ 重置峰值追踪器（不修改历史数据）
+            
+            # --- C. 盘后：处理新信号 (预扣资金用于明天开盘买入) ---
+            if current_idx + 1 < len(all_dates):
+                next_day_idx = current_idx + 1
+                today_signals = signals_by_date.get(today_str, [])
+                
+                if today_signals:
+                    today_signals = sorted(today_signals, key=lambda x: x.get('score', 0), reverse=True)
+                    
+                    # === 🛡️ 冬眠防御系统 (Hibernation Defense) - 双层熔断 ===
+                    current_dd = (equity - dd_peak) / dd_peak if dd_peak > 0 else 0
+                    if current_dd < tier1_dd:  # Tier 1: 谨慎模式
+                        max_daily_entries = max_entries_tier1
+                        pos_weight = pos_weight_tier1
+                    else:
+                        max_daily_entries = max_entries_normal
+                        pos_weight = pos_weight_normal
+                    
+                    entries_today = 0
+                    for sig in today_signals:
+                        if capital <= 1000 or entries_today >= max_daily_entries: break
+                            
+                        s_col = sig['_s_col']
+                        entry_open = o_arr[next_day_idx, s_col]
+                        if np.isnan(entry_open) or entry_open <= 0: continue
+                            
+                        # 资金管理：动态仓位
+                        alloc_amount = min(equity * pos_weight, capital)
+                        if alloc_amount < 1000: continue
+                            
+                        prev_close = c_arr[current_idx, s_col]
+                        gap_up = (entry_open - prev_close) / (prev_close + 1e-10)
+                        slip = Config.Params.SLIPPAGE * 3 if gap_up > 0.03 else Config.Params.SLIPPAGE
+                        entry_cost = entry_open * (1 + slip + Config.Params.COMMISSION)
+                        
+                        shares = alloc_amount / entry_cost
+                        capital -= alloc_amount
+                        
+                        atr_pct = sig.get('_atr_pct', 0.025)
+                        # 动态止盈止损
+                        tp_mul = tp_tier1 if pos_weight < pos_weight_normal else tp_normal
+                        tp = entry_cost * (1 + tp_mul * atr_pct)
+                        sl = entry_cost * (1 - sl_mul * atr_pct)
+                        
+                        # 自适应持仓周期
+                        reversal_kw = {'Spring', 'ChoCh', 'OB', '扫盘', '失衡', '回踩', '口袋', 'AMD'}
+                        factors = sig.get('factors', [])
+                        factor_str = ' '.join(factors) if factors else ''
+                        max_hold = max_hold_rev if any(k in factor_str for k in reversal_kw) else max_hold_trend
+                        
+                        positions.append({
+                            'sym': sig['symbol'], 's_col': s_col, 'shares': shares,
+                            'entry_price': entry_cost, 'tp': tp, 'sl': sl, 'days_held': 0,
+                            'max_hold': max_hold
+                        })
+                        entries_today += 1
+
+        if equity_data:
+            eq_df = pd.DataFrame(equity_data)
+            eq_df['daily_ret'] = eq_df['equity'].pct_change().fillna(0.0)
+            
+            total_ret = (eq_df['equity'].iloc[-1] / 100000.0) - 1.0
+            peak = eq_df['equity'].cummax()
+            drawdown = (eq_df['equity'] - peak) / peak
+            max_dd = drawdown.min()
+            
+            sharpe = np.sqrt(252) * eq_df['daily_ret'].mean() / (eq_df['daily_ret'].std() + 1e-9)
+            calmar = total_ret / abs(max_dd) if max_dd < 0 else 99.0
+            
+            # === 🎲 蒙特卡洛压力测试 (Monte Carlo Stress Test) ===
+            daily_returns = eq_df['daily_ret'].values
+            n_days = len(daily_returns)
+            n_simulations = 10000
+            
+            # --- Track 1: 正常历史重采样 (Normal Bootstrapping) ---
+            mc_matrix = np.random.choice(daily_returns, size=(n_simulations, n_days), replace=True)
+            mc_paths = np.cumprod(1 + mc_matrix, axis=1)
+            mc_drawdowns = (mc_paths - np.maximum.accumulate(mc_paths, axis=1)) / np.maximum.accumulate(mc_paths, axis=1)
+            mc_max_dds = np.min(mc_drawdowns, axis=1)
+            
+            mc_var_95 = float(np.percentile(mc_max_dds, 5))
+            mc_ruin_prob = float(np.mean(mc_max_dds <= -0.50))
+            mc_median_ret = float(np.median(mc_paths[:, -1] - 1.0))
+            
+            # --- Track 2: 肥尾黑天鹅注入 (Fat-Tail Shock Injection) ---
+            # 每日发生系统性崩盘的概率 (约10年一次)
+            crash_prob = 0.0004 
+            crash_mask = np.random.rand(n_simulations, n_days) < crash_prob
+            
+            # 制造断崖式跳空，无视任何止损，单日暴跌 -15% 到 -25%
+            fat_matrix = mc_matrix.copy()
+            fat_matrix[crash_mask] = np.random.uniform(-0.25, -0.15, size=np.sum(crash_mask))
+            
+            fat_paths = np.cumprod(1 + fat_matrix, axis=1)
+            fat_drawdowns = (fat_paths - np.maximum.accumulate(fat_paths, axis=1)) / np.maximum.accumulate(fat_paths, axis=1)
+            fat_max_dds = np.min(fat_drawdowns, axis=1)
+            
+            fat_var_95 = float(np.percentile(fat_max_dds, 5))
+            fat_ruin_prob = float(np.mean(fat_max_dds <= -0.50))
+            fat_median_ret = float(np.median(fat_paths[:, -1] - 1.0))
+            
+            mc_report = f"""
+🎲 蒙特卡洛抗压测试 (10,000次重采样):
+
+[和平时期 - 历史重采样]
+• 95%置信度极限回撤: {mc_var_95 * 100:.2f}%
+• 资金破产概率(DD>50%): {mc_ruin_prob * 100:.2f}%
+• 合成路径中位数收益: {mc_median_ret * 100:.2f}%
+
+[黑天鹅降临 - 肥尾熔断攻击 (模拟2008/2020)]
+• 95%置信度极限回撤: {fat_var_95 * 100:.2f}%
+• 资金破产概率(DD>50%): {fat_ruin_prob * 100:.2f}%
+• 合成路径中位数收益: {fat_median_ret * 100:.2f}%"""
+            
+            # === 📊 Walk-Forward 季度稳定性诊断 ===
+            wf_report = ""
+            try:
+                eq_df['date'] = pd.to_datetime(eq_df['date'])
+                eq_df['quarter'] = eq_df['date'].dt.to_period('Q')
+                quarters = eq_df['quarter'].unique()
+                
+                if len(quarters) >= 2:
+                    q_results = []
+                    for q in quarters:
+                        q_data = eq_df[eq_df['quarter'] == q]
+                        if len(q_data) < 5: continue
+                        q_ret = (q_data['equity'].iloc[-1] / q_data['equity'].iloc[0]) - 1.0
+                        q_peak = q_data['equity'].cummax()
+                        q_dd = ((q_data['equity'] - q_peak) / q_peak).min()
+                        q_daily = q_data['daily_ret']
+                        q_sharpe = float(np.sqrt(252) * q_daily.mean() / (q_daily.std() + 1e-9))
+                        q_results.append({'q': str(q), 'ret': q_ret, 'dd': q_dd, 'sharpe': q_sharpe})
+                    
+                    if q_results:
+                        q_wins = sum(1 for q in q_results if q['ret'] > 0)
+                        wf_lines = [f"\n\n[Walk-Forward 季度稳定性]"]
+                        for q in q_results:
+                            flag = " ⚠️" if q['sharpe'] < 0 else ""
+                            wf_lines.append(f"• {q['q']}: 收益 {q['ret']*100:+.1f}% | 回撤 {q['dd']*100:.1f}% | Sharpe {q['sharpe']:.2f}{flag}")
+                        wf_lines.append(f"• 季度胜率: {q_wins}/{len(q_results)}")
+                        wf_report = "\n".join(wf_lines)
+            except Exception:
+                pass
+            
+            mc_report += wf_report
+            
+            # --- [AGENT_FITNESS_SCORE] 输出 ---
+            fitness_score = (sharpe * 15.0) + (total_ret * 50.0) - abs(max_dd * 80.0) + (calmar * 5.0)
+            
+            print(f"\n[AGENT_FITNESS_SCORE]: {fitness_score:.4f}\n{mc_report}\n")
+            with open(os.path.join(Config.DATA_DIR, "fitness_score.txt"), "w", encoding='utf-8') as f:
+                f.write(f"[AGENT_FITNESS_SCORE]: {fitness_score:.4f}\n{mc_report}")
+            return fitness_score, portfolio_metrics
+    return -9999.0, portfolio_metrics
+
 def run_backtest_engine(replay_mode: bool = False) -> None:
     if replay_mode:
         log_files = [os.path.join(Config.DATA_DIR, 'backtest_log_replay.jsonl')]
@@ -2101,250 +2349,26 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
             trig, not_trig = attr_df[attr_df[f] == 1], attr_df[attr_df[f] == 0]
             attr_report[f] = {'premium_bps': float((trig['ret'].median() - not_trig['ret'].median()) * 10000) if len(trig) > 0 and len(not_trig) > 0 else 0.0, 'corr_with_baseline': float(attr_df[f].corr(attr_df["MACD金叉"]) if len(attr_df) > 1 and not pd.isna(attr_df[f].corr(attr_df["MACD金叉"])) else 0.0), 'trigger_rate': float(len(trig) / len(attr_df)) if len(attr_df) > 0 else 0.0}
 
-    return run_backtest_engine_inner(df_c, h_arr, l_arr, c_arr, o_arr, valid_trades)
+    all_dates = sorted(list(df_c.index))
+    
+    import pickle
+    cache_file = os.path.join(Config.DATA_DIR, "backtest_valid_trades_cache.pkl")
+    try:
+        with open(cache_file, "wb") as f:
+            pickle.dump({
+                'valid_trades': valid_trades,
+                'all_dates': all_dates,
+                'h_arr': h_arr,
+                'l_arr': l_arr,
+                'c_arr': c_arr,
+                'o_arr': o_arr
+            }, f)
+        logger.info(f"✅ 回测数据已缓存至 {cache_file}，现在您可以运行 optuna 搜索最优参数！")
+    except Exception as e:
+        logger.error(f"⚠️ 缓存回测数据失败: {e}")
 
-def simulate_ledger_run(valid_trades, all_dates, h_arr, l_arr, c_arr, o_arr, params=None, is_optuna=False):
-    # === 🚀 真实的逐日盯市事件驱动引擎 (Event-Driven Ledger) ===
-    portfolio_metrics = {}
-    params = params or {}
-    tier2_dd = params.get('tier2_dd', -0.08)
-    tier1_dd = params.get('tier1_dd', -0.05)
-    tp_normal = params.get('tp_normal', 3.0)
-    tp_tier1 = params.get('tp_tier1', 2.0)
-    sl_mul = params.get('sl_mul', 1.2)
-    max_hold_trend = params.get('max_hold_trend', 7)
-    max_hold_rev = params.get('max_hold_rev', 3)
-    pos_weight_normal = params.get('pos_weight_normal', 0.10)
-    pos_weight_tier1 = params.get('pos_weight_tier1', 0.05)
-    max_entries_normal = params.get('max_entries_normal', 5)
-    max_entries_tier1 = params.get('max_entries_tier1', 2)
+    fitness_score, portfolio_metrics = simulate_ledger_run(valid_trades, all_dates, h_arr, l_arr, c_arr, o_arr, params=None, is_optuna=False)
 
-    if len(valid_trades) >= 10:
-        from collections import defaultdict
-        signals_by_date = defaultdict(list)
-        for t in valid_trades:
-            signals_by_date[t['date']].append(t)
-            
-        try:
-            start_date_str = min(t['date'] for t in valid_trades)
-            start_date_pd = pd.to_datetime(start_date_str)
-            start_idx = all_dates.index(start_date_pd) if start_date_pd in all_dates else 0
-        except Exception:
-            start_idx = 0
-            
-        capital = 100000.0
-        equity = 100000.0
-        positions = [] 
-        equity_data = []
-        dd_peak = 100000.0
-        
-        for current_idx in range(start_idx, len(all_dates)):
-            today = all_dates[current_idx]
-            today_str = today.strftime('%Y-%m-%d') if hasattr(today, 'strftime') else str(today)
-            
-            remaining_positions = []
-            for p in positions:
-                sym_col = p['s_col']
-                p['days_held'] += 1
-                
-                h_price = h_arr[current_idx, sym_col]
-                l_price = l_arr[current_idx, sym_col]
-                c_price = c_arr[current_idx, sym_col]
-                o_price = o_arr[current_idx, sym_col]
-                
-                hit = False
-                exit_price = np.nan
-                
-                if not np.isnan(o_price) and o_price <= p['sl']:
-                    exit_price, hit = o_price, True
-                elif not np.isnan(o_price) and o_price >= p['tp']:
-                    exit_price, hit = o_price, True
-                elif not np.isnan(l_price) and l_price <= p['sl']:
-                    exit_price, hit = p['sl'], True
-                elif not np.isnan(h_price) and h_price >= p['tp']:
-                    exit_price, hit = p['tp'], True
-                elif p['days_held'] >= p.get('max_hold', 5):
-                    exit_price, hit = c_price, True
-                    
-                if hit and not np.isnan(exit_price):
-                    actual_exit = exit_price * (1 - Config.Params.SLIPPAGE - Config.Params.COMMISSION)
-                    capital += p['shares'] * actual_exit
-                else:
-                    remaining_positions.append(p)
-            
-            positions = remaining_positions
-            
-            current_mv = 0.0
-            for p in positions:
-                cp = c_arr[current_idx, p['s_col']]
-                if not np.isnan(cp): current_mv += p['shares'] * cp
-            
-            equity = capital + current_mv
-            equity_data.append({'date': today_str, 'equity': equity, 'cash': capital})
-            
-            dd_peak = max(dd_peak, equity)
-            
-            if positions and (equity - dd_peak) / dd_peak < tier2_dd:
-                for p in positions:
-                    cp = c_arr[current_idx, p['s_col']]
-                    if not np.isnan(cp):
-                        actual_exit = cp * (1 - Config.Params.SLIPPAGE - Config.Params.COMMISSION)
-                        capital += p['shares'] * actual_exit
-                positions = []
-                equity = capital
-                dd_peak = equity  # ✅ 重置峰值追踪器（不修改历史数据）
-            
-            # --- C. 盘后：处理新信号 (预扣资金用于明天开盘买入) ---
-            if current_idx + 1 < len(all_dates):
-                next_day_idx = current_idx + 1
-                today_signals = signals_by_date.get(today_str, [])
-                
-                if today_signals:
-                    today_signals = sorted(today_signals, key=lambda x: x.get('score', 0), reverse=True)
-                    
-                    # === 🛡️ 冬眠防御系统 (Hibernation Defense) - 双层熔断 ===
-                    current_dd = (equity - dd_peak) / dd_peak if dd_peak > 0 else 0
-                    if current_dd < tier1_dd:  # Tier 1: 谨慎模式
-                        max_daily_entries = max_entries_tier1
-                        pos_weight = pos_weight_tier1
-                    else:
-                        max_daily_entries = max_entries_normal
-                        pos_weight = pos_weight_normal
-                    
-                    entries_today = 0
-                    for sig in today_signals:
-                        if capital <= 1000 or entries_today >= max_daily_entries: break
-                            
-                        s_col = sig['_s_col']
-                        entry_open = o_arr[next_day_idx, s_col]
-                        if np.isnan(entry_open) or entry_open <= 0: continue
-                            
-                        # 资金管理：动态仓位
-                        alloc_amount = min(equity * pos_weight, capital)
-                        if alloc_amount < 1000: continue
-                            
-                        prev_close = c_arr[current_idx, s_col]
-                        gap_up = (entry_open - prev_close) / (prev_close + 1e-10)
-                        slip = Config.Params.SLIPPAGE * 3 if gap_up > 0.03 else Config.Params.SLIPPAGE
-                        entry_cost = entry_open * (1 + slip + Config.Params.COMMISSION)
-                        
-                        shares = alloc_amount / entry_cost
-                        capital -= alloc_amount
-                        
-                        atr_pct = sig.get('_atr_pct', 0.025)
-                        # 动态止盈止损
-                        tp_mul = tp_tier1 if pos_weight < pos_weight_normal else tp_normal
-                        tp = entry_cost * (1 + tp_mul * atr_pct)
-                        sl = entry_cost * (1 - sl_mul * atr_pct)
-                        
-                        # 自适应持仓周期
-                        reversal_kw = {'Spring', 'ChoCh', 'OB', '扫盘', '失衡', '回踩', '口袋', 'AMD'}
-                        factors = sig.get('factors', [])
-                        factor_str = ' '.join(factors) if factors else ''
-                        max_hold = max_hold_rev if any(k in factor_str for k in reversal_kw) else max_hold_trend
-                        
-                        positions.append({
-                            'sym': sig['symbol'], 's_col': s_col, 'shares': shares,
-                            'entry_price': entry_cost, 'tp': tp, 'sl': sl, 'days_held': 0,
-                            'max_hold': max_hold
-                        })
-                        entries_today += 1
-
-        if equity_data:
-            eq_df = pd.DataFrame(equity_data)
-            eq_df['daily_ret'] = eq_df['equity'].pct_change().fillna(0.0)
-            
-            total_ret = (eq_df['equity'].iloc[-1] / 100000.0) - 1.0
-            peak = eq_df['equity'].cummax()
-            drawdown = (eq_df['equity'] - peak) / peak
-            max_dd = drawdown.min()
-            
-            sharpe = np.sqrt(252) * eq_df['daily_ret'].mean() / (eq_df['daily_ret'].std() + 1e-9)
-            calmar = total_ret / abs(max_dd) if max_dd < 0 else 99.0
-            
-            # === 🎲 蒙特卡洛压力测试 (Monte Carlo Stress Test) ===
-            daily_returns = eq_df['daily_ret'].values
-            n_days = len(daily_returns)
-            n_simulations = 10000
-            
-            # --- Track 1: 正常历史重采样 (Normal Bootstrapping) ---
-            mc_matrix = np.random.choice(daily_returns, size=(n_simulations, n_days), replace=True)
-            mc_paths = np.cumprod(1 + mc_matrix, axis=1)
-            mc_drawdowns = (mc_paths - np.maximum.accumulate(mc_paths, axis=1)) / np.maximum.accumulate(mc_paths, axis=1)
-            mc_max_dds = np.min(mc_drawdowns, axis=1)
-            
-            mc_var_95 = float(np.percentile(mc_max_dds, 5))
-            mc_ruin_prob = float(np.mean(mc_max_dds <= -0.50))
-            mc_median_ret = float(np.median(mc_paths[:, -1] - 1.0))
-            
-            # --- Track 2: 肥尾黑天鹅注入 (Fat-Tail Shock Injection) ---
-            # 每日发生系统性崩盘的概率 (约10年一次)
-            crash_prob = 0.0004 
-            crash_mask = np.random.rand(n_simulations, n_days) < crash_prob
-            
-            # 制造断崖式跳空，无视任何止损，单日暴跌 -15% 到 -25%
-            fat_matrix = mc_matrix.copy()
-            fat_matrix[crash_mask] = np.random.uniform(-0.25, -0.15, size=np.sum(crash_mask))
-            
-            fat_paths = np.cumprod(1 + fat_matrix, axis=1)
-            fat_drawdowns = (fat_paths - np.maximum.accumulate(fat_paths, axis=1)) / np.maximum.accumulate(fat_paths, axis=1)
-            fat_max_dds = np.min(fat_drawdowns, axis=1)
-            
-            fat_var_95 = float(np.percentile(fat_max_dds, 5))
-            fat_ruin_prob = float(np.mean(fat_max_dds <= -0.50))
-            fat_median_ret = float(np.median(fat_paths[:, -1] - 1.0))
-            
-            mc_report = f"""
-🎲 蒙特卡洛抗压测试 (10,000次重采样):
-
-[和平时期 - 历史重采样]
-• 95%置信度极限回撤: {mc_var_95 * 100:.2f}%
-• 资金破产概率(DD>50%): {mc_ruin_prob * 100:.2f}%
-• 合成路径中位数收益: {mc_median_ret * 100:.2f}%
-
-[黑天鹅降临 - 肥尾熔断攻击 (模拟2008/2020)]
-• 95%置信度极限回撤: {fat_var_95 * 100:.2f}%
-• 资金破产概率(DD>50%): {fat_ruin_prob * 100:.2f}%
-• 合成路径中位数收益: {fat_median_ret * 100:.2f}%"""
-            
-            # === 📊 Walk-Forward 季度稳定性诊断 ===
-            wf_report = ""
-            try:
-                eq_df['date'] = pd.to_datetime(eq_df['date'])
-                eq_df['quarter'] = eq_df['date'].dt.to_period('Q')
-                quarters = eq_df['quarter'].unique()
-                
-                if len(quarters) >= 2:
-                    q_results = []
-                    for q in quarters:
-                        q_data = eq_df[eq_df['quarter'] == q]
-                        if len(q_data) < 5: continue
-                        q_ret = (q_data['equity'].iloc[-1] / q_data['equity'].iloc[0]) - 1.0
-                        q_peak = q_data['equity'].cummax()
-                        q_dd = ((q_data['equity'] - q_peak) / q_peak).min()
-                        q_daily = q_data['daily_ret']
-                        q_sharpe = float(np.sqrt(252) * q_daily.mean() / (q_daily.std() + 1e-9))
-                        q_results.append({'q': str(q), 'ret': q_ret, 'dd': q_dd, 'sharpe': q_sharpe})
-                    
-                    if q_results:
-                        q_wins = sum(1 for q in q_results if q['ret'] > 0)
-                        wf_lines = [f"\n\n[Walk-Forward 季度稳定性]"]
-                        for q in q_results:
-                            flag = " ⚠️" if q['sharpe'] < 0 else ""
-                            wf_lines.append(f"• {q['q']}: 收益 {q['ret']*100:+.1f}% | 回撤 {q['dd']*100:.1f}% | Sharpe {q['sharpe']:.2f}{flag}")
-                        wf_lines.append(f"• 季度胜率: {q_wins}/{len(q_results)}")
-                        wf_report = "\n".join(wf_lines)
-            except Exception:
-                pass
-            
-            mc_report += wf_report
-            
-            # --- [AGENT_FITNESS_SCORE] 输出 ---
-            fitness_score = (sharpe * 15.0) + (total_ret * 50.0) - abs(max_dd * 80.0) + (calmar * 5.0)
-            
-            print(f"\n[AGENT_FITNESS_SCORE]: {fitness_score:.4f}\n{mc_report}\n")
-            with open(os.path.join(Config.DATA_DIR, "fitness_score.txt"), "w", encoding='utf-8') as f:
-                f.write(f"[AGENT_FITNESS_SCORE]: {fitness_score:.4f}\n{mc_report}")
 
     with open(Config.STATS_FILE, 'w', encoding='utf-8') as f: json.dump({"overall": res, "factors": f_res, "xai_importances": feature_importances_dict, "meta_weights": meta_weights_dict, "attribution": attr_report, "factor_ic": factor_ic_report, "portfolio": portfolio_metrics}, f, indent=4)
     
