@@ -2148,7 +2148,7 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                     exit_price, hit = p['sl'], True
                 elif not np.isnan(h_price) and h_price >= p['tp']:
                     exit_price, hit = p['tp'], True
-                elif p['days_held'] >= 5: # MAX_HOLDING_DAYS
+                elif p['days_held'] >= p.get('max_hold', 5): # 自适应持仓周期
                     exit_price, hit = c_price, True
                     
                 if hit and not np.isnan(exit_price):
@@ -2214,9 +2214,16 @@ def run_backtest_engine(replay_mode: bool = False) -> None:
                         tp = entry_cost * (1 + tp_mul * atr_pct)
                         sl = entry_cost * (1 - 1.2 * atr_pct)
                         
+                        # 自适应持仓周期：反转类快出(3天)，趋势类慢出(7天)
+                        reversal_kw = {'Spring', 'ChoCh', 'OB', '扫盘', '失衡', '回踩', '口袋', 'AMD'}
+                        factors = sig.get('factors', [])
+                        factor_str = ' '.join(factors) if factors else ''
+                        max_hold = 3 if any(k in factor_str for k in reversal_kw) else 7
+                        
                         positions.append({
                             'sym': sig['symbol'], 's_col': s_col, 'shares': shares,
-                            'entry_price': entry_cost, 'tp': tp, 'sl': sl, 'days_held': 0
+                            'entry_price': entry_cost, 'tp': tp, 'sl': sl, 'days_held': 0,
+                            'max_hold': max_hold
                         })
                         entries_today += 1
 
